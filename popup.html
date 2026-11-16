@@ -1,0 +1,49 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <style>
+    body { font-family: system-ui, sans-serif; width: 270px; max-width: 100%; padding: 12px; }
+    h3 { margin: 0 0 10px; }
+    .row { margin: 12px 0; }
+    label { display: flex; justify-content: space-between; font-size: 13px; margin-bottom: 4px; }
+    input[type=range], select { width: 100%; }
+    select { font-size: 14px; padding: 6px; }
+    .switch { display: flex; align-items: center; justify-content: space-between; font-size: 15px; }
+    .switch input { width: 22px; height: 22px; }
+    .hidden { display: none; }
+  </style>
+</head>
+<body>
+  <h3>ChessVision</h3>
+  <div class="row switch">
+    <span>Auto-play</span>
+    <input type="checkbox" id="enabled">
+  </div>
+  <div class="row">
+    <label for="engine">Engine</label>
+    <select id="engine">
+      <option value="aggro">AggroChess (Tal-style sacrifices)</option>
+      <option value="stockfish">Stockfish (strongest)</option>
+    </select>
+  </div>
+  <div class="row" id="thinkRow">
+    <label>Think time <b id="thinkVal"></b></label>
+    <input type="range" id="thinkMs" min="200" max="5000" step="100">
+  </div>
+  <div class="row hidden" id="depthRow">
+    <label>Search depth <b id="depthVal"></b></label>
+    <input type="range" id="depth" min="1" max="20" step="1">
+  </div>
+  <div class="row">
+    <label>Min delay <b id="minVal"></b></label>
+    <input type="range" id="minDelay" min="100" max="3000" step="50">
+  </div>
+  <div class="row">
+    <label>Max delay <b id="maxVal"></b></label>
+    <input type="range" id="maxDelay" min="100" max="3000" step="50">
+  </div>
+  <script src="popup.js"></script>
+</body>
+</html>
