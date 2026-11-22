@@ -1,7 +1,8 @@
 // Runs the AggroChess WebAssembly engine off the main thread so the page never freezes.
 'use strict';
 
-const WASM_URL = new URL('aggrochess.wasm', self.location.href);
+let WASM_URL = new URL('aggrochess.wasm', self.location.href);   // init may name another file (the SIMD build)
+let TT_MB = 0;                                                    // hash size asked for in init (0 = the engine's own)
 const enc = new TextEncoder();
 const dec = new TextDecoder();
 let ex = null;
@@ -13,17 +14,74 @@ const imports = {
     },
 };
 
-async function init() {
-    let result;
-    try {
-        result = await WebAssembly.instantiateStreaming(fetch(WASM_URL), imports);
-    } catch (e) {
-        // Fallback for hosts that don't serve .wasm with the right MIME type.
-        const buf = await (await fetch(WASM_URL)).arrayBuffer();
-        result = await WebAssembly.instantiate(buf, imports);
+// Start-up (1.7.9). background.js compiles the .wasm once and posts { type: 'init', module } as the first message, so
+// every worker only instantiates (no download, no compile). Falls back to fetching the file itself when no module
+// arrives (module: null, no message within INIT_WAIT_MS) or when instantiating from the module throws.
+const INIT_WAIT_MS = 3000;
+// Warm-up before 'ready': the engine allocates its net, book and transposition table on the first real search
+// (about 40-65 ms in Node). Pay that now, on a position that is not in the opening book, then put the engine back in
+// its fresh state: empty hash, and set_position('') = start position, no moves (that resets the per-game state it keeps).
+const WARM_FEN = 'r3k2r/p1ppqpb1/bn2pnp1/3PN3/1p2P3/2N2Q1p/PPPBBPPP/R3K2R w KQkq - 0 1';
+const WARM_MS = 5;      // the engine searches at least 30 ms whatever it is given
+
+let started = false;
+
+// One fresh instance: from the shared module when there is one, else by loading the file. { instance, how }
+async function makeInstance(module) {
+    if (module) {
+        try {
+            const r = await WebAssembly.instantiate(module, imports);
+            return { instance: r instanceof WebAssembly.Instance ? r : r.instance, how: 'module' };
+        } catch (e) { /* fall back to the file */ }
     }
-    ex = result.instance.exports;
-    postMessage({ type: 'ready' });
+    const load = async (url) => {
+        try {
+            return await WebAssembly.instantiateStreaming(fetch(url), imports);
+        } catch (e) {
+            // Fallback for hosts that don't serve .wasm with the right MIME type.
+            const buf = await (await fetch(url)).arrayBuffer();
+            return await WebAssembly.instantiate(buf, imports);
+        }
+    };
+    let result;
+    try { result = await load(WASM_URL); }
+    catch (e) {
+        if (!/aggrochess\.wasm$/.test(String(WASM_URL))) result = await load(new URL('aggrochess.wasm', self.location.href));   // the SIMD build would not load: the plain one
+        else throw e;
+    }
+    return { instance: result.instance, how: 'fetch' };
+}
+
+async function startInit(module, file, ttMb) {
+    if (started) return;
+    started = true;
+    if (file && !file.includes('..') && /^(?:[\w.-]+\/)?[\w.-]+\.wasm$/.test(file)) WASM_URL = new URL(file.replace(/^.*\//, ''), self.location.href);
+    TT_MB = Number(ttMb) > 0 ? Number(ttMb) : 0;
+    let made = await makeInstance(module);
+    ex = made.instance.exports;
+    let warmMs = null;
+    try { warmMs = warmUp(); }
+    catch (e) {
+        // The engine trapped during the warm-up: do not trust that instance. Use a clean one, without warm-up.
+        made = await makeInstance(module);
+        ex = made.instance.exports;
+        try { applyTt(); } catch (e2) { /* ignore */ }
+    }
+    postMessage({ type: 'ready', how: made.how, warmMs, steps: typeof ex.think_depth === 'function' });
+}
+
+// Throws if the engine traps.
+// The hash size (builds that export set_tt_mb); before the first search, which is what allocates the table.
+function applyTt() { if (TT_MB && typeof ex.set_tt_mb === 'function') ex.set_tt_mb(TT_MB); }
+
+function warmUp() {
+    const t0 = performance.now();
+    applyTt();
+    ex.set_position(write(WARM_FEN + '|'));
+    read(ex.think(WARM_MS));
+    ex.clear_hash();
+    ex.set_position(write(''));
+    return Math.round(performance.now() - t0);
 }
 
 function write(s) {
@@ -59,7 +117,9 @@ function positionInfo() {
 onmessage = (e) => {
     const m = e.data;
     try {
-        if (m.type === 'position') {
+        if (m.type === 'init') {
+            startInit(m.module || null, m.file, m.ttMb).catch((err) => postMessage({ type: 'error', message: 'Failed to load engine: ' + err }));
+        } else if (m.type === 'position') {
             const ok = ex.set_position(write(posText(m)));
             postMessage({ type: 'position', id: m.id, ok: ok === 1, ...positionInfo() });
         } else if (m.type === 'analyze') {
@@ -96,7 +156,7 @@ onmessage = (e) => {
             postMessage({ type: 'cleared', id: m.id });
         } else if (m.type === 'think') {
             ex.set_position(write(posText(m)));
-            const out = read(m.soft ? ex.think_clock(m.soft, m.hard) : ex.think(m.ms)).split(' ');
+            const out = read(m.depth && ex.think_depth ? ex.think_depth(m.depth, m.ms) : m.soft ? ex.think_clock(m.soft, m.hard) : ex.think(m.ms)).split(' ');
             if (out[0] === 'none') {
                 postMessage({ type: 'bestmove', id: m.id, uci: null });
             } else {
@@ -117,4 +177,7 @@ onmessage = (e) => {
     }
 };
 
-init().catch((err) => postMessage({ type: 'error', message: 'Failed to load engine: ' + err }));
+// No init message (an older background page, or the module could not be sent): load the file ourselves.
+setTimeout(() => {
+    startInit(null).catch((err) => postMessage({ type: 'error', message: 'Failed to load engine: ' + err }));
+}, INIT_WAIT_MS);

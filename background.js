@@ -1,29 +1,212 @@
 'use strict';
 const api = typeof browser !== 'undefined' ? browser : chrome;
 
-// ======================= Stockfish (UCI, asm.js) =======================
-const SF_FILE = 'engine/stockfish-19-asm.js';
+// ======================= Stockfish (UCI, WebAssembly with asm.js fallback) =======================
+// SF_FILE: Stockfish.js 19, lite NNUE, single thread (no SharedArrayBuffer needed). Its loader and the .wasm of the
+// same name (SF_WASM) are both in engine/. If it fails to start, SF_FALLBACK_FILE (asm.js, much slower) is used.
+// Start order of every Stockfish worker: (1) engine/sf-worker.js, which loads the UNMODIFIED loader and hands it a wasm
+// Module compiled once here (sfModuleFor), (2) the loader directly (it fetches and compiles the .wasm itself), (3) asm.js
+// (main worker only). The threaded build SF_THREADED_FILE is used for the MAIN worker only, only when setting sfThreads > 1
+// AND the runtime feature test (CV.sabSupport) passes; any failure there keeps the single-thread engine.
+const SF_FILE = 'engine/stockfish-19-lite-single.js';
+const SF_WASM = SF_FILE.replace(/\.js$/, '.wasm');
+const SF_WRAPPER = 'engine/sf-worker.js';
+const SF_THREADED_FILE = 'engine/stockfish-19-lite.js';
+const SF_THREADED_WASM = SF_THREADED_FILE.replace(/\.js$/, '.wasm');
+const SF_FALLBACK_FILE = 'engine/stockfish-19-asm.js';
+const SF_THREADS = 1, SF_HASH_MB = 32;      // sent once after start-up
+const SF_START_TIMEOUT_MS = 30000;          // no readyok within this long = the engine did not start
+const SF_WRAPPER_TIMEOUT_MS = 15000;        // ... for the wrapper / shared-module start (then the direct loader is tried)
+// "Imperfection" only considers alternatives within this many centipawns of the best line.
+const IMPERFECTION_MARGIN_CP = 60;
+const IMPERFECTION_LINES = 3; // MultiPV lines searched when imperfection > 0
+
 let sf = null, sfReady = null, sfCurrent = null, sfNext = null;
+let sfActive = null;    // engine file in use
+let sfPrevCount = null; // pieces in the previous request; null = nothing searched yet (see CV.sfIsNewGame)
+let sfMultiPvSent = null, sfThreadsSent = SF_THREADS;   // setoption is only sent when the value changes
+const sfDbg = { moduleSendFailures: 0, workerStarts: 0, lastStart: null, harvested: 0, harvestFailed: 0, threadedFailed: null, threadedStarts: 0 };
+const sfSab = (() => { try { return CV.sabSupport(typeof globalThis !== 'undefined' ? globalThis : {}); } catch (e) { return { ok: false, reason: 'test failed: ' + e, checks: {} }; } })();
+
+// The .wasm compiled once; every Stockfish worker that starts through the wrapper only instantiates it.
+// Resolves a WebAssembly.Module, or null when compiling is not possible here (then every worker loads the file itself).
+let sfModuleP = null;
+const sfModuleInfo = { shared: false, ms: null, how: null, error: null };
+function sfModuleFor() {
+  if (!sfModuleP) {
+    sfModuleP = (async () => {
+      if (typeof WebAssembly === 'undefined' || typeof fetch === 'undefined') { sfModuleInfo.error = 'WebAssembly or fetch not available'; return null; }
+      const t0 = Date.now(), url = api.runtime.getURL(SF_WASM);
+      try {
+        try { sfModuleInfo.how = 'compileStreaming'; const m = await WebAssembly.compileStreaming(fetch(url)); sfModuleInfo.shared = true; sfModuleInfo.ms = Date.now() - t0; return m; }
+        catch (e) { sfModuleInfo.how = 'arrayBuffer'; const m = await WebAssembly.compile(await (await fetch(url)).arrayBuffer()); sfModuleInfo.shared = true; sfModuleInfo.ms = Date.now() - t0; return m; }
+      } catch (e) {
+        sfModuleInfo.error = String((e && e.message) || e);
+        console.error('[ChessVision] Stockfish: could not compile the module, workers will load the file themselves', e);
+        return null;
+      }
+    })();
+  }
+  return sfModuleP;
+}
+
+// Starts one engine file and resolves { worker, notes } once it has answered `readyok` after the options were sent.
+// Rejects on a worker error, a start timeout or a failure to create the worker.
+// opts (all optional): wrapper + module = start SF_FILE through SF_WRAPPER with that compiled Module; hashMb; threads; timeoutMs.
+function sfSpawn(file, opts) {
+  opts = opts || {};
+  const hashMb = opts.hashMb || SF_HASH_MB, threads = opts.threads || SF_THREADS;
+  const viaWrapper = file === SF_FILE && !!opts.wrapper;
+  return new Promise((resolve, reject) => {
+    let w = null, done = false, stage = 'uci';
+    const spin = {};      // option name -> { min, max } for the spin options the engine lists
+    const notes = [];     // what happened with the options, for the log
+    const fail = (why) => {
+      if (done) return;
+      done = true; clearTimeout(timer);
+      try { if (w) w.terminate(); } catch (e) { /* ignore */ }
+      reject(new Error(why));
+    };
+    const timer = setTimeout(() => fail('no readyok within ' + (opts.timeoutMs || SF_START_TIMEOUT_MS) + ' ms (waiting for ' + stage + ')'), opts.timeoutMs || SF_START_TIMEOUT_MS);
+    try {
+      // The wasm loader finds its .wasm from "#<url>,worker"; passing it explicitly avoids relying on location.origin.
+      const wasmFile = file === SF_THREADED_FILE ? SF_THREADED_WASM : SF_WASM;
+      w = new Worker(api.runtime.getURL(viaWrapper ? SF_WRAPPER : file) + (file === SF_FILE || file === SF_THREADED_FILE ? '#' + encodeURIComponent(api.runtime.getURL(wasmFile)) + ',worker' : ''));
+    } catch (e) { return fail('could not create worker: ' + ((e && e.message) || e)); }
+    w.onerror = (e) => fail('worker error: ' + ((e && e.message) || 'unknown'));
+    w.onmessage = (e) => {
+      if (done) return;
+      const line = typeof e.data === 'string' ? e.data : '';
+      if (stage === 'uci') {
+        const m = /^option name (.+?) type spin default \S+ min (-?\d+) max (-?\d+)/.exec(line);
+        if (m) spin[m[1]] = { min: +m[2], max: +m[3] };
+        if (line === 'uciok') {
+          stage = 'readyok';
+          for (const [name, value] of [['Threads', threads], ['Hash', hashMb]]) {
+            const o = spin[name];
+            if (!o) notes.push(name + ': option not offered');
+            else if (value < o.min || value > o.max) notes.push(name + ': ' + value + ' outside ' + o.min + '-' + o.max + ', not sent');
+            else { w.postMessage('setoption name ' + name + ' value ' + value); notes.push(name + ' = ' + value + ' sent'); }
+          }
+          w.postMessage('isready');
+        }
+      } else if (/^no such option/i.test(line)) {
+        notes.push('engine refused an option: ' + line);
+      } else if (line === 'readyok') {
+        done = true; clearTimeout(timer);
+        resolve({ worker: w, notes });
+      }
+    };
+    if (viaWrapper) {       // first message: the compiled module (null = the wrapper fetches the file itself)
+      const init = { type: 'sfinit', module: opts.module || null, loader: SF_FILE.replace(/^engine\//, '') };
+      try { w.postMessage(init); }
+      catch (e) { sfDbg.moduleSendFailures++; try { w.postMessage({ ...init, module: null }); } catch (e2) { return fail('could not start worker: ' + ((e2 && e2.message) || e2)); } }
+    }
+    w.postMessage('uci');
+  });
+}
+
+// Main worker: wrapper + shared module first, then the loader directly, then asm.js.
+async function sfSpawnWasm(opts) {
+  const module = await sfModuleFor();
+  if (module) {
+    try { const r = await sfSpawn(SF_FILE, { ...opts, wrapper: true, module, timeoutMs: Math.min(SF_START_TIMEOUT_MS, SF_WRAPPER_TIMEOUT_MS) }); r.how = 'shared module'; return r; }
+    catch (e) { console.error('[ChessVision] Stockfish: start through ' + SF_WRAPPER + ' failed (' + ((e && e.message) || e) + '); trying ' + SF_FILE + ' directly'); }
+  }
+  const r = await sfSpawn(SF_FILE, opts); r.how = 'direct'; return r;
+}
+
+function sfAttach(worker) {
+  sf = worker;
+  sfMultiPvSent = null; sfThreadsSent = null;
+  sf.onmessage = (e) => {
+    const line = typeof e.data === 'string' ? e.data : '';
+    if (line.startsWith('info ')) sfInfo(line);
+    else if (line.startsWith('bestmove')) sfBestMove(line.split(' ')[1]);
+  };
+  sf.onerror = (e) => console.error('[ChessVision] Stockfish error', e.message);
+}
 
 function initStockfish() {
-  sf = new Worker(api.runtime.getURL(SF_FILE));
-  sfReady = new Promise((resolve) => {
-    sf.onmessage = (e) => {
-      const line = typeof e.data === 'string' ? e.data : '';
-      if (line === 'readyok') resolve();
-      else if (line.startsWith('bestmove')) sfBestMove(line.split(' ')[1]);
-    };
-    sf.onerror = (e) => console.error('[ChessVision] Stockfish error', e.message);
-  });
-  sf.postMessage('uci');
-  sf.postMessage('isready');
+  sfReady = (async () => {
+    let r;
+    try {
+      r = await sfSpawnWasm();
+      sfActive = SF_FILE;
+    } catch (e) {
+      console.error('[ChessVision] Stockfish: ' + SF_FILE + ' did not start (' + ((e && e.message) || e) + '); falling back to ' + SF_FALLBACK_FILE);
+      r = await sfSpawn(SF_FALLBACK_FILE);
+      sfActive = SF_FALLBACK_FILE;
+    }
+    sfAttach(r.worker);
+    sfThreadsSent = SF_THREADS;
+    sfDbg.workerStarts++; sfDbg.lastStart = { label: 'main', file: sfActive, how: r.how || 'direct' };
+    // Threads missing on the asm fallback is expected (it is single-threaded); anything else is worth a look.
+    const notes = sfActive === SF_FALLBACK_FILE ? r.notes.filter((n) => n !== 'Threads: option not offered') : r.notes;
+    console.log('[ChessVision] Stockfish active:', sfActive, sfActive === SF_FILE ? '(WebAssembly' + (r.how ? ', ' + r.how : '') + ')' : '(asm.js fallback)', notes.join('; '));
+  })();
+  sfReady.catch((e) => console.error('[ChessVision] Stockfish could not be started', e));
+}
+
+// Optional: the threaded build for the main worker (setting sfThreads > 1). Needs SharedArrayBuffer (runtime test, sfSab).
+// Any failure keeps the single-thread engine and is remembered (no retry loop). Returns the thread count in use.
+async function sfApplyThreads(setting) {
+  const want = CV.sfThreadCount(setting, typeof navigator !== 'undefined' ? navigator.hardwareConcurrency : undefined, sfSab.ok);
+  if (sfActive === SF_THREADED_FILE) {
+    if (want !== sfThreadsSent && !sfCurrent) { sf.postMessage('setoption name Threads value ' + want); sfThreadsSent = want; }
+    return sfThreadsSent;
+  }
+  if (want <= 1 || sfDbg.threadedFailed || sfCurrent || sfNext) return 1;
+  try {
+    const r = await sfSpawn(SF_THREADED_FILE, { threads: want });
+    if (sfCurrent) { try { r.worker.terminate(); } catch (e) { /* ignore */ } return 1; }     // a search started meanwhile: keep the old engine
+    const old = sf; sfAttach(r.worker); sfActive = SF_THREADED_FILE; sfThreadsSent = want; sfPrevCount = null;
+    try { if (old) old.terminate(); } catch (e) { /* ignore */ }
+    sfDbg.threadedStarts++; sfDbg.lastStart = { label: 'main', file: sfActive, how: 'threaded, Threads ' + want };
+    console.log('[ChessVision] Stockfish threaded build active:', SF_THREADED_FILE, 'Threads', want, r.notes.join('; '));
+    return want;
+  } catch (e) {
+    sfDbg.threadedFailed = String((e && e.message) || e);
+    console.error('[ChessVision] Stockfish threaded build did not start (' + sfDbg.threadedFailed + '); keeping ' + sfActive);
+    return 1;
+  }
 }
 
 function sfStart(job) {
   sfCurrent = job;
-  sf.postMessage('ucinewgame');
-  sf.postMessage('position fen ' + job.fen);
-  sf.postMessage('go depth ' + job.depth);
+  // The search state (hash table) is kept between the moves of one game; cleared only when a new game starts.
+  if (CV.sfIsNewGame(sfPrevCount, job.fen)) sf.postMessage('ucinewgame');
+  sfPrevCount = CV.sfPieceCount(job.fen);
+  if (sfMultiPvSent !== job.multipv) { sf.postMessage('setoption name MultiPV value ' + job.multipv); sfMultiPvSent = job.multipv; }   // only when it changes
+  sf.postMessage(CV.sfPositionCommand(job.fen, job.startFen, job.moves));   // with history: the engine sees repetitions / the 50-move counter
+  sf.postMessage(CV.sfGoCommand(job.depth, job.maxMs));
+}
+
+// Keeps the deepest exact score/line for each MultiPV index of the running job.
+function sfInfo(line) {
+  const job = sfCurrent;
+  if (!job || job.multipv < 2) return;
+  if (line.includes(' lowerbound') || line.includes(' upperbound')) return;
+  const mpv = /\bmultipv (\d+)/.exec(line), sc = /\bscore (cp|mate) (-?\d+)/.exec(line), pv = / pv (\S+)/.exec(line);
+  const depth = /\bdepth (\d+)/.exec(line);
+  if (!mpv || !sc || !pv) return;
+  job.lines.set(+mpv[1], {
+    uci: pv[1], depth: depth ? +depth[1] : 0,
+    cp: sc[1] === 'cp' ? +sc[2] : null,
+    mate: sc[1] === 'mate' ? +sc[2] : null,
+  });
+}
+
+// Occasionally returns a near-best alternative instead of the best move. Never when a mate is found.
+function chooseMove(job, best) {
+  if (!job.imperfection || job.lines.size < 2) return best;
+  const lines = [...job.lines.entries()].sort((a, b) => a[0] - b[0]).map((e) => e[1]);
+  const top = lines[0];
+  if (top.mate !== null && top.mate > 0) return best;
+  if (top.cp === null) return best;
+  if (Math.random() * 100 >= job.imperfection) return best;
+  const alts = lines.slice(1).filter((l) => l.cp !== null && top.cp - l.cp <= IMPERFECTION_MARGIN_CP && l.uci !== best);
+  return alts.length ? alts[Math.floor(Math.random() * alts.length)].uci : best;
 }
 
 function sfBestMove(move) {
@@ -35,14 +218,46 @@ function sfBestMove(move) {
     if (job) job.resolve(null); // superseded
     sfStart(n);
   } else if (job) {
-    job.resolve({ uci: move });
+    const chosen = chooseMove(job, move);
+    job.resolve({ uci: chosen, best: move, imperfect: chosen !== move });
   }
 }
 
-async function analyzeStockfish(fen, depth) {
-  await sfReady;
+// The real Stockfish request. `msg` (optional, 7th argument) carries the pondering fields (ponder, sfThreads).
+async function analyzeStockfish(fen, depth, imperfection, maxMs, startFen, moves, msg) {
+  aggroThinking++;                     // while a real search runs, no spare ponder worker is made (see ponderTopUp)
+  try { return await analyzeStockfishNow(fen, depth, imperfection, maxMs, startFen, moves, msg || {}); } finally { aggroThinking--; ponderTopUp(); }
+}
+async function analyzeStockfishNow(fen, depth, imperfection, maxMs, startFen, moves, msg) {
+  try { await sfReady; } catch (e) { return { error: 'Stockfish: could not start (' + ((e && e.message) || e) + ')' }; }
+  // 1) a reply already found while pondering wins; anything else stops the ponder workers at once (stop + isready, never waited for)
+  if (!msg.ponder) { if (ponderKind === 'sf') ponderCancel(); }
+  else {
+    const hist = typeof startFen === 'string' && Array.isArray(moves);
+    const d = ponder.decide(hist ? startFen : null, hist ? moves : null);
+    if (d.decision === 'hit') { ponderStop(); const e = d.result; return { uci: e.uci, best: e.uci, depth: e.depth, ponderHit: true }; }
+    if (d.decision === 'late' && d.running && ponderKind === 'sf') {          // a worker is on exactly this move: take what it has if it is deep enough
+      const opp = moves[moves.length - 1], w = ponderActive.find((x) => x.kind === 'sf' && x.task && x.task.key === opp), tp = w && w.task.promise;
+      ponderStop();                                                           // halts the job, sends `stop` to every worker
+      if (tp) {
+        const res = await Promise.race([tp, new Promise((r) => setTimeout(() => r(null), SF_HARVEST_MS))]).catch(() => null);
+        if (res && res.best && res.best !== '(none)' && res.depth >= SF_PARTIAL_MIN_DEPTH && res.key === opp) { sfDbg.harvested++; return { uci: res.best, best: res.best, depth: res.depth, ponderHit: true, partial: true }; }
+        sfDbg.harvestFailed++;
+      }
+    }
+    ponderCancel();                                                           // miss, late or no entry yet: the ponder workers never delay a real search
+  }
+  if (msg.sfThreads !== undefined) { try { await sfApplyThreads(msg.sfThreads); } catch (e) { /* keep the engine we have */ } }
   return new Promise((resolve) => {
-    const job = { fen, resolve, depth: Math.max(1, Math.min(20, depth || 10)) };
+    const imp = Math.max(0, Math.min(100, imperfection || 0));
+    const job = {
+      fen, resolve, startFen: typeof startFen === 'string' ? startFen : null, moves: Array.isArray(moves) ? moves : null,
+      depth: Math.max(1, Math.min(20, depth || 10)),
+      maxMs: Math.max(0, Math.min(CV.LIMITS.sfMaxMs[1], Number(maxMs) || 0)),
+      imperfection: imp,
+      multipv: imp > 0 ? IMPERFECTION_LINES : 1,
+      lines: new Map(),
+    };
     if (sfCurrent) {
       if (sfNext) sfNext.resolve(null);
       sfNext = job;
@@ -53,46 +268,725 @@ async function analyzeStockfish(fen, depth) {
   });
 }
 
-// ======================= AggroChess (WebAssembly, Tal-style) =======================
-const AGGRO_WORKER = 'engine/aggro-worker.js';
-let aggro = null, aggroReady = null, aggroSeq = 0;
-const aggroPending = new Map(); // id -> resolve
-
-function initAggro() {
-  aggro = new Worker(api.runtime.getURL(AGGRO_WORKER));
-  aggroReady = new Promise((resolve) => {
-    aggro.onmessage = (e) => {
-      const m = e.data;
-      if (m.type === 'ready') return resolve();
-      if (m.type === 'error') console.error('[ChessVision] AggroChess error', m.message);
-      const done = aggroPending.get(m.id);
-      if (!done) return;
-      aggroPending.delete(m.id);
-      if (m.type === 'bestmove' && m.uci) done({ uci: m.uci, san: m.san, sacrifice: m.sacrifice });
-      else done(null);
-    };
-    aggro.onerror = (e) => console.error('[ChessVision] AggroChess worker error', e.message);
-  });
+// ======================= Icon download (brilliant layer c) =======================
+// The page cannot read chess.com's icon images (another origin taints a canvas), the background page can fetch them with
+// the host permission for chess.com's image domain and hands the bytes over. Only https images on chess.com domains.
+const IMAGE_MAX_BYTES = 300 * 1024;
+async function fetchImage(url) {
+  try {
+    const u = new URL(url);
+    if (u.protocol !== 'https:' || !/(^|\.)(chess\.com|chesscomfiles\.com)$/.test(u.hostname)) return { ok: false, error: 'host not allowed' };
+    const r = await fetch(u.href, { credentials: 'omit' });
+    if (!r.ok) return { ok: false, error: 'HTTP ' + r.status };
+    const bytes = await r.arrayBuffer();
+    if (bytes.byteLength > IMAGE_MAX_BYTES) return { ok: false, error: 'too large' };
+    return { ok: true, type: r.headers.get('content-type') || 'image/png', bytes };
+  } catch (e) { return { ok: false, error: String((e && e.message) || e) }; }
 }
 
-async function analyzeAggro(fen, ms) {
-  await aggroReady;
-  // Drop older requests: their results would be stale anyway
-  for (const [id, done] of aggroPending) { aggroPending.delete(id); done(null); }
-  const id = ++aggroSeq;
-  return new Promise((resolve) => {
-    aggroPending.set(id, resolve);
-    // "<fen>|" = set-up position with no move list
-    aggro.postMessage({ type: 'think', id, fen, moves: [], ms: Math.max(100, ms || 1000) });
+// ======================= AggroChess (WebAssembly, Tal-style) =======================
+// Two kinds of worker, both made by spawnAggroWorker (same failure handling):
+//   main   - the real think / verify / ponderMove / clear requests. Never used for idle work.
+//   ponder - 1-3 more workers for idle time (evaluation line and pondering; setting aggroPonderWorkers). wasm think()
+//            blocks its worker and cannot be interrupted, and workers do not share a hash table, so cancelling = terminate()
+//            of ALL of them; replacements are made (and warmed up) in advance, see the pool below.
+// The .wasm is compiled once here (compileAggroModule) and the Module is posted to every worker, which only instantiates it.
+const AGGRO_WORKER = 'engine/aggro-worker.js';
+const AGGRO_WASM = 'engine/aggrochess.wasm';
+const AGGRO_WASM_FALLBACK = 'aggrochess.wasm';        // file name inside engine/ that the worker loads itself when no module reaches it
+const AGGRO_WASM_SIMD = 'engine/aggrochess-simd.wasm';   // same engine built with simd128; used when the browser validates SIMD, else AGGRO_WASM
+// A tiny module that only validates where WebAssembly SIMD is supported (v128.const + i8x16.popcnt-style op).
+const SIMD_PROBE = new Uint8Array([0, 97, 115, 109, 1, 0, 0, 0, 1, 5, 1, 96, 0, 1, 123, 3, 2, 1, 0, 10, 10, 1, 8, 0, 65, 0, 253, 15, 253, 98, 11]);
+const PONDER_STEPPED = false;          // see runIdleJob: reply searches one depth at a time (think_depth). Off: not compared with think(ms) for strength.
+const PONDER_STEP_MAX_DEPTH = 40;
+const PONDER_STEP_MIN_MS = 15;         // no step is started with less time than this left in its slice
+const AGGRO_START_TIMEOUT_MS = 15000;     // no 'ready' within this long = the worker did not start
+const AGGRO_ERROR_COOLDOWN_MS = 15000;    // after a failed start, answer with the same error instead of re-creating at once
+const AGGRO_THINK_FACTOR = 3;             // a think request may take this many times the requested ms ...
+const AGGRO_THINK_MARGIN_MS = 4000;       // ... plus this, before the worker is declared stuck and re-created
+const AGGRO_QUICK_REQ_MS = 3000;          // timeout for the cheap requests (position, ponderMove, clear)
+const AGGRO_EVAL_MS = 300;                // budget of the idle evaluation line (inside the ponder time)
+const AGGRO_HARD_MAX_MS = 60000;          // upper bound for any search budget that arrives in a message
+
+// Creates one worker. Returns { ready, request(msg, timeoutMs), kill(), dead }.
+// `ready` rejects on a worker 'error' message before 'ready', on worker.onerror and after AGGRO_START_TIMEOUT_MS.
+function spawnAggroWorker(label, ttMb) {
+  const h = { kind: 'aggro', label, ttMb: ttMb || null, steps: false, worker: null, dead: false, pending: new Map(), seq: 0 };
+  const failAll = (why) => {
+    for (const [id, p] of h.pending) { h.pending.delete(id); clearTimeout(p.timer); p.reject(new Error(why)); }
+  };
+  h.ready = new Promise((resolve, reject) => {
+    let settled = false;
+    const settle = (fn, v) => { if (settled) return false; settled = true; clearTimeout(timer); fn(v); return true; };
+    const fail = (why) => { settle(reject, new Error(why)); failAll(why); };
+    const timer = setTimeout(() => fail('worker did not start within ' + AGGRO_START_TIMEOUT_MS + ' ms'), AGGRO_START_TIMEOUT_MS);
+    try { h.worker = new Worker(api.runtime.getURL(AGGRO_WORKER)); } catch (e) { fail('could not create worker: ' + ((e && e.message) || e)); return; }
+    h.worker.onmessage = (e) => {
+      const m = e.data || {};
+      if (m.type === 'ready') { h.how = m.how || null; h.warmMs = m.warmMs; h.steps = !!m.steps; aggroDbg.workerStarts++; aggroDbg.lastStart = { label, how: h.how, warmMs: h.warmMs }; settle(resolve); return; }
+      if (m.type === 'error' && !settled) { fail(m.message || 'worker error'); return; }
+      const p = h.pending.get(m.id);
+      if (m.type === 'error') console.error('[ChessVision] AggroChess (' + label + ') error', m.message);
+      if (!p) return;
+      h.pending.delete(m.id); clearTimeout(p.timer);
+      if (m.type === 'error') p.reject(new Error(m.message || 'worker error')); else p.resolve(m);
+    };
+    h.worker.onerror = (e) => fail('worker error: ' + ((e && e.message) || 'unknown'));
+    // First message: the compiled module (or null: the worker loads the file itself). If the Module cannot be cloned,
+    // or compiling failed, send null so the worker falls back.
+    aggroModuleFor().then((module) => {
+      if (h.dead || settled) return;
+      const init = { type: 'init', module, file: aggroModuleInfo.file || AGGRO_WASM_FALLBACK, ttMb: h.ttMb };
+      try { h.worker.postMessage(init); }
+      catch (e) {
+        aggroDbg.moduleSendFailures++;
+        try { h.worker.postMessage({ ...init, module: null }); } catch (e2) { fail('could not start worker: ' + ((e2 && e2.message) || e2)); }
+      }
+    });
   });
+  h.ready.catch(() => {});      // a start failure is reported by whoever awaits ready; never an unhandled rejection
+  // Posts a message and resolves with the worker's reply. Rejects on timeout or when the worker fails.
+  h.request = (msg, timeoutMs) => new Promise((resolve, reject) => {
+    if (h.dead) { reject(new Error('worker was terminated')); return; }
+    const id = ++h.seq;
+    const timer = setTimeout(() => { h.pending.delete(id); reject(new Error('no answer within ' + timeoutMs + ' ms')); }, timeoutMs);
+    h.pending.set(id, { resolve, reject, timer, think: msg.type === 'think' });
+    try { h.worker.postMessage({ ...msg, id }); } catch (e) { h.pending.delete(id); clearTimeout(timer); reject(e); }
+  });
+  h.kill = () => {
+    if (h.dead) return;
+    h.dead = true;
+    try { if (h.worker) h.worker.terminate(); } catch (e) { /* ignore */ }
+    failAll('worker was terminated');
+  };
+  return h;
+}
+
+let aggroMain = null, aggroFailure = null;     // aggroFailure = { message, at }: why the last start failed
+const aggroDbg = { verifyChecks: 0, verifyWarnings: 0, lastVerify: null, restarts: 0, moduleSendFailures: 0, workerStarts: 0, lastStart: null };
+
+// Compiles aggrochess.wasm once; resolves { module, ms, how, error }. Never rejects: module is null when compiling is not
+// possible here (no WebAssembly / fetch, a fetch or compile error) and every worker then loads the file itself.
+let aggroModuleP = null;
+const aggroModuleInfo = { shared: false, ms: null, how: null, error: null, file: null, simd: false };
+function aggroSimdOk() { try { return typeof WebAssembly !== 'undefined' && typeof WebAssembly.validate === 'function' && WebAssembly.validate(SIMD_PROBE); } catch (e) { return false; } }
+async function compileFile(file) {
+  const url = api.runtime.getURL(file);
+  try { aggroModuleInfo.how = 'compileStreaming'; return await WebAssembly.compileStreaming(fetch(url)); }
+  catch (e) {                                          // wrong MIME type or no streaming: compile the bytes
+    aggroModuleInfo.how = 'arrayBuffer';
+    return await WebAssembly.compile(await (await fetch(url)).arrayBuffer());
+  }
+}
+function aggroModuleFor() {
+  if (!aggroModuleP) {
+    aggroModuleP = (async () => {
+      if (typeof WebAssembly === 'undefined' || typeof fetch === 'undefined') { aggroModuleInfo.error = 'WebAssembly or fetch not available'; return null; }
+      const t0 = Date.now();
+      let m = null;
+      if (aggroSimdOk()) {                                // the SIMD build, if this browser can run it; any problem -> the plain build
+        try { m = await compileFile(AGGRO_WASM_SIMD); aggroModuleInfo.file = AGGRO_WASM_SIMD; aggroModuleInfo.simd = true; }
+        catch (e) { aggroModuleInfo.error = 'simd build: ' + String((e && e.message) || e); m = null; }
+      }
+      try {
+        if (!m) { m = await compileFile(AGGRO_WASM); aggroModuleInfo.file = AGGRO_WASM; aggroModuleInfo.simd = false; }
+        aggroModuleInfo.shared = true; aggroModuleInfo.ms = Date.now() - t0;
+        return m;
+      } catch (e) {
+        aggroModuleInfo.error = String((e && e.message) || e);
+        console.error('[ChessVision] AggroChess: could not compile the module, workers will load the file themselves', e);
+        return null;
+      }
+    })();
+  }
+  return aggroModuleP;
+}
+
+// The main worker, created on demand. Throws the last start error while it is cooling down.
+function aggroGet() {
+  if (aggroFailure && Date.now() - aggroFailure.at < AGGRO_ERROR_COOLDOWN_MS) throw new Error(aggroFailure.message);
+  if (!aggroMain || aggroMain.dead) {
+    if (aggroMain) aggroDbg.restarts++;
+    aggroMain = spawnAggroWorker('main');
+    const h = aggroMain;
+    h.ready.then(() => { if (aggroFailure) aggroFailure = null; }, (e) => {
+      aggroFailure = { message: (e && e.message) || String(e), at: Date.now() };
+      console.error('[ChessVision] AggroChess could not start', e);
+      h.kill();
+    });
+  }
+  return aggroMain;
+}
+function initAggro() { try { aggroGet(); } catch (e) { /* cooling down: nothing to start */ } }
+
+// What think wants: the fen/moves of the request (history when reliable, else the bare FEN as a set-up position).
+function aggroPosition(msg) {
+  const hist = typeof msg.startFen === 'string' && msg.startFen && Array.isArray(msg.moves);
+  if (!hist) return { fen: msg.fen, moves: [] };
+  return { fen: msg.startFen === CV.STANDARD_START_FEN ? undefined : msg.startFen, moves: msg.moves };   // from the standard start: no fen (opening book)
+}
+const posFor = (startFen, moves) => ({ fen: startFen === CV.STANDARD_START_FEN ? undefined : startFen, moves });
+
+const aggroResult = (m) => (m && m.type === 'bestmove' && m.uci
+  ? { uci: m.uci, best: m.uci, san: m.san, sacrifice: !!m.sacrifice, depth: m.depth, score: m.score } : null);
+
+// Compares the engine's idea of the position with chessmini's; returns a warning text or null. Never throws.
+async function aggroVerifyPosition(h, msg) {
+  try {
+    const p = aggroPosition(msg);
+    const r = await h.request({ type: 'position', ...p }, AGGRO_QUICK_REQ_MS);
+    const hist = typeof msg.startFen === 'string' && Array.isArray(msg.moves);
+    const mine = hist ? CV.replayUci(msg.startFen, msg.moves) : { ok: true, pos: CV.chess.parseFen(msg.fen) };
+    if (!mine.ok) return 'verify skipped: the move history does not replay';
+    const mineLegal = CV.chess.legalMoves(mine.pos).map((m) => m.uci).sort().join(' ');
+    const theirs = (r.legal || []).map((m) => m.uci).sort().join(' ');
+    aggroDbg.verifyChecks++;
+    let warn = null;
+    if (!r.ok) warn = 'engine rejected the position';
+    else if (r.stm !== mine.pos.turn) warn = 'side to move differs (engine ' + r.stm + ', page ' + mine.pos.turn + ')';
+    else if (mineLegal !== theirs) warn = 'legal moves differ (engine ' + (r.legal || []).length + ', page ' + mineLegal.split(' ').filter(Boolean).length + ')';
+    if (warn) { aggroDbg.verifyWarnings++; console.warn('[ChessVision] AggroChess verify:', warn); }
+    aggroDbg.lastVerify = warn || 'ok';
+    return warn;
+  } catch (e) { return null; }     // a verify problem must never block play
+}
+
+// ---- pondering: state (pure, in settings.js) and the idle job ----
+// While the opponent thinks, the ponder workers work through a list of opponent moves (one shared queue: whichever worker
+// is free takes the next move) and keep, for each one, the reply it found. The whole job stays inside the ponder time.
+// When the opponent moves, whatever was already found is used.
+const PONDER_SCAN_MS = 12;          // ranking pass: a very short search after each legal opponent move
+const PONDER_SCAN_SHARE = 0.35;     // the ranking pass may use at most this share of the ponder time
+const PONDER_OVERRUN_MS = 70;       // a search can overrun its ms a little (seen: +50 ms); never start one that could end late
+const PONDER_MIN_SLICE_MS = 80;     // no search shorter than this is worth using as a reply
+const PONDER_SLICE_MIN_MS = 120, PONDER_SLICE_MAX_MS = 600;
+const ponder = CV.createPonderState();
+let idleToken = 0, idleInfo = { pondering: false, evalLine: null };
+
+// ---- the ponder worker pool ----
+// ponderActive: the workers of the running job. ponderSpares: idle workers that are already instantiated AND warmed up, so
+// the next job starts at once; together they never exceed ponderCap (the setting, capped by the CPU count). A spare is
+// only made while pondering / the evaluation line is on (ponderWanted) and while no real search is running, because
+// instantiating and warming a worker would take CPU from that search.
+let ponderActive = [], ponderSpares = [];
+let ponderCap = 1, ponderWanted = false, ponderSpawnFailedAt = 0;
+// 1.8.0: the same pool also holds Stockfish workers (kind 'sf', see the Stockfish ponder section). ponderKind is the kind the
+// current settings want; spares of the other kind are killed. Stockfish workers are cancelled with `stop` instead of being
+// terminated, so for a moment they are neither active nor spare: ponderCancelling counts them against the cap.
+let ponderKind = 'aggro', ponderCancelling = [], ponderGen = 0;
+let ponderHashMb = 32;          // hash table size of the ponder workers (setting aggroPonderHashMb; the main worker always uses the engine's 32)
+let aggroThinking = 0;          // real searches in flight
+
+const ponderSpawn = () => (ponderKind === 'sf' ? spawnSfWorker('ponder', ponderHashMb) : spawnAggroWorker('ponder', ponderHashMb));
+function ponderTopUp() {
+  ponderSpares = ponderSpares.filter((w) => !w.dead);
+  if (!ponderWanted) { for (const w of ponderSpares) w.kill(); ponderSpares = []; return; }
+  for (const w of ponderSpares) if (w.ttMb !== ponderHashMb || w.kind !== ponderKind) w.kill();   // made for another hash size / another engine
+  ponderSpares = ponderSpares.filter((w) => !w.dead);
+  while (ponderActive.length + ponderSpares.length + ponderCancelling.length > ponderCap && ponderSpares.length) ponderSpares.pop().kill();   // setting lowered
+  if (aggroThinking > 0 || Date.now() - ponderSpawnFailedAt < AGGRO_ERROR_COOLDOWN_MS) return;
+  while (ponderActive.length + ponderSpares.length + ponderCancelling.length < ponderCap) {
+    const w = ponderSpawn();
+    w.ready.then(null, () => { ponderSpawnFailedAt = Date.now(); w.kill(); ponderSpares = ponderSpares.filter((x) => x !== w); });
+    ponderSpares.push(w);
+  }
+}
+// n workers for a job: warmed spares first, then new ones. The caller never asks for more than ponderCap.
+function ponderClaim(n) {
+  for (const w of ponderSpares) if (w.ttMb !== ponderHashMb || w.kind !== ponderKind) w.kill();
+  ponderSpares = ponderSpares.filter((w) => !w.dead);
+  const got = [];
+  while (got.length < n && ponderSpares.length) got.push(ponderSpares.shift());
+  while (got.length < n) got.push(ponderSpawn());
+  for (const w of got) if (w.kind === 'sf' && w.gen !== ponderGen) w.newGame(ponderGen);     // a new game began since this worker last searched
+  ponderActive.push(...got);
+  return got;
+}
+function ponderDrop(w) {          // a job worker is finished or failed: Stockfish workers are stopped and recycled, AggroChess ones killed (spares are made again by ponderTopUp)
+  if (w.kind === 'sf') { sfRelease(w); return; }
+  w.kill();
+  ponderActive = ponderActive.filter((x) => x !== w);
+}
+// The effective number of ponder workers for a setting value: the setting, but at most max(1, hardwareConcurrency - 1).
+const ponderEffectiveCount = (setting) => CV.ponderWorkerCount(setting, typeof navigator !== 'undefined' ? navigator.hardwareConcurrency : undefined);
+
+function ponderStop() {             // stop working (ALL job workers), keep what was found (used after a hit)
+  idleToken++;
+  idleInfo.pondering = false;
+  const act = ponderActive;
+  ponderActive = [];
+  for (const w of act) { if (w.kind === 'sf') sfRelease(w, true); else w.kill(); }
+  ponder.setRunning(null);
+  ponderTopUp();
+}
+function ponderCancel() {           // stop and forget everything
+  ponderStop();
+  ponder.invalidate();
+  idleInfo = { pondering: false, evalLine: null };
+}
+
+function formatEval(a, myColor) {
+  if (!a || a.none) return null;
+  const mineSign = myColor === 'b' ? -1 : 1;                 // the worker reports White's point of view
+  const v = a.value * mineSign;
+  const score = a.kind === 'mate' ? (v < 0 ? '-M' : '+M') + Math.abs(a.value) : (v >= 0 ? '+' : '\u2212') + (Math.abs(v) / 100).toFixed(2);
+  return 'Eval ' + score + ' (you) d' + a.depth + ' \u00b7 opp best ' + (a.bestSan || a.bestUci) + (a.book ? ' (book)' : '');
+}
+
+// Score of an analysis from OUR point of view (higher = better for us); mates become +-100000.
+function ourScore(a, myColor) {
+  const v = a.value * (myColor === 'b' ? -1 : 1);
+  return a.kind === 'mate' ? (v > 0 ? 100000 - Math.abs(a.value) : -100000 + Math.abs(a.value)) : v;
+}
+
+// The idle job: after our move, while the opponent thinks. Runs detached; every step re-checks its token.
+async function runIdle(msg, token) {
+  if (msg.ponder) idleInfo.pondering = true;                   // the job has started (the workers may still be loading)
+  try { await runIdleJob(msg, token); } finally { if (token === idleToken) idleInfo.pondering = false; }
+}
+async function runIdleJob(msg, token) {
+  const t0 = Date.now();
+  const budget = Math.max(200, Math.min(AGGRO_HARD_MAX_MS, Number(msg.ponderMs) || 1500));
+  const deadline = t0 + budget;
+  const left = () => deadline - Date.now();
+  const main = aggroGet();
+  await main.ready;
+  let predicted = null;
+  try {
+    const r = await main.request({ type: 'ponderMove', ...posFor(msg.startFen, msg.moves) }, AGGRO_QUICK_REQ_MS);
+    predicted = r.uci && r.uci !== 'none' ? r.uci : null;      // a hint for ranking only
+  } catch (e) { predicted = null; }
+  if (token !== idleToken) return;
+  const after = CV.replayUci(msg.startFen, msg.moves);
+  if (!after.ok) return;
+  const legal = CV.chess.legalMoves(after.pos);                // the opponent's possible moves
+
+  // the workers of this job: ponderCap of them when pondering, one for the evaluation line alone
+  const pool = ponderClaim(msg.ponder ? Math.max(1, ponderCap) : 1);
+  const doPonder = !!msg.ponder && legal.length > 0;
+  if (doPonder) ponder.begin(msg.startFen, msg.moves, legal.map((m) => m.uci));
+  const req = (w, m, ms) => w.request(m, ms * AGGRO_THINK_FACTOR + AGGRO_THINK_MARGIN_MS + 200);
+
+  // shared queue 1 - ranking: how good is each opponent move for the opponent? (a very short search after each)
+  const scoreOf = new Map();
+  const scanMs = Math.max(5, Math.min(PONDER_SCAN_MS, Math.floor((budget * PONDER_SCAN_SHARE) / Math.max(1, legal.length))));
+  const scanEnd = t0 + budget * PONDER_SCAN_SHARE;
+  const rank = { next: 0, pending: 0, ended: false };
+  let rankedList = null, resolveRanked = null;
+  const ranked = new Promise((r) => { resolveRanked = r; });
+  const finishRanking = () => {
+    if (rankedList || !rank.ended || rank.pending > 0) return;
+    rankedList = legal.map((m) => m.uci).filter((u) => scoreOf.get(u) !== null)
+      .sort((x, y) => (scoreOf.has(x) ? scoreOf.get(x) : Infinity) - (scoreOf.has(y) ? scoreOf.get(y) : Infinity));
+    resolveRanked();
+  };
+  const rankClaim = () => {
+    if (!rank.ended && (rank.next >= legal.length || Date.now() > scanEnd || left() < PONDER_OVERRUN_MS || token !== idleToken)) rank.ended = true;
+    if (rank.ended) { finishRanking(); return null; }
+    rank.pending++;
+    return legal[rank.next++];
+  };
+  // shared queue 2 - replies, most likely opponent move first, each with its own slice; nothing starts after the deadline
+  const slice = Math.max(PONDER_SLICE_MIN_MS, Math.min(PONDER_SLICE_MAX_MS, Math.round(budget / 6)));
+  let replyNext = 0;
+  const replyClaim = () => {
+    if (token !== idleToken || !rankedList || replyNext >= rankedList.length) return null;
+    const ms = Math.min(slice, left() - PONDER_OVERRUN_MS);
+    if (ms < PONDER_MIN_SLICE_MS) return null;
+    return { u: rankedList[replyNext++], ms };
+  };
+
+  const work = async (w, first) => {
+    try {
+      await w.ready;
+      if (token !== idleToken) return;
+      idleInfo.pondering = !!msg.ponder;
+      if (first && msg.showEval) {                             // the evaluation line runs on the first worker, the others start ranking meanwhile
+        const next = predicted && legal.some((m) => m.uci === predicted) ? predicted : undefined;
+        const a = await req(w, { type: 'analyze', ...posFor(msg.startFen, msg.moves), ms: AGGRO_EVAL_MS, next }, AGGRO_EVAL_MS);
+        if (token === idleToken) idleInfo.evalLine = formatEval(a, msg.myColor);
+      }
+      if (!doPonder) return;
+      for (let m = rankClaim(); m; m = rankClaim()) {
+        try {
+          const a = await req(w, { type: 'analyze', ...posFor(msg.startFen, [...msg.moves, m.uci]), ms: scanMs }, scanMs);
+          if (!a || a.none) scoreOf.set(m.uci, null);          // we would have no move there (game over): nothing to prepare
+          else scoreOf.set(m.uci, ourScore(a, msg.myColor) - (m.uci === predicted ? 30 : 0));   // lowest = best for the opponent
+        } finally { rank.pending--; finishRanking(); }
+      }
+      await ranked;                                            // the replies are taken in ranked order, so wait for the last ranking search
+      for (let c = replyClaim(); c; c = replyClaim()) {
+        ponder.addRunning(c.u);
+        try {
+          if (PONDER_STEPPED && w.steps) {                      // one depth at a time: every finished depth is a usable (partial) reply
+            const sliceEnd = Date.now() + c.ms;
+            for (let d = 1; d <= PONDER_STEP_MAX_DEPTH; d++) {
+              const ms = Math.min(sliceEnd - Date.now(), left() - PONDER_OVERRUN_MS);
+              if (ms < PONDER_STEP_MIN_MS || token !== idleToken) break;
+              const r = await req(w, { type: 'think', ...posFor(msg.startFen, [...msg.moves, c.u]), depth: d, ms }, ms);
+              if (token !== idleToken) return;
+              const res = aggroResult(r);
+              if (!res) break;
+              ponder.addResult(c.u, { ...res, ms: c.ms });
+              if (res.depth < d || /^mate/.test(String(res.score))) break;   // cut by the clock, or a forced mate: deeper adds nothing
+            }
+          } else {
+            const r = await req(w, { type: 'think', ...posFor(msg.startFen, [...msg.moves, c.u]), ms: c.ms }, c.ms);
+            if (token !== idleToken) return;
+            const res = aggroResult(r);
+            if (res) ponder.addResult(c.u, { ...res, ms: c.ms });
+          }
+        } finally { ponder.removeRunning(c.u); }
+      }
+    } catch (e) {
+      if (token === idleToken) { console.error('[ChessVision] AggroChess ponder worker stopped', e); ponderDrop(w); }   // the other workers go on
+    }
+  };
+  try {
+    await Promise.all(pool.map((w, i) => work(w, i === 0)));
+  } finally {
+    if (token === idleToken) {
+      ponder.setRunning(null); idleInfo.pondering = false;
+      for (const w of pool) ponderDrop(w);                     // finished or failed: free the workers, keep the results
+      ponderTopUp();                                           // ... and warm replacements for the next job
+    }
+  }
+}
+
+function aggroIdle(msg) {
+  if (msg.engine === 'stockfish') return sfIdle(msg);
+  ponderKind = 'aggro';
+  ponderWanted = !!(msg.ponder || msg.showEval);               // before ponderCancel: its top-up uses these
+  ponderCap = msg.ponder ? ponderEffectiveCount(msg.ponderWorkers) : 1;
+  ponderHashMb = CV.sanitize({ aggroPonderHashMb: msg.ponderHashMb }).aggroPonderHashMb || CV.DEFAULTS.aggroPonderHashMb;
+  ponderCancel();
+  const token = idleToken;
+  if (!(msg.ponder || msg.showEval) || typeof msg.startFen !== 'string' || !Array.isArray(msg.moves)) return { state: 'off' };
+  runIdle(msg, token).catch((e) => { if (token === idleToken) console.error('[ChessVision] AggroChess idle job failed', e); });
+  return { state: 'started' };
+}
+
+// The real request. Never throws: failures come back as { error } .
+async function analyzeAggro(msg) {
+  aggroThinking++;                     // while a real search runs, no spare ponder worker is made (see ponderTopUp)
+  try { return await analyzeAggroNow(msg); } finally { aggroThinking--; ponderTopUp(); }
+}
+async function analyzeAggroNow(msg) {
+  try {
+    // 1) an answer already found while pondering wins; anything else stops the ponder worker at once
+    const hist = typeof msg.startFen === 'string' && Array.isArray(msg.moves);
+    if (!msg.ponder) ponderCancel();
+    else {
+      const d = ponder.decide(hist ? msg.startFen : null, hist ? msg.moves : null);
+      if (d.decision === 'hit') { ponderStop(); const e = d.result; return { uci: e.uci, best: e.uci, san: e.san, sacrifice: e.sacrifice, depth: e.depth, ponderHit: true }; }
+      ponderCancel();                                          // miss, late or no entry yet: the ponder workers never delay a real think
+    }
+    const h = aggroGet();
+    await h.ready;
+    // 2) older requests' results would be stale
+    for (const [id, p] of h.pending) { if (p.think) { h.pending.delete(id); clearTimeout(p.timer); p.resolve({ type: 'bestmove', uci: null }); } }
+    const warn = msg.verify ? await aggroVerifyPosition(h, msg) : null;
+    // 3) think: a fixed budget, or the clock budget (soft/hard) when the page sent one
+    const pos = aggroPosition(msg);
+    let req;
+    const hardOk = Number(msg.hard) > 0 && Number(msg.soft) > 0;
+    if (hardOk) {
+      const hard = Math.min(AGGRO_HARD_MAX_MS, Math.round(msg.hard)), soft = Math.min(hard, Math.round(msg.soft));   // soft above hard would overrun
+      req = { type: 'think', ...pos, soft, hard, ms: hard };
+    } else req = { type: 'think', ...pos, ms: Math.max(100, Math.min(AGGRO_HARD_MAX_MS, Number(msg.ms) || 1000)) };
+    const reqMs = hardOk ? req.hard : req.ms;
+    const r = await h.request(req, reqMs * AGGRO_THINK_FACTOR + AGGRO_THINK_MARGIN_MS).catch((e) => {
+      if (/no answer within/.test(e.message)) { h.kill(); if (aggroMain === h) aggroMain = null; }   // wasm think() blocks: only a new worker helps
+      throw e;
+    });
+    const res = aggroResult(r);
+    if (res && warn) res.verifyWarning = warn;
+    return res;
+  } catch (e) {
+    const why = (e && e.message) || String(e);
+    console.error('[ChessVision] AggroChess:', why);
+    return { error: 'AggroChess: ' + why };
+  }
+}
+
+// ======================= Stockfish pondering (1.8.0) =======================
+// The same pool (ponderActive / ponderSpares / ponderCap, one shared `ponder` state, one idle token) now also runs Stockfish
+// workers. Differences from AggroChess, all because Stockfish can be stopped while it searches and keeps its hash:
+//   - a worker is cancelled with `stop` + `isready` (about 20 ms) and goes back to the spares; terminate() is only the escape
+//     hatch when it does not answer within SF_STOP_TIMEOUT_MS. The MAIN Stockfish worker is never used for idle work.
+//   - ranking: ONE MultiPV search of the position the opponent faces ranks their moves (SF_RANK_MODE 'multipv'), or, as before
+//     for AggroChess, a very short search after every legal move ('scan'). Chosen with tests/bench-stockfish.js (--only rank).
+//   - a reply search that is still running when the opponent plays exactly that move can be stopped and used if it already
+//     reached SF_PARTIAL_MIN_DEPTH (the final bestmove belongs to exactly that position).
+const SF_RANK_MODE = 'multipv';        // 'multipv' | 'scan'
+const SF_RANK_LINES = 8;               // MultiPV lines of the ranking search (at most the number of legal moves)
+const SF_RANK_MS = 120;                // ... and its time
+const SF_SCAN_MS = 20;                 // 'scan' mode: time per legal opponent move
+const SF_WARM_FEN = 'r3k2r/p1ppqpb1/bn2pnp1/3PN3/1p2P3/2N2Q1p/PPPBBPPP/R3K2R w KQkq - 0 1';   // a non-book middlegame, as for AggroChess
+const SF_WARM_MS = 10;                 // warm-up search before a worker counts as ready
+const SF_STOP_TIMEOUT_MS = 1500;       // no bestmove / readyok after `stop` + `isready` within this long = terminate the worker
+const SF_SEARCH_MARGIN_MS = 3000;      // a search may take its movetime plus this before the worker is declared stuck
+const SF_PARTIAL_MIN_DEPTH = 8;        // a stopped reply search is used only if it reached this depth
+const SF_HARVEST_MS = 150;             // ... and `stop` must answer within this long (a real search never waits longer)
+const SF_PONDER_SCAN_SHARE = 0.35;     // the ranking pass may use at most this share of the ponder time
+
+// One Stockfish ponder worker: { kind:'sf', ready, search(), cancel(), newGame(gen), kill(), dead, task }.
+// At most one search is in flight; `task` is set from `go` until its `bestmove`. A new `go` is only sent after the previous
+// bestmove (and, after a cancel, a readyok), so a bestmove can never be taken for another position's.
+function spawnSfWorker(label, hashMb) {
+  const h = { kind: 'sf', label, ttMb: hashMb || null, worker: null, dead: false, task: null, syncWait: null, multipv: null, gen: ponderGen, how: null, warmMs: null };
+  h.kill = () => {
+    if (h.dead) return;
+    h.dead = true;
+    try { if (h.worker) h.worker.terminate(); } catch (e) { /* ignore */ }
+    if (h.task) { const t = h.task; h.task = null; clearTimeout(t.timer); t.reject(new Error('worker was terminated')); }
+    if (h.syncWait) { const x = h.syncWait; h.syncWait = null; clearTimeout(x.timer); x.resolve(false); }
+  };
+  // isready -> readyok; false after the timeout (the caller terminates)
+  h.sync = (ms) => new Promise((resolve) => {
+    if (h.dead) { resolve(false); return; }
+    const x = { resolve, timer: setTimeout(() => { h.syncWait = null; resolve(false); }, ms) };
+    h.syncWait = x;
+    try { h.worker.postMessage('isready'); } catch (e) { clearTimeout(x.timer); h.syncWait = null; resolve(false); }
+  });
+  const onLine = (line) => {
+    if (line === 'readyok') { const x = h.syncWait; if (x) { h.syncWait = null; clearTimeout(x.timer); x.resolve(true); } return; }
+    const t = h.task;
+    if (!t) return;
+    if (line.startsWith('info ')) { const p = CV.sfParseInfo(line); if (p && !p.bound) { t.lines.set(p.mpv, p); if (p.mpv === 1) t.depth = p.depth; } return; }
+    if (line.startsWith('bestmove')) {
+      h.task = null; clearTimeout(t.timer);
+      t.resolve({ best: line.split(' ')[1], depth: t.depth, lines: t.lines, stopped: t.stopped, key: t.key });
+    }
+  };
+  h.ready = (async () => {
+    const module = await sfModuleFor();
+    let r = null;
+    if (module) {
+      try { r = await sfSpawn(SF_FILE, { hashMb, wrapper: true, module, timeoutMs: Math.min(SF_START_TIMEOUT_MS, SF_WRAPPER_TIMEOUT_MS) }); h.how = 'shared module'; }
+      catch (e) { console.error('[ChessVision] Stockfish (' + label + '): wrapper start failed (' + ((e && e.message) || e) + '); trying the loader directly'); }
+    }
+    if (!r) { r = await sfSpawn(SF_FILE, { hashMb }); h.how = 'direct'; }
+    if (h.dead) { try { r.worker.terminate(); } catch (e) { /* ignore */ } throw new Error('worker was terminated'); }
+    h.worker = r.worker;
+    h.worker.onmessage = (e) => onLine(typeof e.data === 'string' ? e.data : '');
+    h.worker.onerror = (e) => { console.error('[ChessVision] Stockfish (' + label + ') error', e && e.message); h.kill(); };
+    // warm-up: the first search of a fresh engine pays for its own lazy set-up; do it before the worker counts as ready
+    const t0 = Date.now();
+    h.worker.postMessage('ucinewgame');
+    if (!(await h.sync(SF_STOP_TIMEOUT_MS))) throw new Error('no readyok after ucinewgame');
+    await h.search(SF_WARM_FEN, [], 'go movetime ' + SF_WARM_MS, 'warm');
+    h.worker.postMessage('ucinewgame');
+    if (!(await h.sync(SF_STOP_TIMEOUT_MS))) throw new Error('no readyok after the warm-up');
+    h.warmMs = Date.now() - t0;
+    sfDbg.workerStarts++; sfDbg.lastStart = { label, file: SF_FILE, how: h.how, warmMs: h.warmMs };
+  })();
+  h.ready = h.ready.catch((e) => { h.kill(); throw e; });      // a worker that failed to start or warm up is never reused
+  h.ready.catch(() => {});
+  // Searches one position. key = what the result is for (an opponent move, 'rank', 'warm'); movetime comes from `go`.
+  h.search = (startFen, moves, go, key, multipv) => new Promise((resolve, reject) => {
+    if (h.dead || !h.worker) { reject(new Error('worker was terminated')); return; }
+    if (h.task) { reject(new Error('worker is busy')); return; }
+    const ms = Number((/movetime (\d+)/.exec(go) || [])[1]) || 1000;
+    const t = { key, lines: new Map(), depth: 0, stopped: false };
+    let settle; t.promise = new Promise((res) => { settle = res; });      // resolves with the result, or null when the search failed (cancel() and the harvest wait on it)
+    t.resolve = (v) => { resolve(v); settle(v); };
+    t.reject = (e) => { reject(e); settle(null); };
+    t.timer = setTimeout(() => { h.task = null; t.reject(new Error('no answer within ' + (ms + SF_SEARCH_MARGIN_MS) + ' ms')); h.kill(); }, ms + SF_SEARCH_MARGIN_MS);
+    h.task = t;
+    try {
+      const mpv = multipv || 1;
+      if (h.multipv !== mpv) { h.worker.postMessage('setoption name MultiPV value ' + mpv); h.multipv = mpv; }
+      h.worker.postMessage(CV.sfPositionCommand(startFen, startFen, moves));
+      h.worker.postMessage(go);
+    } catch (e) { h.task = null; clearTimeout(t.timer); t.reject(e); }
+  });
+  // stop + isready. true = idle again; false = it did not answer and was terminated.
+  h.cancel = async () => {
+    if (h.dead) return false;
+    const t = h.task;
+    if (t) {
+      t.stopped = true;
+      try { h.worker.postMessage('stop'); } catch (e) { h.kill(); return false; }
+      const got = await Promise.race([t.promise, new Promise((r) => setTimeout(() => r(null), SF_STOP_TIMEOUT_MS))]).catch(() => null);
+      if (!got) { h.kill(); return false; }
+    }
+    if (!(await h.sync(SF_STOP_TIMEOUT_MS))) { h.kill(); return false; }
+    return true;
+  };
+  h.newGame = (gen) => { h.gen = gen; try { if (h.worker && !h.dead) h.worker.postMessage('ucinewgame'); } catch (e) { /* ignore */ } };   // runs in order, before the next position
+  return h;
+}
+
+// A job worker is finished or the job was cancelled: stop it, wait for readyok (it never blocks anyone: only the worker is
+// busy), then it is a warm spare again, or it is killed when it did not answer / is no longer wanted.
+async function sfRelease(w) {
+  ponderActive = ponderActive.filter((x) => x !== w);
+  if (ponderCancelling.includes(w) || w.dead) return;
+  ponderCancelling.push(w);
+  let ok = false;
+  try { ok = await w.cancel(); } catch (e) { ok = false; }
+  ponderCancelling = ponderCancelling.filter((x) => x !== w);
+  if (!ok || w.dead) { w.kill(); ponderTopUp(); return; }
+  ponderSpares = ponderSpares.filter((x) => !x.dead);
+  if (!ponderWanted || ponderKind !== 'sf' || w.ttMb !== ponderHashMb || ponderActive.length + ponderSpares.length + ponderCancelling.length >= ponderCap) { w.kill(); return; }
+  ponderSpares.push(w);
+}
+
+// The idle job for Stockfish: after our move, while the opponent thinks. Detached; every step re-checks its token.
+async function runIdleSf(msg, token) {
+  idleInfo.pondering = true;
+  try { await runIdleSfJob(msg, token); } finally { if (token === idleToken) idleInfo.pondering = false; }
+}
+async function runIdleSfJob(msg, token) {
+  const t0 = Date.now();
+  const budget = Math.max(200, Math.min(AGGRO_HARD_MAX_MS, Number(msg.ponderMs) || 1500));
+  const deadline = t0 + budget, left = () => deadline - Date.now();
+  const after = CV.replayUci(msg.startFen, msg.moves);
+  if (!after.ok) return;
+  const legal = CV.chess.legalMoves(after.pos).map((m) => m.uci);          // the opponent's possible moves
+  if (!legal.length) return;
+  const depth = Math.max(1, Math.min(CV.LIMITS.depth[1], Number(msg.depth) || CV.DEFAULTS.depth));
+  const mode = legal.length < 2 ? 'single' : SF_RANK_MODE;
+  const pool = ponderClaim(Math.max(1, ponderCap));
+  ponder.begin(msg.startFen, msg.moves, legal);
+  const goFor = (ms) => CV.sfGoCommand(depth, ms);
+  const req = (w, startFen, moves, ms, key, mpv) => w.search(startFen, moves, goFor(ms), key, mpv);
+
+  // ranking: lists the opponent's moves, most likely first
+  const scoreOf = new Map();
+  const rank = { owner: null, next: 0, pending: 0, ended: false };
+  let rankedList = null, resolveRanked = null;
+  const ranked = new Promise((r) => { resolveRanked = r; });
+  const setRanked = (list) => { if (!rankedList) { rankedList = list; resolveRanked(); } };
+  if (mode === 'single') setRanked(legal.slice());
+  const scanMs = Math.max(5, Math.min(SF_SCAN_MS, Math.floor((budget * SF_PONDER_SCAN_SHARE) / Math.max(1, legal.length))));
+  const scanEnd = t0 + budget * SF_PONDER_SCAN_SHARE;
+  const scanClaim = () => {
+    if (!rank.ended && (rank.next >= legal.length || Date.now() > scanEnd || left() < PONDER_OVERRUN_MS || token !== idleToken)) rank.ended = true;
+    if (rank.ended) { if (rank.pending === 0) setRanked(CV.sfRankFromScan(legal, scoreOf)); return null; }
+    rank.pending++;
+    return legal[rank.next++];
+  };
+  // replies: most likely opponent move first, each with its own slice; nothing starts after the deadline
+  const slice = Math.max(PONDER_SLICE_MIN_MS, Math.min(PONDER_SLICE_MAX_MS, Math.round(budget / 6)));
+  let replyNext = 0;
+  const replyClaim = () => {
+    if (token !== idleToken || !rankedList || replyNext >= rankedList.length) return null;
+    const ms = mode === 'single' ? left() - PONDER_OVERRUN_MS : Math.min(slice, left() - PONDER_OVERRUN_MS);   // one legal move: think about it for the whole time
+    if (ms < PONDER_MIN_SLICE_MS) return null;
+    return { u: rankedList[replyNext++], ms };
+  };
+
+  const work = async (w) => {
+    try {
+      await w.ready;
+      if (token !== idleToken) return;
+      idleInfo.pondering = true;
+      if (mode === 'multipv') {
+        if (!rank.owner) {                                      // the first worker that is ready ranks; the others wait for the list
+          rank.owner = w;
+          const k = Math.min(legal.length, SF_RANK_LINES), ms = Math.max(30, Math.min(SF_RANK_MS, Math.floor(budget * SF_PONDER_SCAN_SHARE)));
+          try {
+            const r = await w.search(msg.startFen, msg.moves, 'go movetime ' + ms, 'rank', k);   // not depth-limited: the ranking should use its time
+            if (token !== idleToken) return;
+            setRanked(CV.sfRankFromLines(legal, r.lines));
+          } catch (e) { setRanked(legal.slice()); throw e; }    // unranked (legal order) so the others still work; this worker drops out
+        }
+      } else if (mode === 'scan') {
+        for (let m = scanClaim(); m; m = scanClaim()) {
+          try {
+            const r = await req(w, msg.startFen, [...msg.moves, m], scanMs, 'scan');
+            if (token !== idleToken) return;
+            const top = r.lines.get(1);
+            scoreOf.set(m, !r.best || r.best === '(none)' || !top ? null : CV.sfScoreValue(top.cp, top.mate));   // our score (we are to move): lowest = best for the opponent
+          } finally { rank.pending--; if (rank.ended && rank.pending === 0) setRanked(CV.sfRankFromScan(legal, scoreOf)); }
+        }
+      }
+      await ranked;
+      for (let c = replyClaim(); c; c = replyClaim()) {
+        ponder.addRunning(c.u);
+        try {
+          const r = await req(w, msg.startFen, [...msg.moves, c.u], c.ms, c.u);
+          if (token !== idleToken) return;
+          if (!r.stopped && r.best && r.best !== '(none)') ponder.addResult(c.u, { uci: r.best, depth: r.depth, ms: c.ms });
+        } finally { ponder.removeRunning(c.u); }
+      }
+    } catch (e) {
+      if (token === idleToken) { console.error('[ChessVision] Stockfish ponder worker stopped', e); ponderDrop(w); }   // the other workers go on
+    }
+  };
+  try {
+    await Promise.all(pool.map((w) => work(w)));
+  } finally {
+    if (token === idleToken) {
+      ponder.setRunning(null); idleInfo.pondering = false;
+      for (const w of pool) ponderDrop(w);                     // finished or failed: stop them (they stay warm), keep the results
+      ponderTopUp();
+    }
+  }
+}
+
+function sfIdle(msg) {
+  ponderKind = 'sf';
+  ponderWanted = !!msg.ponder;                                 // before ponderCancel: its top-up uses these
+  ponderCap = msg.ponder ? ponderEffectiveCount(msg.ponderWorkers) : 1;
+  ponderHashMb = CV.sanitize({ sfPonderHashMb: msg.ponderHashMb }).sfPonderHashMb || CV.DEFAULTS.sfPonderHashMb;
+  ponderCancel();
+  const token = idleToken;
+  if (!msg.ponder || typeof msg.startFen !== 'string' || !Array.isArray(msg.moves)) return { state: 'off' };
+  runIdleSf(msg, token).catch((e) => { if (token === idleToken) console.error('[ChessVision] Stockfish idle job failed', e); });
+  return { state: 'started' };
+}
+
+// New game (or the panel's button): clear the hash of the main worker and forget the ponder state.
+function aggroClear() {
+  ponderGen++;                         // Stockfish ponder workers send ucinewgame before their next job (see ponderClaim)
+  ponderCancel();
+  if (aggroMain && !aggroMain.dead) aggroMain.request({ type: 'clear' }, AGGRO_QUICK_REQ_MS).catch(() => {});
+}
+function clearEngines() {
+  aggroClear();
+  if (sf && !sfCurrent) sf.postMessage('ucinewgame');         // Stockfish: new game now ...
+  else sfPrevCount = null;                                    // ... or before its next search if it is busy
+}
+
+// ======================= Allowed pages =======================
+// Content scripts can't read extension files directly, so the background page serves the list.
+let allowlistText = null;
+async function loadAllowlist() {
+  if (allowlistText === null) {
+    try {
+      allowlistText = await (await fetch(api.runtime.getURL('allowed-pages.txt'))).text();
+    } catch (e) {
+      console.error('[ChessVision] could not read allowed-pages.txt', e);
+      return '';
+    }
+  }
+  return allowlistText;
 }
 
 // ======================= Messaging =======================
 api.runtime.onMessage.addListener((msg) => {
+  if (msg && msg.type === 'allowlist') return loadAllowlist();
+  if (msg && msg.type === 'fetchImage') return fetchImage(msg.url);
+  if (msg && msg.type === 'aggroClear') { aggroClear(); return Promise.resolve({ ok: true }); }
+  if (msg && msg.type === 'clearEngines') { clearEngines(); return Promise.resolve({ ok: true }); }
+  if (msg && msg.type === 'aggroInvalidate') { ponderWanted = false; ponderCancel(); return Promise.resolve({ ok: true }); }   // also frees the spares
+  if (msg && msg.type === 'aggroIdle') return Promise.resolve(aggroIdle(msg));
+  if (msg && msg.type === 'aggroIdleStatus') return Promise.resolve({ pondering: idleInfo.pondering, evalLine: idleInfo.evalLine, found: ponder.found() });
+  if (msg && msg.type === 'aggroDebug') {
+    return Promise.resolve({ ponder: { ...ponder.counters }, verify: { checks: aggroDbg.verifyChecks, warnings: aggroDbg.verifyWarnings, last: aggroDbg.lastVerify },
+      aggroWorkerAlive: !!(aggroMain && !aggroMain.dead), aggroRestarts: aggroDbg.restarts, aggroFailure: aggroFailure ? aggroFailure.message : null,
+      ponderPool: { cap: ponderCap, active: ponderActive.filter((w) => !w.dead).length, spares: ponderSpares.filter((w) => !w.dead).length, wanted: ponderWanted },
+      module: { ...aggroModuleInfo, sendFailures: aggroDbg.moduleSendFailures }, ponderHashMb, ponderStepped: PONDER_STEPPED, workerStarts: aggroDbg.workerStarts, lastWorkerStart: aggroDbg.lastStart,
+      stockfish: { active: sfActive, threads: sfThreadsSent, threadedFailed: sfDbg.threadedFailed, threadedStarts: sfDbg.threadedStarts, sab: sfSab, module: { ...sfModuleInfo, sendFailures: sfDbg.moduleSendFailures },
+        poolKind: ponderKind, cancelling: ponderCancelling.length, harvested: sfDbg.harvested, harvestFailed: sfDbg.harvestFailed, workerStarts: sfDbg.workerStarts, lastWorkerStart: sfDbg.lastStart, rankMode: SF_RANK_MODE } });
+  }
   if (!msg || msg.type !== 'analyze') return;
   return msg.engine === 'stockfish'
-    ? analyzeStockfish(msg.fen, msg.depth)
-    : analyzeAggro(msg.fen, msg.ms);
+    ? analyzeStockfish(msg.fen, msg.depth, msg.imperfection, msg.sfMaxMs, msg.startFen, msg.moves, msg)
+    : analyzeAggro(msg);
 });
 
 initStockfish();

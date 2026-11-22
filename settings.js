@@ -1,0 +1,392 @@
+// Shared settings: defaults, limits and validation.
+// Loaded by the content scripts and by the popup (isolated world, shared `CV` namespace).
+(function (root) {
+  'use strict';
+  const CV = (root.CV = root.CV || {});
+
+  CV.DEFAULTS = {
+    // --- core ---
+    enabled: false,
+    engine: 'aggro',          // 'aggro' | 'stockfish'
+    depth: 10,                // Stockfish search depth
+    sfMaxMs: 0,               // Stockfish max think time per move in ms (0 = off: search to the full depth)
+    thinkMs: 1000,            // AggroChess think time
+    minDelay: 300,            // ms, lower bound of the pre-move delay
+    maxDelay: 800,            // ms, upper bound of the pre-move delay
+
+    // --- human-like play ---
+    humanize: true,           // master switch for the block below
+    delayStyle: 'natural',    // 'natural' | 'uniform'
+    hesitation: true,         // rare, longer pauses
+    mouseMove: true,          // cursor glides along a curved path
+    clickOffset: true,        // click a random spot inside the square, not the centre
+    inputMode: 'click',       // 'click' | 'drag' | 'mixed'
+    imperfection: 0,          // % chance per move of a near-best alternative (Stockfish only)
+
+    // --- quick replies ---
+    quickReplies: true,       // master switch for the block below
+    quickOnlyMove: true,      // only one legal move
+    quickRecapture: true,     // retake the piece that just captured
+    quickPromotion: true,     // promotion and passed-pawn runs in endgames
+    quickMate: true,          // mate in one
+    quickMinDelay: 80,        // ms
+    quickMaxDelay: 300,       // ms
+    quickThinkMs: 300,        // ms, reduced AggroChess budget when a move looks obvious
+
+    // --- watchdog ---
+    watchdogMs: 1000,         // how often the board is re-read, whatever the DOM says
+
+    // --- AggroChess options (shown only when the engine is AggroChess) ---
+    aggroUseClock: true,      // size the search from my chess.com clock (think_clock) when a clock can be read
+    aggroPonder: false,       // think on the opponent's time with a second, killable worker
+    aggroPonderMs: 1500,      // ms of pondering per opponent move
+    aggroPonderHashMb: 32,    // hash table of each ponder worker in MB (32 = the engine's own size; lower fits more workers on a phone)
+    aggroPonderWorkers: 1,    // ponder workers working through the opponent's moves together (~50 MiB each; capped by the CPU count)
+    aggroShowEval: false,     // show a short evaluation line while the opponent is thinking
+    aggroVerify: false,       // compare the engine's position with the page's (warn only)
+
+    // --- Stockfish options (shown only when the engine is Stockfish) ---
+    sfUseClock: false,        // cap the search with a budget sized from my chess.com clock (never more than a quarter of what is left)
+    sfPonder: false,          // think on the opponent's time with extra Stockfish workers (never the main one)
+    sfPonderMs: 1500,         // ms of pondering per opponent move (a ceiling)
+    sfPonderWorkers: 1,       // ponder workers sharing the opponent's moves (capped by the CPU count; each costs wasm memory + its hash)
+    sfPonderHashMb: 16,       // hash table of each ponder worker in MB (the main worker keeps 32)
+    sfThreads: 1,             // search threads of the MAIN worker; above 1 only with the threaded build and only if the browser allows SharedArrayBuffer
+
+    // --- game recording and saving ---
+    saveWithSacrifices: false,       // save a finished game when its counted sacrifices reach the threshold
+    saveSacrificeThreshold: 3,
+    saveEveryGame: false,            // save every finished game
+    sacrificeTypePawn: true,         // which sacrificed piece types are counted (the type of the piece that moved)
+    sacrificeTypeKnight: true,
+    sacrificeTypeBishop: true,
+    sacrificeTypeRook: true,
+    sacrificeTypeQueen: true,
+    maxSavedGames: 50,
+    countBrilliants: false,          // best effort: read chess.com's post-game popup
+    brilliantWaitSec: 4,
+
+    // --- overlay UI ---
+    overlayOpen: true,
+    overlayX: null,           // null = default corner
+    overlayY: null,
+  };
+
+  // [min, max, step]
+  CV.LIMITS = {
+    depth: [1, 20, 1],
+    sfMaxMs: [0, 10000, 100],
+    thinkMs: [200, 5000, 100],
+    minDelay: [100, 3000, 50],
+    maxDelay: [100, 3000, 50],
+    imperfection: [0, 30, 1],
+    quickMinDelay: [40, 1000, 10],
+    quickMaxDelay: [40, 1500, 10],
+    quickThinkMs: [100, 2000, 50],
+    watchdogMs: [200, 5000, 100],
+    aggroPonderMs: [200, 5000, 100],
+    aggroPonderWorkers: [1, 3, 1],
+    aggroPonderHashMb: [4, 64, 4],
+    sfPonderMs: [200, 5000, 100],
+    sfPonderWorkers: [1, 3, 1],
+    sfPonderHashMb: [4, 64, 4],
+    sfThreads: [1, 4, 1],
+    saveSacrificeThreshold: [1, 20, 1],
+    maxSavedGames: [5, 200, 1],
+    brilliantWaitSec: [1, 15, 1],
+  };
+
+  CV.ENUMS = {
+    engine: ['aggro', 'stockfish'],
+    delayStyle: ['natural', 'uniform'],
+    inputMode: ['click', 'drag', 'mixed'],
+  };
+
+  // Returns a cleaned copy of `obj`: unknown keys dropped, numbers clamped, enums checked.
+  CV.sanitize = function (obj) {
+    const out = {};
+    for (const k of Object.keys(CV.DEFAULTS)) {
+      if (!(k in obj)) continue;
+      const v = obj[k], def = CV.DEFAULTS[k];
+      if (CV.LIMITS[k]) {
+        const n = Number(v);
+        if (!Number.isFinite(n)) continue;
+        const [lo, hi, step] = CV.LIMITS[k];
+        const dec = (String(step).split('.')[1] || '').length;   // 0.05 -> 2: avoids 0.30000000000000004
+        out[k] = +Math.min(hi, Math.max(lo, Math.round(n / step) * step)).toFixed(dec);
+      } else if (CV.ENUMS[k]) {
+        if (CV.ENUMS[k].includes(v)) out[k] = v;
+      } else if (typeof def === 'boolean') {
+        out[k] = !!v;
+      } else if (k === 'overlayX' || k === 'overlayY') {
+        out[k] = Number.isFinite(Number(v)) && v !== null ? Number(v) : null;
+      }
+    }
+    return out;
+  };
+
+  // ---- Stockfish helpers (pure; used by background.js) ----
+  const SF_START_PLACEMENT = 'rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR';
+  const fenPlacement = (fen) => String(fen || '').split(' ')[0];
+
+  // Number of pieces on the board in a FEN.
+  CV.sfPieceCount = function (fen) {
+    return (fenPlacement(fen).match(/[a-zA-Z]/g) || []).length;
+  };
+
+  // True when a request starts a new game: the engine has not searched yet, the position is the standard
+  // start position, or there are more pieces than in the previous request (pieces never come back in one game).
+  // Only then is `ucinewgame` sent; within a game the search state (hash table) is kept.
+  CV.sfIsNewGame = function (prevCount, fen) {
+    if (prevCount === null || prevCount === undefined) return true;
+    return fenPlacement(fen) === SF_START_PLACEMENT || CV.sfPieceCount(fen) > prevCount;
+  };
+
+  // The UCI `go` command. maxMs 0/invalid = depth only; otherwise whichever limit is reached first stops the search.
+  CV.sfGoCommand = function (depth, maxMs) {
+    const [dlo, dhi] = CV.LIMITS.depth, [mlo, mhi] = CV.LIMITS.sfMaxMs;
+    const d = Math.min(dhi, Math.max(dlo, Math.round(Number(depth)) || CV.DEFAULTS.depth));
+    const m = Math.min(mhi, Math.max(mlo, Math.round(Number(maxMs)) || 0));
+    return 'go depth ' + d + (m > 0 ? ' movetime ' + m : '');
+  };
+
+  // Keeps min <= max for the two delay pairs.
+  CV.fixRanges = function (c) {
+    if (c.minDelay > c.maxDelay) c.maxDelay = c.minDelay;
+    if (c.quickMinDelay > c.quickMaxDelay) c.quickMaxDelay = c.quickMinDelay;
+    return c;
+  };
+
+
+
+  // ---- backup: export / import ----
+  // Not part of a backup: panel position/state (per device) and Auto-play, so importing can never start play.
+  const UI_KEYS = ['overlayOpen', 'overlayX', 'overlayY', 'enabled'];
+  CV.exportSettings = function (cfg) {
+    const out = {};
+    for (const k of Object.keys(CV.DEFAULTS)) if (!UI_KEYS.includes(k) && k in cfg) out[k] = cfg[k];
+    return JSON.stringify({ type: 'chessvision-settings', version: 1, settings: out }, null, 2);
+  };
+
+  // Parses pasted JSON. Unknown keys are ignored and values are clamped; returns { ok, values, count, error }.
+  CV.importSettings = function (text) {
+    let obj;
+    try { obj = JSON.parse(String(text)); } catch (e) { return { ok: false, error: 'not valid JSON' }; }
+    if (!obj || obj.type !== 'chessvision-settings' || typeof obj.settings !== 'object' || obj.settings === null) {
+      return { ok: false, error: 'not a ChessVision settings export' };
+    }
+    const raw = {};
+    for (const k of Object.keys(obj.settings)) if (!UI_KEYS.includes(k)) raw[k] = obj.settings[k];
+    const values = CV.sanitize(raw);
+    return { ok: true, values, count: Object.keys(values).length };
+  };
+
+
+  // ---- history, engine messages and pondering (pure; used by background.js and the page scripts) ----
+  CV.STANDARD_START_FEN = 'rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1';
+
+  // Plays one UCI move on a chessmini position; { move, pos } or null if it is not legal there.
+  CV.applyUci = function (pos, uci) {
+    const m = CV.chess.legalMoves(pos).find((x) => x.uci === uci);
+    return m ? { move: m, pos: CV.chess.apply(pos, m) } : null;
+  };
+
+  // Replays a move list from a FEN: { ok, pos, failedAt }.
+  CV.replayUci = function (startFen, moves) {
+    let pos = CV.chess.parseFen(startFen);
+    const list = moves || [];
+    for (let i = 0; i < list.length; i++) {
+      const r = CV.applyUci(pos, list[i]);
+      if (!r) return { ok: false, pos, failedAt: i };
+      pos = r.pos;
+    }
+    return { ok: true, pos };
+  };
+
+  // The Stockfish `position` command. With a usable history: `position fen <startFen> moves m1 m2 ...`
+  // (so the engine sees repetitions and the 50-move counter); without: the old `position fen <fen>`.
+  CV.sfPositionCommand = function (fen, startFen, moves) {
+    if (typeof startFen === 'string' && startFen && Array.isArray(moves) && moves.length) {
+      return 'position fen ' + startFen + ' moves ' + moves.join(' ');
+    }
+    return 'position fen ' + (typeof startFen === 'string' && startFen && Array.isArray(moves) ? startFen : fen);
+  };
+
+  // How many ponder workers may run: the setting (1-3), at most max(1, hardwareConcurrency - 1) so the main worker and the
+  // page keep a core. An unknown CPU count (undefined, 0, not a number) counts as 1 core: one worker, the old behaviour.
+  CV.ponderWorkerCount = function (setting, hardwareConcurrency) {
+    const lim = CV.LIMITS.aggroPonderWorkers;
+    const want = Math.min(lim[1], Math.max(lim[0], Math.round(Number(setting)) || lim[0]));
+    const hc = Math.floor(Number(hardwareConcurrency));
+    const cap = Number.isFinite(hc) && hc > 0 ? Math.max(1, hc - 1) : 1;
+    return Math.min(want, cap);
+  };
+
+  // Identity of a position by its history: same start and same moves = same key.
+  CV.ponderKey = function (startFen, moves) {
+    return String(startFen || '') + '|' + (moves || []).join(' ');
+  };
+
+  // Why pondering must be cancelled when settings change: 'engineSwitch', 'ponderOff' or null.
+  CV.ponderCfgChange = function (prev, next) {
+    if (prev.engine === 'aggro' && next.engine !== 'aggro') return 'engineSwitch';
+    if (prev.engine === 'stockfish' && next.engine !== 'stockfish' && prev.sfPonder) return 'engineSwitch';   // 1.8.0: Stockfish pondering
+    if ((prev.aggroPonder && !next.aggroPonder) || (prev.aggroShowEval && !next.aggroShowEval)) return 'ponderOff';
+    if (prev.sfPonder && !next.sfPonder) return 'ponderOff';
+    return null;
+  };
+
+  // Is pondering wanted for this engine and these settings? (content.js and the debug info use it)
+  CV.ponderWanted = function (cfg) {
+    return cfg.engine === 'aggro' ? !!cfg.aggroPonder : cfg.engine === 'stockfish' ? !!cfg.sfPonder : false;
+  };
+
+  // Pondering state (pure). One entry per opponent turn: the position after OUR move (startFen + base moves), the
+  // opponent moves that are planned (every legal one) and, per opponent move, the reply found so far. Replies arrive
+  // one by one while the opponent thinks; when the opponent moves, whatever was already found is used.
+  // decide() -> { decision, result }:
+  //   'none' no entry | 'miss' other position / no history | 'hit' that move has a finished reply
+  //   'late' that move is planned but its search has not finished (it is dropped by the caller).
+  // Several ponder workers can run at once, so the state keeps a SET of running opponent moves (the moves whose reply
+  // search is under way). setRunning(uci) is the old single-move call (it replaces the set; null clears it);
+  // addRunning / removeRunning are used by the pool. 'late' = planned, no finished reply yet (whether or not it is
+  // running); decide() also says in `running` whether a worker was on that very move when the opponent played it.
+  CV.createPonderState = function () {
+    const counters = { attempts: 0, hits: 0, misses: 0, late: 0, skipped: 0 };
+    let entry = null;
+    const sameBase = (e, startFen, moves) => Array.isArray(moves) && startFen === e.startFen && moves.length === e.base.length + 1 &&
+      e.base.every((m, i) => moves[i] === m);
+    const syncRunning = (e) => { e.running = e.runningSet.size ? [...e.runningSet].pop() : null; };   // old field: the latest started one
+    return {
+      counters,
+      get: () => entry,
+      begin(startFen, base, planned) {
+        counters.attempts++;
+        entry = { startFen, base: base.slice(), planned: new Set(planned), results: {}, running: null, runningSet: new Set(), counted: new Set() };
+        return entry;
+      },
+      skip() { counters.skipped++; },
+      setRunning(uci) { if (entry) { entry.runningSet.clear(); if (uci) entry.runningSet.add(uci); syncRunning(entry); } },
+      addRunning(uci) { if (entry && uci) { entry.runningSet.add(uci); syncRunning(entry); } },
+      removeRunning(uci) { if (entry) { entry.runningSet.delete(uci); syncRunning(entry); } },
+      runningMoves: () => (entry ? [...entry.runningSet] : []),
+      // Stores the reply found for one opponent move. False if the entry is gone or the answer is empty.
+      addResult(oppUci, r) {
+        if (!entry || !entry.planned.has(oppUci) || !r || !r.uci) return false;
+        entry.results[oppUci] = { uci: r.uci, san: r.san || null, depth: r.depth || 0, sacrifice: !!r.sacrifice, ms: r.ms || 0 };
+        return true;
+      },
+      found: () => (entry ? Object.keys(entry.results).length : 0),
+      decide(startFen, moves) {
+        if (!entry) return { decision: 'none', result: null, running: false };
+        let decision = 'miss', result = null, running = false;
+        if (sameBase(entry, startFen, moves)) {
+          const opp = moves[moves.length - 1];
+          if (entry.results[opp]) { decision = 'hit'; result = entry.results[opp]; }
+          else if (entry.planned.has(opp)) { decision = 'late'; running = entry.runningSet.has(opp); }
+        }
+        const key = String(startFen) + '|' + (Array.isArray(moves) ? moves.join(' ') : '');
+        if (!entry.counted.has(key)) { entry.counted.add(key); counters[decision === 'hit' ? 'hits' : decision === 'late' ? 'late' : 'misses']++; }
+        return { decision, result, running };
+      },
+      // Drops the entry (new game, takeback, setting off, engine switch, miss...). True if there was one.
+      invalidate() { const had = !!entry; entry = null; return had; },
+    };
+  };
+
+  // ---- Stockfish 1.8.0 helpers (pure; used by background.js and content.js) ----
+  // Can this browser context run the threaded Stockfish build? It needs SharedArrayBuffer, Atomics and shared WebAssembly
+  // memory. `env` is what the caller sees (globalThis in a browser); a test passes a fake. crossOriginIsolated is reported
+  // but not required: an extension page may have SharedArrayBuffer without it (not verified for Firefox, hence this test).
+  CV.sabSupport = function (env) {
+    env = env || {};
+    const checks = {
+      sharedArrayBuffer: typeof env.SharedArrayBuffer === 'function',
+      atomics: typeof env.Atomics === 'object' && env.Atomics !== null,
+      sharedMemory: false,
+      crossOriginIsolated: env.crossOriginIsolated === true,
+    };
+    try {
+      const W = env.WebAssembly;
+      if (W && typeof W.Memory === 'function') { const m = new W.Memory({ initial: 1, maximum: 1, shared: true }); checks.sharedMemory = !!(m && m.buffer); }
+    } catch (e) { checks.sharedMemory = false; }
+    const failed = ['sharedArrayBuffer', 'atomics', 'sharedMemory'].find((k) => !checks[k]) || null;
+    return { ok: !failed, reason: failed ? failed + ' missing' : null, checks };
+  };
+
+  // Search threads for the main worker: the setting (1-4), at most max(1, hardwareConcurrency - 1) so the page keeps a core,
+  // and 1 whenever the threaded build cannot run (sabOk false). Unknown CPU count -> 1.
+  CV.sfThreadCount = function (setting, hardwareConcurrency, sabOk) {
+    const lim = CV.LIMITS.sfThreads;
+    const want = Math.min(lim[1], Math.max(lim[0], Math.round(Number(setting)) || lim[0]));
+    if (!sabOk) return 1;
+    const hc = Math.floor(Number(hardwareConcurrency));
+    const cap = Number.isFinite(hc) && hc > 0 ? Math.min(lim[1], Math.max(1, hc - 1)) : 1;
+    return Math.min(want, cap);
+  };
+
+  // The time cap of a Stockfish search (ms, 0 = none): the smaller of the user's cap (sfMaxMs) and the clock budget (soft),
+  // ignoring whichever is 0 / unusable. The clock budget is already <= remaining / 4 (clock.js).
+  CV.sfSearchCap = function (sfMaxMs, clockSoftMs) {
+    const a = Math.max(0, Math.round(Number(sfMaxMs)) || 0), b = Math.max(0, Math.round(Number(clockSoftMs)) || 0);
+    return a && b ? Math.min(a, b) : (a || b);
+  };
+
+  // Score as one number from the side to move's point of view (mates +-100000 - plies).
+  CV.sfScoreValue = function (cp, mate) {
+    if (mate !== null && mate !== undefined) return mate > 0 ? 100000 - mate : -100000 - mate;
+    return cp;
+  };
+
+  // One UCI `info` line -> { mpv, depth, cp, mate, uci, nodes, bound } or null when it carries no score / pv.
+  CV.sfParseInfo = function (line) {
+    if (typeof line !== 'string' || !line.startsWith('info ')) return null;
+    const sc = /\bscore (cp|mate) (-?\d+)/.exec(line), pv = / pv (\S+)/.exec(line), d = /\bdepth (\d+)/.exec(line);
+    if (!sc || !pv || !d) return null;
+    const mpv = /\bmultipv (\d+)/.exec(line), n = /\bnodes (\d+)/.exec(line);
+    return {
+      mpv: mpv ? +mpv[1] : 1, depth: +d[1], uci: pv[1], nodes: n ? +n[1] : 0,
+      cp: sc[1] === 'cp' ? +sc[2] : null, mate: sc[1] === 'mate' ? +sc[2] : null,
+      bound: line.includes(' lowerbound') ? 'lower' : line.includes(' upperbound') ? 'upper' : null,
+    };
+  };
+
+  // The opponent's moves in the order a MultiPV search of the position they face ranked them (best for the opponent first),
+  // followed by the other legal moves (in the order given). `lines`: Map or array of { uci, cp, mate } from the OPPONENT's view.
+  CV.sfRankFromLines = function (legal, lines) {
+    const arr = (lines instanceof Map ? [...lines.values()] : Array.from(lines || [])).filter((l) => l && l.uci && legal.includes(l.uci));
+    arr.sort((a, b) => CV.sfScoreValue(b.cp, b.mate) - CV.sfScoreValue(a.cp, a.mate));
+    const seen = new Set(), out = [];
+    for (const l of arr) if (!seen.has(l.uci)) { seen.add(l.uci); out.push(l.uci); }
+    for (const u of legal) if (!seen.has(u)) { seen.add(u); out.push(u); }
+    return out;
+  };
+
+  // Ranking by the per-move scan: `scores` Map uci -> our score after that opponent move (null = game over, nothing to prepare).
+  // Lowest first = best for the opponent; unscanned moves go last.
+  CV.sfRankFromScan = function (legal, scores) {
+    return legal.filter((u) => scores.get(u) !== null)
+      .sort((x, y) => (scores.has(x) ? scores.get(x) : Infinity) - (scores.has(y) ? scores.get(y) : Infinity));
+  };
+
+  // ---- allowed pages (allowed-pages.txt) ----
+  // Turns the file's text into a list of normalised entries.
+  CV.parseAllowlist = function (text) {
+    return String(text || '').split(/\r?\n/)
+      .map((l) => l.replace(/(^|\s)#.*$/, '').trim().toLowerCase())
+      .filter(Boolean)
+      .map((l) => l.replace(/^[a-z][a-z0-9+.-]*:\/\//, '').replace(/^www\./, '').replace(/[?#].*$/, '').replace(/\/+$/, ''))
+      .filter(Boolean);
+  };
+
+  // True if host + path matches any entry (entry = page or anything below it; "*" is a wildcard).
+  CV.matchPage = function (entries, hostname, pathname) {
+    const page = (String(hostname).toLowerCase().replace(/^www\./, '') + String(pathname).toLowerCase()).replace(/\/+$/, '');
+    return entries.some((e) => {
+      const re = new RegExp('^' + e.replace(/[.+?^${}()|[\]\\]/g, '\\$&').replace(/\*/g, '.*') + '(?:/.*)?$');
+      return re.test(page);
+    });
+  };
+
+  if (typeof module !== 'undefined' && module.exports) module.exports = CV;
+})(typeof window !== 'undefined' ? window : globalThis);
