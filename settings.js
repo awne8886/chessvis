@@ -56,6 +56,7 @@
     // --- 2.0.0: speed (both engines unless noted) ---
     earlyPonder: true,        // start pondering the moment our move is decided, not when the board shows it (false = 1.8.0)
     boardDebounceMs: 80,      // wait after a board change before the stable-read check (250 = the 1.8.0 timing)
+    ponderHitFast: true,      // a ponder hit is answered with the quick delay and the faster hand (false = 1.8.0: normal delay)
     sfSearchMode: 'delay',    // Stockfish full search: 'depth' (1.8.0: go depth N) | 'delay' (search through the human-like pause, depth = minimum) | 'clock'
 
     // --- game recording and saving ---

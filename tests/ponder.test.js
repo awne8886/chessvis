@@ -2,7 +2,7 @@
 'use strict';
 const assert = require('node:assert');
 const { load, runner } = require('./_load');
-const CV = load();
+const CV = load('humanize.js');
 const { test, run } = runner('ponder');
 const START = CV.STANDARD_START_FEN;
 
@@ -55,6 +55,19 @@ test('decide(): late for a planned move without a reply; none without an entry',
   const d = p.decide(START, ['e2e4', 'c7c5']);
   assert.strictEqual(d.decision, 'late');
   assert.strictEqual(d.running, true);
+});
+
+// ---- T5: fast reply on a ponder hit ----
+test('delayFor: fastReply uses the quick range (only with quick replies on); no category needed', () => {
+  const cfg = { ...CV.DEFAULTS };
+  for (let i = 0; i < 300; i++) {
+    const d = CV.human.delayFor(cfg, { legalCount: 30, category: null, fastReply: true });
+    assert.ok(d >= cfg.quickMinDelay && d <= cfg.quickMaxDelay, String(d));
+  }
+  const off = { ...cfg, quickReplies: false };
+  for (let i = 0; i < 300; i++) assert.ok(CV.human.delayFor(off, { fastReply: true }) >= off.minDelay);
+  for (let i = 0; i < 300; i++) assert.ok(CV.human.delayFor({ ...cfg, hesitation: false }, { fastReply: false }) >= cfg.minDelay);
+  assert.strictEqual(CV.DEFAULTS.ponderHitFast, true);
 });
 
 run();

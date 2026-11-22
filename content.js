@@ -492,10 +492,12 @@
 
       // Human-like pause. The engine already ran, so only the remainder is waited. A quick category has its own short
       // delay; otherwise the delay drawn before the full search is used.
-      let delay = category || plannedDelay === null ? CV.human.delayFor(cfg, { legalCount: legal.length, category }) : plannedDelay;
+      // 2.0.0: a ponder hit with ponderHitFast gets the quick range too (fastReply), without becoming a quick category.
+      const fastReply = !category && ponderHit && cfg.ponderHitFast && cfg.quickReplies;
+      let delay = category || fastReply || plannedDelay === null ? CV.human.delayFor(cfg, { legalCount: legal.length, category, fastReply }) : plannedDelay;
       if (lastClock) delay = CV.clock.delayCap(delay, lastClock.ms);          // the pause must not eat a short clock
       const wait = Math.max(0, delay - (Date.now() - t0));
-      fast = !!category || !!(lastClock && lastClock.mode === 'low');     // low on time: the faster hand too (set before the glide below)
+      fast = !!category || fastReply || !!(lastClock && lastClock.mode === 'low');     // low on time: the faster hand too (set before the glide below)
       // 2.0.0: with the curved cursor the glide to the from-square runs DURING the pause (if it takes longer than the
       // pause, no extra wait is added). The position is re-checked after both, before anything is clicked; if it changed
       // the cursor simply stays where it is.

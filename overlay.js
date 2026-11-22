@@ -314,7 +314,8 @@ details[open] summary .arrow { transform: rotate(90deg); }
         slider('quickMinDelay', 'Quick min delay', fmtMs),
         slider('quickMaxDelay', 'Quick max delay', fmtMs),
         slider('quickThinkMs', 'Quick think time', fmtMs),
-        el('p', { class: 'note' }, 'Quick think time is the AggroChess budget for obvious moves. Stockfish searches to depth 8 or less instead.')),
+        toggle('ponderHitFast', 'Fast reply on ponder hit'),
+        el('p', { class: 'note' }, 'Quick think time is the AggroChess budget for obvious moves. Stockfish searches to depth 8 or less instead. Fast reply on ponder hit: a reply prepared while the opponent thought is played with the quick delay and the faster hand.')),
 
       aggroDet, sfDet,
 
