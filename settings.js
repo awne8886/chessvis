@@ -278,9 +278,13 @@
       addRunning(uci) { if (entry && uci) { entry.runningSet.add(uci); syncRunning(entry); } },
       removeRunning(uci) { if (entry) { entry.runningSet.delete(uci); syncRunning(entry); } },
       runningMoves: () => (entry ? [...entry.runningSet] : []),
-      // Stores the reply found for one opponent move. False if the entry is gone or the answer is empty.
+      // Stores the reply found for one opponent move. False if the entry is gone or the answer is empty, or (2.0.0) when a
+      // DEEPER reply is already stored for that move (a seed from the main search's PV, or an earlier deepening pass, is never
+      // replaced by a shallower search; equal or greater depth replaces it as before).
       addResult(oppUci, r) {
         if (!entry || !entry.planned.has(oppUci) || !r || !r.uci) return false;
+        const old = entry.results[oppUci];
+        if (old && old.depth > (r.depth || 0)) return false;
         entry.results[oppUci] = { uci: r.uci, san: r.san || null, depth: r.depth || 0, sacrifice: !!r.sacrifice, ms: r.ms || 0 };
         return true;
       },
@@ -428,6 +432,31 @@
   CV.sfParsePv = function (line) {
     const m = / pv ((?:\S+ ?)+)$/.exec(String(line || '').trim());
     return m ? m[1].trim().split(/\s+/) : [];
+  };
+
+  // ---- 2.0.0: seeding the ponder table from the main search's principal variation (pure; background.js) ----
+  // lastMainPv = { startFen, moves, pv, depth, ponder } of the last main Stockfish search: `moves` led to the position we
+  // searched, pv[0] is the move we played, pv[1] the opponent's expected reply, pv[2] our answer to it. A reply from a
+  // PV at depth d is worth a depth d - 2 search of the position after pv[1].
+  CV.SF_PARTIAL_MIN_DEPTH = 8;          // shallower ponder replies are not used (also the harvest minimum in background.js)
+  const pvFollows = (lmp, startFen, moves) => !!lmp && Array.isArray(lmp.pv) && lmp.pv.length >= 1 && Array.isArray(lmp.moves) &&
+    Array.isArray(moves) && startFen === lmp.startFen && moves.length === lmp.moves.length + 1 &&
+    lmp.moves.every((m, i) => moves[i] === m) && moves[moves.length - 1] === lmp.pv[0];
+  // { opp, reply, depth } for an instant ponder result, or null: other start / other move played / PV too short / too shallow.
+  CV.pvSeed = function (lmp, startFen, moves) {
+    if (!pvFollows(lmp, startFen, moves) || lmp.pv.length < 3) return null;
+    const depth = (Number(lmp.depth) || 0) - 2;
+    if (depth < CV.SF_PARTIAL_MIN_DEPTH) return null;
+    return { opp: lmp.pv[1], reply: lmp.pv[2], depth };
+  };
+  // The opponent move the main search expects (pv[1], else the `ponder` token of its bestmove), or null.
+  CV.pvPredict = function (lmp, startFen, moves) {
+    if (!pvFollows(lmp, startFen, moves)) return null;
+    return lmp.pv[1] || lmp.ponder || null;
+  };
+  // `list` with `first` moved to the front (when it is in the list).
+  CV.moveFirst = function (list, first) {
+    return first && list.includes(first) ? [first, ...list.filter((u) => u !== first)] : list.slice();
   };
 
   // ---- allowed pages (allowed-pages.txt) ----

@@ -70,4 +70,39 @@ test('delayFor: fastReply uses the quick range (only with quick replies on); no 
   assert.strictEqual(CV.DEFAULTS.ponderHitFast, true);
 });
 
+// ---- T6: seeding from the main search's PV ----
+const LMP = { startFen: START, moves: ['e2e4', 'e7e5'], pv: ['g1f3', 'b8c6', 'f1b5', 'a7a6'], depth: 14, ponder: 'b8c6' };
+test('pvSeed: positive case', () => {
+  assert.deepStrictEqual(CV.pvSeed(LMP, START, ['e2e4', 'e7e5', 'g1f3']), { opp: 'b8c6', reply: 'f1b5', depth: 12 });
+  assert.strictEqual(CV.pvPredict(LMP, START, ['e2e4', 'e7e5', 'g1f3']), 'b8c6');
+});
+test('pvSeed: negative cases', () => {
+  assert.strictEqual(CV.pvSeed(LMP, '8/8/8/8/8/8/8/K6k w - - 0 1', ['e2e4', 'e7e5', 'g1f3']), null, 'different start');
+  assert.strictEqual(CV.pvSeed(LMP, START, ['e2e4', 'e7e5', 'b1c3']), null, 'different move played');
+  assert.strictEqual(CV.pvSeed(LMP, START, ['e2e4', 'e7e5']), null, 'history too short');
+  assert.strictEqual(CV.pvSeed(LMP, START, ['d2d4', 'e7e5', 'g1f3']), null, 'different earlier move');
+  assert.strictEqual(CV.pvSeed({ ...LMP, pv: ['g1f3', 'b8c6'] }, START, ['e2e4', 'e7e5', 'g1f3']), null, 'short PV');
+  assert.strictEqual(CV.pvSeed({ ...LMP, depth: 9 }, START, ['e2e4', 'e7e5', 'g1f3']), null, 'too shallow (9 - 2 < 8)');
+  assert.ok(CV.pvSeed({ ...LMP, depth: 10 }, START, ['e2e4', 'e7e5', 'g1f3']), 'depth 10 - 2 = 8 is enough');
+  assert.strictEqual(CV.pvSeed(null, START, ['e2e4']), null);
+  assert.strictEqual(CV.pvPredict({ ...LMP, pv: ['g1f3'] }, START, ['e2e4', 'e7e5', 'g1f3']), 'b8c6', 'ponder token when the PV has no reply');
+  assert.strictEqual(CV.pvPredict(LMP, START, ['e2e4', 'e7e5', 'b1c3']), null);
+});
+test('moveFirst', () => {
+  assert.deepStrictEqual(CV.moveFirst(['a', 'b', 'c'], 'c'), ['c', 'a', 'b']);
+  assert.deepStrictEqual(CV.moveFirst(['a', 'b'], 'x'), ['a', 'b']);
+  assert.deepStrictEqual(CV.moveFirst(['a', 'b'], null), ['a', 'b']);
+});
+test('addResult never replaces a deeper result; equal or greater depth replaces as before', () => {
+  const p = CV.createPonderState();
+  p.begin(START, ['e2e4'], ['e7e5']);
+  assert.strictEqual(p.addResult('e7e5', { uci: 'g1f3', depth: 12 }), true);
+  assert.strictEqual(p.addResult('e7e5', { uci: 'b1c3', depth: 9 }), false);
+  assert.strictEqual(p.get().results.e7e5.uci, 'g1f3');
+  assert.strictEqual(p.addResult('e7e5', { uci: 'f1c4', depth: 12 }), true, 'equal depth replaces');
+  assert.strictEqual(p.addResult('e7e5', { uci: 'd2d4', depth: 15 }), true, 'deeper replaces');
+  assert.strictEqual(p.get().results.e7e5.uci, 'd2d4');
+  assert.strictEqual(p.addResult('c7c5', { uci: 'g1f3', depth: 3 }), false, 'not planned');
+});
+
 run();

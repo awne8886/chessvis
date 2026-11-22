@@ -22,12 +22,13 @@ const IMPERFECTION_MARGIN_CP = 60;
 const IMPERFECTION_LINES = 3; // MultiPV lines searched when imperfection > 0
 
 let sf = null, sfReady = null, sfCurrent = null, sfNext = null;
+let lastMainPv = null;  // 2.0.0: { startFen, moves, pv, depth, ponder } of the last main search (seeds the ponder table, CV.pvSeed)
 let sfLast = null;      // 2.0.0: the last finished main search { mode, depthDone, softMs, hardMs, elapsedMs } (debug info)
 const SF_DELAY_GO = 'go depth 64';   // delay-matched search: effectively unbounded; stopped from JavaScript (CV.sfShouldStop)
 let sfActive = null;    // engine file in use
 let sfPrevCount = null; // pieces in the previous request; null = nothing searched yet (see CV.sfIsNewGame)
 let sfMultiPvSent = null, sfThreadsSent = SF_THREADS;   // setoption is only sent when the value changes
-const sfDbg = { moduleSendFailures: 0, workerStarts: 0, lastStart: null, harvested: 0, harvestFailed: 0, threadedFailed: null, threadedStarts: 0 };
+const sfDbg = { moduleSendFailures: 0, workerStarts: 0, lastStart: null, harvested: 0, harvestFailed: 0, threadedFailed: null, threadedStarts: 0, pvSeeds: 0 };
 const sfSab = (() => { try { return CV.sabSupport(typeof globalThis !== 'undefined' ? globalThis : {}); } catch (e) { return { ok: false, reason: 'test failed: ' + e, checks: {} }; } })();
 
 // The .wasm compiled once; every Stockfish worker that starts through the wrapper only instantiates it.
@@ -255,20 +256,20 @@ async function analyzeStockfishNow(fen, depth, imperfection, maxMs, startFen, mo
   else {
     const hist = typeof startFen === 'string' && Array.isArray(moves);
     const d = ponder.decide(hist ? startFen : null, hist ? moves : null);
-    if (d.decision === 'hit') { ponderStop(); const e = d.result; return { uci: e.uci, best: e.uci, depth: e.depth, ponderHit: true }; }
+    if (d.decision === 'hit') { ponderStop(); lastMainPv = null; const e = d.result; return { uci: e.uci, best: e.uci, depth: e.depth, ponderHit: true }; }
     if (d.decision === 'late' && d.running && ponderKind === 'sf') {          // a worker is on exactly this move: take what it has if it is deep enough
       const opp = moves[moves.length - 1], w = ponderActive.find((x) => x.kind === 'sf' && x.task && x.task.key === opp), tp = w && w.task.promise;
       ponderStop();                                                           // halts the job, sends `stop` to every worker
       if (tp) {
         const res = await Promise.race([tp, new Promise((r) => setTimeout(() => r(null), SF_HARVEST_MS))]).catch(() => null);
-        if (res && res.best && res.best !== '(none)' && res.depth >= SF_PARTIAL_MIN_DEPTH && res.key === opp) { sfDbg.harvested++; return { uci: res.best, best: res.best, depth: res.depth, ponderHit: true, partial: true }; }
+        if (res && res.best && res.best !== '(none)' && res.depth >= SF_PARTIAL_MIN_DEPTH && res.key === opp) { sfDbg.harvested++; lastMainPv = null; return { uci: res.best, best: res.best, depth: res.depth, ponderHit: true, partial: true }; }
         sfDbg.harvestFailed++;
       }
     }
     ponderCancel();                                                           // miss, late or no entry yet: the ponder workers never delay a real search
   }
   if (msg.sfThreads !== undefined) { try { await sfApplyThreads(msg.sfThreads); } catch (e) { /* keep the engine we have */ } }
-  return new Promise((resolve) => {
+  const res = await new Promise((resolve) => {
     const imp = Math.max(0, Math.min(100, imperfection || 0));
     const softMs = Math.max(0, Math.min(AGGRO_HARD_MAX_MS, Math.round(Number(msg.softMs)) || 0));
     const job = {
@@ -292,6 +293,13 @@ async function analyzeStockfishNow(fen, depth, imperfection, maxMs, startFen, mo
       sfStart(job);
     }
   });
+  // 2.0.0: remember the principal variation when the move played is its first move (no imperfection substitution); the
+  // next ponder job takes pv[1] as the predicted opponent move and pv[2] as a ready reply (CV.pvSeed / CV.pvPredict).
+  if (res && res.uci && !res.imperfect && typeof startFen === 'string' && Array.isArray(moves)) {
+    const pv = res.pv && res.pv[0] === res.uci ? res.pv : res.ponder ? [res.uci, res.ponder] : null;
+    lastMainPv = pv ? { startFen, moves: moves.slice(), pv: pv.slice(), depth: res.pv && res.pv[0] === res.uci ? res.pvDepth : 0, ponder: res.ponder } : null;
+  } else if (res) lastMainPv = null;
+  return res ? { uci: res.uci, best: res.best, imperfect: res.imperfect, depth: res.depth } : res;
 }
 
 // ======================= Icon download (brilliant layer c) =======================
@@ -615,11 +623,39 @@ async function runIdleJob(msg, token) {
   // shared queue 2 - replies, most likely opponent move first, each with its own slice; nothing starts after the deadline
   const slice = Math.max(PONDER_SLICE_MIN_MS, Math.min(PONDER_SLICE_MAX_MS, Math.round(budget / 6)));
   let replyNext = 0;
+  // 2.0.0: AggroChess's own predicted move gets its reply first, on the first worker that is ready, while the others start
+  // ranking; the reply queue then skips it.
+  const predictedOk = doPonder && !!predicted && legal.some((m) => m.uci === predicted);
+  let predictedTaken = false;
   const replyClaim = () => {
+    while (rankedList && replyNext < rankedList.length && predictedTaken && rankedList[replyNext] === predicted) replyNext++;
     if (token !== idleToken || !rankedList || replyNext >= rankedList.length) return null;
     const ms = Math.min(slice, left() - PONDER_OVERRUN_MS);
     if (ms < PONDER_MIN_SLICE_MS) return null;
     return { u: rankedList[replyNext++], ms };
+  };
+  const replySearch = async (w, c) => {
+    ponder.addRunning(c.u);
+    try {
+      if (PONDER_STEPPED && w.steps) {                      // one depth at a time: every finished depth is a usable (partial) reply
+        const sliceEnd = Date.now() + c.ms;
+        for (let d = 1; d <= PONDER_STEP_MAX_DEPTH; d++) {
+          const ms = Math.min(sliceEnd - Date.now(), left() - PONDER_OVERRUN_MS);
+          if (ms < PONDER_STEP_MIN_MS || token !== idleToken) break;
+          const r = await req(w, { type: 'think', ...posFor(msg.startFen, [...msg.moves, c.u]), depth: d, ms }, ms);
+          if (token !== idleToken) return;
+          const res = aggroResult(r);
+          if (!res) break;
+          ponder.addResult(c.u, { ...res, ms: c.ms });
+          if (res.depth < d || /^mate/.test(String(res.score))) break;   // cut by the clock, or a forced mate: deeper adds nothing
+        }
+      } else {
+        const r = await req(w, { type: 'think', ...posFor(msg.startFen, [...msg.moves, c.u]), ms: c.ms }, c.ms);
+        if (token !== idleToken) return;
+        const res = aggroResult(r);
+        if (res) ponder.addResult(c.u, { ...res, ms: c.ms });
+      }
+    } finally { ponder.removeRunning(c.u); }
   };
 
   const work = async (w, first) => {
@@ -627,6 +663,12 @@ async function runIdleJob(msg, token) {
       await w.ready;
       if (token !== idleToken) return;
       idleInfo.pondering = !!msg.ponder;
+      if (predictedOk && !predictedTaken) {                    // the first ready worker: the predicted move's reply before anything else
+        predictedTaken = true;
+        const ms = Math.min(slice, left() - PONDER_OVERRUN_MS);
+        if (ms >= PONDER_MIN_SLICE_MS) await replySearch(w, { u: predicted, ms });
+        if (token !== idleToken) return;
+      }
       if (first && msg.showEval) {                             // the evaluation line runs on the first worker, the others start ranking meanwhile
         const next = predicted && legal.some((m) => m.uci === predicted) ? predicted : undefined;
         const a = await req(w, { type: 'analyze', ...posFor(msg.startFen, msg.moves), ms: AGGRO_EVAL_MS, next }, AGGRO_EVAL_MS);
@@ -642,27 +684,8 @@ async function runIdleJob(msg, token) {
       }
       await ranked;                                            // the replies are taken in ranked order, so wait for the last ranking search
       for (let c = replyClaim(); c; c = replyClaim()) {
-        ponder.addRunning(c.u);
-        try {
-          if (PONDER_STEPPED && w.steps) {                      // one depth at a time: every finished depth is a usable (partial) reply
-            const sliceEnd = Date.now() + c.ms;
-            for (let d = 1; d <= PONDER_STEP_MAX_DEPTH; d++) {
-              const ms = Math.min(sliceEnd - Date.now(), left() - PONDER_OVERRUN_MS);
-              if (ms < PONDER_STEP_MIN_MS || token !== idleToken) break;
-              const r = await req(w, { type: 'think', ...posFor(msg.startFen, [...msg.moves, c.u]), depth: d, ms }, ms);
-              if (token !== idleToken) return;
-              const res = aggroResult(r);
-              if (!res) break;
-              ponder.addResult(c.u, { ...res, ms: c.ms });
-              if (res.depth < d || /^mate/.test(String(res.score))) break;   // cut by the clock, or a forced mate: deeper adds nothing
-            }
-          } else {
-            const r = await req(w, { type: 'think', ...posFor(msg.startFen, [...msg.moves, c.u]), ms: c.ms }, c.ms);
-            if (token !== idleToken) return;
-            const res = aggroResult(r);
-            if (res) ponder.addResult(c.u, { ...res, ms: c.ms });
-          }
-        } finally { ponder.removeRunning(c.u); }
+        await replySearch(w, c);
+        if (token !== idleToken) return;
       }
     } catch (e) {
       if (token === idleToken) { console.error('[ChessVision] AggroChess ponder worker stopped', e); ponderDrop(w); }   // the other workers go on
@@ -750,7 +773,7 @@ const SF_WARM_FEN = 'r3k2r/p1ppqpb1/bn2pnp1/3PN3/1p2P3/2N2Q1p/PPPBBPPP/R3K2R w K
 const SF_WARM_MS = 10;                 // warm-up search before a worker counts as ready
 const SF_STOP_TIMEOUT_MS = 1500;       // no bestmove / readyok after `stop` + `isready` within this long = terminate the worker
 const SF_SEARCH_MARGIN_MS = 3000;      // a search may take its movetime plus this before the worker is declared stuck
-const SF_PARTIAL_MIN_DEPTH = 8;        // a stopped reply search is used only if it reached this depth
+const SF_PARTIAL_MIN_DEPTH = CV.SF_PARTIAL_MIN_DEPTH;   // 8: a stopped reply search is used only if it reached this depth (also the PV seed minimum)
 const SF_HARVEST_MS = 150;             // ... and `stop` must answer within this long (a real search never waits longer)
 const SF_PONDER_SCAN_SHARE = 0.35;     // the ranking pass may use at most this share of the ponder time
 
@@ -874,6 +897,10 @@ async function runIdleSfJob(msg, token) {
   const mode = legal.length < 2 ? 'single' : SF_RANK_MODE;
   const pool = ponderClaim(Math.max(1, ponderCap));
   ponder.begin(msg.startFen, msg.moves, legal);
+  // 2.0.0: the main search's PV is a free first result (an instant hit candidate) and a prediction: pv[1] goes first.
+  const seed = CV.pvSeed(lastMainPv, msg.startFen, msg.moves);
+  if (seed && legal.includes(seed.opp) && ponder.addResult(seed.opp, { uci: seed.reply, depth: seed.depth, ms: 0 })) sfDbg.pvSeeds++;
+  const predicted = CV.pvPredict(lastMainPv, msg.startFen, msg.moves);
   const goFor = (ms) => CV.sfGoCommand(depth, ms);
   const req = (w, startFen, moves, ms, key, mpv) => w.search(startFen, moves, goFor(ms), key, mpv);
 
@@ -882,7 +909,7 @@ async function runIdleSfJob(msg, token) {
   const rank = { owner: null, next: 0, pending: 0, ended: false };
   let rankedList = null, resolveRanked = null;
   const ranked = new Promise((r) => { resolveRanked = r; });
-  const setRanked = (list) => { if (!rankedList) { rankedList = list; resolveRanked(); } };
+  const setRanked = (list) => { if (!rankedList) { rankedList = CV.moveFirst(list, predicted); resolveRanked(); } };
   if (mode === 'single') setRanked(legal.slice());
   const scanMs = Math.max(5, Math.min(SF_SCAN_MS, Math.floor((budget * SF_PONDER_SCAN_SHARE) / Math.max(1, legal.length))));
   const scanEnd = t0 + budget * SF_PONDER_SCAN_SHARE;
@@ -1006,7 +1033,7 @@ api.runtime.onMessage.addListener((msg) => {
       module: { ...aggroModuleInfo, sendFailures: aggroDbg.moduleSendFailures }, ponderHashMb, ponderStepped: PONDER_STEPPED, workerStarts: aggroDbg.workerStarts, lastWorkerStart: aggroDbg.lastStart,
       stockfish: { active: sfActive, threads: sfThreadsSent, threadedFailed: sfDbg.threadedFailed, threadedStarts: sfDbg.threadedStarts, sab: sfSab, module: { ...sfModuleInfo, sendFailures: sfDbg.moduleSendFailures },
         poolKind: ponderKind, cancelling: ponderCancelling.length, harvested: sfDbg.harvested, harvestFailed: sfDbg.harvestFailed, workerStarts: sfDbg.workerStarts, lastWorkerStart: sfDbg.lastStart, rankMode: SF_RANK_MODE,
-        searchMode: sfLast ? sfLast.mode : null, lastSearch: sfLast },
+        searchMode: sfLast ? sfLast.mode : null, lastSearch: sfLast, pvSeeds: sfDbg.pvSeeds },
       aggroLastBudget: aggroDbg.lastBudget || null });
   }
   if (!msg || msg.type !== 'analyze') return;
