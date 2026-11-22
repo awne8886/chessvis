@@ -321,7 +321,8 @@ details[open] summary .arrow { transform: rotate(90deg); }
         el('summary', {}, el('span', {}, el('span', { class: 'arrow' }, '\u25b8'), 'Watchdog')),
         el('div', { class: 'group' },
           slider('watchdogMs', 'Re-read board every', fmtMs),
-          el('p', { class: 'note' }, 'Re-checks the board on a timer so a missed update can\u2019t leave it waiting. Lower = faster recovery, slightly more CPU.'))),
+          slider('boardDebounceMs', 'Read board after a change', fmtMs),
+          el('p', { class: 'note' }, 'Re-checks the board on a timer so a missed update can\u2019t leave it waiting. Lower = faster recovery, slightly more CPU. After a change on the board it waits this long, then reads the board twice a frame apart and only goes on when both reads agree (250 ms = the old timing).'))),
 
       gameDet,
 

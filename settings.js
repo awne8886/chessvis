@@ -55,6 +55,7 @@
 
     // --- 2.0.0: speed (both engines unless noted) ---
     earlyPonder: true,        // start pondering the moment our move is decided, not when the board shows it (false = 1.8.0)
+    boardDebounceMs: 80,      // wait after a board change before the stable-read check (250 = the 1.8.0 timing)
 
     // --- game recording and saving ---
     saveWithSacrifices: false,       // save a finished game when its counted sacrifices reach the threshold
@@ -87,6 +88,7 @@
     quickMaxDelay: [40, 1500, 10],
     quickThinkMs: [100, 2000, 50],
     watchdogMs: [200, 5000, 100],
+    boardDebounceMs: [0, 300, 10],
     aggroPonderMs: [200, 5000, 100],
     aggroPonderWorkers: [1, 3, 1],
     aggroPonderHashMb: [4, 64, 4],

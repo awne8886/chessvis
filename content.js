@@ -23,11 +23,14 @@
   const ATTEMPTS_MAX = 3;          // retries if a move does not register
   const RETRY_AFTER_MS = 1800;     // how long to wait before deciding a move did not register
   const BUSY_TIMEOUT_MS = 45000;   // a move attempt stuck longer than this is abandoned
+  const STABLE_GAP_MS = 20;        // stable read: second board read one animation frame + this long after the first
+  const UNSTABLE_MAX = 10;         // after this many unstable reads in a row, check() runs anyway (the watchdog would too)
 
   let cfg = { ...CV.DEFAULTS };
   let board = null, observer = null, debounceTimer = null, watchdogTimer = null;
   let busy = false, busySince = 0, playToken = 0, recheckPending = false;
   let lastHandledKey = null, attempts = 0;
+  let unstableReads = 0, unstableRun = 0, stableSeq = 0;   // stable-read debounce (2.0.0): total / in a row / cancels an outdated check
   let rights = BS.freshRights();
   const tracker = BS.createTracker();            // the one game-tracking mechanism (history, new game, takeback)
   const rec = CV.createRecorder();               // records every ply the tracker reports
@@ -143,9 +146,11 @@
     }
   }
 
-  function buildFen() {
+  // obs: the observation check() already made (observeBoard's result), so one check() reads the board once. Without it
+  // (the re-check in play(), the retry timer, debug info) the board is read fresh.
+  function buildFen(obs) {
     if (!board) return null;
-    const obs = isAllowedPage() ? observeBoard() : null;
+    if (obs === undefined) obs = isAllowedPage() ? observeBoard() : null;
     let st = obs && obs.st, p = obs && obs.p;
     if (!obs) {
       st = readBoardState();
@@ -157,6 +162,13 @@
     const myColor = board.classList.contains('flipped') ? 'b' : 'w';
     const fen = BS.assembleFen({ placement: p.placement, turn: p.turn, castle: p.castle, ep: p.ep, halfmove: info ? info.halfmove : 0, fullmove: info ? info.fullmove : 1 });
     return { fen, turn: p.turn, myColor, count: st.count, lastTo: p.lastTo };
+  }
+
+  // Pieces + highlights as one string (BS.signature); '' without a board.
+  function boardSignature() {
+    if (!board) return '';
+    const p = readPosition();
+    return BS.signature(p.grid, p.highlights);
   }
 
   // startFen + moves for an engine, only when the tracked history ends exactly at this position; else null.
@@ -479,8 +491,9 @@
   }
 
   function check(reason) {
+    let obs;
     if (board && allowed !== null && isAllowedPage()) {          // observe before anything can return early
-      try { observeBoard(); } catch (e) { console.error('[ChessVision] observe failed', e); }
+      try { obs = observeBoard() || undefined; } catch (e) { console.error('[ChessVision] observe failed', e); }
     }
     if (!cfg.enabled) { setStatus('off'); return; }
     if (allowed === null) { setStatus('loading page list\u2026'); return; }
@@ -491,7 +504,7 @@
         playToken++; busy = false;                      // late results from the old attempt are ignored
       } else { recheckPending = true; return; }         // don't lose the update, look again once free
     }
-    const pos = buildFen();
+    const pos = buildFen(obs);                                   // the observation above: no second board read
     if (!pos) { setStatus('no board found', 'warn'); return; }
     const over = gameOverFor(pos);
     if (over) {
@@ -616,7 +629,33 @@
 
   function schedule(ms, reason = 'event') {
     clearTimeout(debounceTimer);
+    stableSeq++;                                                 // a stable check still waiting for its second read is outdated
     debounceTimer = setTimeout(() => check(reason), ms);
+  }
+
+  // Board mutations (2.0.0): a short debounce, then a STABLE READ: the board is read twice, one animation frame + 20 ms
+  // apart, and check() only runs when both reads agree. The tracker treats "more pieces than before" as a new game, so a
+  // read taken while chess.com is half-way through an update (piece removed, not re-added yet) followed by a full read
+  // could clear the hash and restart the recorder; the second read rules that out. A short debounce alone would not.
+  // boardDebounceMs 250 = the 1.8.0 timing (the stability check stays).
+  const nextFrame = () => new Promise((r) => {                   // rAF does not fire in a hidden tab: a timeout backs it up
+    let done = false; const go = () => { if (!done) { done = true; r(); } };
+    try { requestAnimationFrame(go); } catch (e) { /* no rAF */ }
+    setTimeout(go, 100);
+  });
+  function scheduleStable(ms, reason) {
+    clearTimeout(debounceTimer);
+    const seq = ++stableSeq;
+    debounceTimer = setTimeout(async () => {
+      const a = boardSignature();
+      await nextFrame();
+      await sleep(STABLE_GAP_MS);
+      if (seq !== stableSeq) return;                             // a newer mutation (or schedule) took over
+      const b = boardSignature();
+      if (a === b || unstableRun >= UNSTABLE_MAX) { unstableRun = 0; check(reason); return; }
+      unstableReads++; unstableRun++;
+      scheduleStable(cfg.boardDebounceMs, 'unstable');
+    }, ms);
   }
 
   // Watchdog: re-reads the board on a timer, independent of any DOM event.
@@ -633,7 +672,7 @@
     board = b;
     observer = null;
     if (!b) return;
-    observer = new MutationObserver(() => schedule(250, 'mutation'));
+    observer = new MutationObserver(() => scheduleStable(cfg.boardDebounceMs, 'mutation'));
     observer.observe(b, {
       childList: true, subtree: true,
       attributes: true, attributeFilter: ['class'],
@@ -675,7 +714,7 @@
       page: location.hostname + location.pathname,
       allowedPage: isAllowedPage(), allowedEntries: allowed ? allowed.length : null,
       settings: cfg,
-      state: { busy, busyForMs: busy ? Date.now() - busySince : 0, attempts, dragDisabled, lastMode, atStart, ownMove, watchdogTimerRunning: !!watchdogTimer },
+      state: { busy, busyForMs: busy ? Date.now() - busySince : 0, attempts, dragDisabled, lastMode, atStart, ownMove, watchdogTimerRunning: !!watchdogTimer, unstableReads },
       history: (() => { const i = tracker.info(); return { length: i.plies, halfmove: i.halfmove, fullmove: i.fullmove, repetitionCount: i.repetitionCount, historyResets: i.resets, startFen: i.startFen }; })(),
       recording: { positionsSeen: rec.plyCount() },
       clock: { lastClock, myClockNow: board ? readMyClock(board.classList.contains('flipped') ? 'b' : 'w') : null },
