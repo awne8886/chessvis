@@ -425,6 +425,15 @@
         return;
       }
 
+      // Early ponder (2.0.0): the move is final, so the opponent's turn can be prepared now instead of after the pause, the
+      // cursor, chess.com's animation and the next board read. If the move is then discarded or does not register, the
+      // next check() computes another key and restarts the job, and the background's decide() answers `miss` for any
+      // position that does not extend this one (see sameBase in CV.createPonderState).
+      if (cfg.earlyPonder && idleWanted() && byUci(uci) && !document.hidden) {
+        const h = histFor(pos);
+        if (h) startIdle(h.startFen, [...h.moves, uci], pos.myColor);
+      }
+
       // Human-like pause. The engine already ran, so only the remainder is waited.
       let delay = CV.human.delayFor(cfg, { legalCount: legal.length, category });
       if (lastClock) delay = CV.clock.delayCap(delay, lastClock.ms);          // the pause must not eat a short clock
@@ -503,20 +512,30 @@
     play(pos);
   }
 
-  // ---------- AggroChess idle work (opponent's turn) ----------
+  // ---------- Idle work (opponent's turn): pondering / evaluation line ----------
+  // Is idle work wanted for the current engine and settings? (idleWork and the early ponder in play() use the same rule)
+  function idleWanted() { return sfPonderOn() || (cfg.engine === 'aggro' && (cfg.aggroPonder || cfg.aggroShowEval)); }
+
+  // Starts the background idle job for the position startFen + moves (the opponent to move there). The idle key is the
+  // HISTORY key, not the FEN: play() starts the job for the position after our move before the board shows it (early
+  // ponder, 2.0.0), and idleWork() later recognises the same position by the same key and only polls.
+  function startIdle(startFen, moves, myColor) {
+    idleKey = CV.ponderKey(startFen, moves); idlePondering = false; idleFound = 0; if (ui) ui.setEval('');
+    api.runtime.sendMessage(sfPonderOn()
+      ? { type: 'aggroIdle', engine: 'stockfish', startFen, moves, ponder: true, ponderMs: cfg.sfPonderMs, ponderWorkers: cfg.sfPonderWorkers, ponderHashMb: cfg.sfPonderHashMb, depth: cfg.depth, myColor }
+      : { type: 'aggroIdle', startFen, moves, ponder: cfg.aggroPonder, showEval: cfg.aggroShowEval, ponderMs: cfg.aggroPonderMs, ponderWorkers: cfg.aggroPonderWorkers, ponderHashMb: cfg.aggroPonderHashMb, myColor }).catch(() => {});
+  }
+
   function idleWork(pos) {
-    const sfIdle = sfPonderOn();
-    if (!sfIdle && (cfg.engine !== 'aggro' || !(cfg.aggroPonder || cfg.aggroShowEval))) return;
+    if (!idleWanted()) return;
     const h = histFor(pos);
     if (!h) return;
-    if (idleKey !== pos.fen) {                                   // start once per position
-      idleKey = pos.fen; idlePondering = false; idleFound = 0; if (ui) ui.setEval('');
-      api.runtime.sendMessage(sfIdle
-        ? { type: 'aggroIdle', engine: 'stockfish', startFen: h.startFen, moves: h.moves, ponder: true, ponderMs: cfg.sfPonderMs, ponderWorkers: cfg.sfPonderWorkers, ponderHashMb: cfg.sfPonderHashMb, depth: cfg.depth, myColor: pos.myColor }
-        : { type: 'aggroIdle', startFen: h.startFen, moves: h.moves, ponder: cfg.aggroPonder, showEval: cfg.aggroShowEval, ponderMs: cfg.aggroPonderMs, ponderWorkers: cfg.aggroPonderWorkers, ponderHashMb: cfg.aggroPonderHashMb, myColor: pos.myColor }).catch(() => {});
+    const key = CV.ponderKey(h.startFen, h.moves);
+    if (idleKey !== key) {                                       // start once per position (unless the early ponder already did)
+      startIdle(h.startFen, h.moves, pos.myColor);
     } else {                                                     // then poll (the watchdog ticks drive this)
       api.runtime.sendMessage({ type: 'aggroIdleStatus' }).then((r) => {
-        if (idleKey !== pos.fen || !r) return;
+        if (idleKey !== key || !r) return;
         idlePondering = !!r.pondering; idleFound = r.found || 0;
         if (ui) ui.setEval(r.evalLine || '');
       }).catch(() => {});

@@ -53,6 +53,9 @@
     sfPonderHashMb: 16,       // hash table of each ponder worker in MB (the main worker keeps 32)
     sfThreads: 1,             // search threads of the MAIN worker; above 1 only with the threaded build and only if the browser allows SharedArrayBuffer
 
+    // --- 2.0.0: speed (both engines unless noted) ---
+    earlyPonder: true,        // start pondering the moment our move is decided, not when the board shows it (false = 1.8.0)
+
     // --- game recording and saving ---
     saveWithSacrifices: false,       // save a finished game when its counted sacrifices reach the threshold
     saveSacrificeThreshold: 3,
@@ -252,8 +255,8 @@
   // addRunning / removeRunning are used by the pool. 'late' = planned, no finished reply yet (whether or not it is
   // running); decide() also says in `running` whether a worker was on that very move when the opponent played it.
   CV.createPonderState = function () {
-    const counters = { attempts: 0, hits: 0, misses: 0, late: 0, skipped: 0 };
-    let entry = null;
+    const counters = { attempts: 0, hits: 0, misses: 0, late: 0, skipped: 0, lastLeadMs: null, avgLeadMs: null, leadSamples: 0 };
+    let entry = null, leadSum = 0;
     const sameBase = (e, startFen, moves) => Array.isArray(moves) && startFen === e.startFen && moves.length === e.base.length + 1 &&
       e.base.every((m, i) => moves[i] === m);
     const syncRunning = (e) => { e.running = e.runningSet.size ? [...e.runningSet].pop() : null; };   // old field: the latest started one
@@ -262,7 +265,7 @@
       get: () => entry,
       begin(startFen, base, planned) {
         counters.attempts++;
-        entry = { startFen, base: base.slice(), planned: new Set(planned), results: {}, running: null, runningSet: new Set(), counted: new Set() };
+        entry = { startFen, base: base.slice(), planned: new Set(planned), results: {}, running: null, runningSet: new Set(), counted: new Set(), beganAt: Date.now() };
         return entry;
       },
       skip() { counters.skipped++; },
@@ -286,8 +289,13 @@
           else if (entry.planned.has(opp)) { decision = 'late'; running = entry.runningSet.has(opp); }
         }
         const key = String(startFen) + '|' + (Array.isArray(moves) ? moves.join(' ') : '');
-        if (!entry.counted.has(key)) { entry.counted.add(key); counters[decision === 'hit' ? 'hits' : decision === 'late' ? 'late' : 'misses']++; }
-        return { decision, result, running };
+        let leadMs = null;
+        if (decision !== 'miss') leadMs = Date.now() - entry.beganAt;   // 2.0.0: how long before the opponent's move the job began (early ponder makes it longer)
+        if (!entry.counted.has(key)) {
+          entry.counted.add(key); counters[decision === 'hit' ? 'hits' : decision === 'late' ? 'late' : 'misses']++;
+          if (leadMs !== null) { counters.lastLeadMs = leadMs; leadSum += leadMs; counters.leadSamples++; counters.avgLeadMs = Math.round(leadSum / counters.leadSamples); }
+        }
+        return { decision, result, running, leadMs };
       },
       // Drops the entry (new game, takeback, setting off, engine switch, miss...). True if there was one.
       invalidate() { const had = !!entry; entry = null; return had; },
