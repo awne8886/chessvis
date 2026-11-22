@@ -256,13 +256,27 @@ async function analyzeStockfishNow(fen, depth, imperfection, maxMs, startFen, mo
   else {
     const hist = typeof startFen === 'string' && Array.isArray(moves);
     const d = ponder.decide(hist ? startFen : null, hist ? moves : null);
-    if (d.decision === 'hit') { ponderStop(); lastMainPv = null; const e = d.result; return { uci: e.uci, best: e.uci, depth: e.depth, ponderHit: true }; }
+    if (d.decision === 'hit') {
+      // 2.0.0 harvest upgrade: a deepening pass may be searching exactly this move right now and already be deeper than the
+      // stored reply. Stop it and use its bestmove if it answers within SF_HARVEST_MS; otherwise the stored reply.
+      const opp = moves[moves.length - 1];
+      const w = ponderKind === 'sf' ? ponderActive.find((x) => x.kind === 'sf' && x.task && x.task.key === opp && x.task.deepen && x.task.depth > (d.result.depth || 0)) : null;
+      const tp = w && w.task.promise;
+      ponderStop(); lastMainPv = null;
+      let e = d.result;
+      if (tp) {
+        const res = await Promise.race([tp, new Promise((r) => setTimeout(() => r(null), SF_HARVEST_MS))]).catch(() => null);
+        if (res && res.best && res.best !== '(none)' && res.key === opp && res.depth > (e.depth || 0)) { e = { uci: res.best, depth: res.depth }; ponderDbg.harvestUpgrades++; }
+      }
+      noteHitDepth(e.depth);
+      return { uci: e.uci, best: e.uci, depth: e.depth, ponderHit: true };
+    }
     if (d.decision === 'late' && d.running && ponderKind === 'sf') {          // a worker is on exactly this move: take what it has if it is deep enough
       const opp = moves[moves.length - 1], w = ponderActive.find((x) => x.kind === 'sf' && x.task && x.task.key === opp), tp = w && w.task.promise;
       ponderStop();                                                           // halts the job, sends `stop` to every worker
       if (tp) {
         const res = await Promise.race([tp, new Promise((r) => setTimeout(() => r(null), SF_HARVEST_MS))]).catch(() => null);
-        if (res && res.best && res.best !== '(none)' && res.depth >= SF_PARTIAL_MIN_DEPTH && res.key === opp) { sfDbg.harvested++; lastMainPv = null; return { uci: res.best, best: res.best, depth: res.depth, ponderHit: true, partial: true }; }
+        if (res && res.best && res.best !== '(none)' && res.depth >= SF_PARTIAL_MIN_DEPTH && res.key === opp) { sfDbg.harvested++; lastMainPv = null; noteHitDepth(res.depth); return { uci: res.best, best: res.best, depth: res.depth, ponderHit: true, partial: true }; }
         sfDbg.harvestFailed++;
       }
     }
@@ -491,11 +505,68 @@ async function aggroVerifyPosition(h, msg) {
 // When the opponent moves, whatever was already found is used.
 const PONDER_SCAN_MS = 12;          // ranking pass: a very short search after each legal opponent move
 const PONDER_SCAN_SHARE = 0.35;     // the ranking pass may use at most this share of the ponder time
-const PONDER_OVERRUN_MS = 70;       // a search can overrun its ms a little (seen: +50 ms); never start one that could end late
-const PONDER_MIN_SLICE_MS = 80;     // no search shorter than this is worth using as a reply
+const PONDER_OVERRUN_MS = CV.PONDER_OVERRUN_MS;       // 70: a search can overrun its ms a little (seen: +50 ms); never start one that could end late
+const PONDER_MIN_SLICE_MS = CV.PONDER_MIN_SLICE_MS;   // 80: no search shorter than this is worth using as a reply
 const PONDER_SLICE_MIN_MS = 120, PONDER_SLICE_MAX_MS = 600;
 const ponder = CV.createPonderState();
 let idleToken = 0, idleInfo = { pondering: false, evalLine: null };
+// 2.0.0 debug: passes of the latest ponder job, and the depth of the reply used on each recent hit (newest last)
+const ponderDbg = { lastPasses: 0, hitDepths: [], harvestUpgrades: 0, lateWaits: 0, lateWaitHits: 0 };
+const noteHitDepth = (d) => { ponderDbg.hitDepths.push(d || 0); if (ponderDbg.hitDepths.length > 20) ponderDbg.hitDepths.shift(); };
+
+// The job's ceiling (ms): the *PonderMs budget (1.8.0), or with ponderUntilMove (2.0.0) max(budget, ponderMaxMs): the job
+// then keeps deepening until the opponent moves (any real search cancels it) or this ceiling.
+function ponderCeiling(msg, budget) {
+  if (!msg.ponderUntilMove) return budget;
+  const lim = CV.LIMITS.ponderMaxMs;
+  return Math.max(budget, Math.min(lim[1], Math.max(lim[0], Number(msg.ponderMaxMs) || CV.DEFAULTS.ponderMaxMs)));
+}
+
+// Reply searches of one ponder job, pass by pass (2.0.0). Pass 1 is the 1.8.0 reply queue (every ranked move, one slice
+// each, most likely first). With `until`, more passes follow from CV.ponderDeepenPlan (the likely moves again with longer
+// slices) until the token changes or the deadline. A pass starts when the previous one has finished (its results feed the
+// planner). Worker affinity: a move is given back to the worker that searched it last while that worker is free (its hash
+// holds that tree), otherwise to any free worker.
+//   claim(w) -> { u, ms, pass, done() } | null; done() must be called when that search ended (finally).
+// opts: { token, ranked, firstSlice, left(), until, workers, depthCap, single, skipFirst() }
+function createReplyPasses(opts) {
+  let pass = 0, queue = [], running = 0, waiters = [];
+  const lastWorker = new Map(), busy = new Set();
+  const wake = () => { const w = waiters; waiters = []; for (const r of w) r(); };
+  const nextPass = () => {
+    if (pass >= 1 && !opts.until) return false;
+    const p = ponder.get();
+    let items = CV.ponderDeepenPlan({ ranked: opts.ranked, results: p ? p.results : null, pass: pass + 1, workers: opts.workers.length, firstSlice: opts.firstSlice, leftMs: opts.left(), depthCap: pass >= 1 ? opts.depthCap : 0 });
+    if (pass === 0 && opts.skipFirst) { const skip = opts.skipFirst(); if (skip) items = items.filter((it) => it.uci !== skip); }
+    if (!items.length) return false;
+    pass++; queue = items;
+    if (pass > 1) ponderDbg.lastPasses = pass - 1;
+    return true;
+  };
+  const free = (w) => !w.dead && !busy.has(w) && opts.workers.includes(w);
+  return {
+    passes: () => pass,
+    async claim(w) {
+      for (;;) {
+        if (opts.token !== idleToken) return null;
+        if (queue.length) {
+          let i = queue.findIndex((it) => lastWorker.get(it.uci) === w);
+          if (i < 0) i = queue.findIndex((it) => { const lw = lastWorker.get(it.uci); return !lw || !free(lw); });
+          if (i < 0) i = 0;
+          const it = queue.splice(i, 1)[0];
+          const room = opts.left() - PONDER_OVERRUN_MS;
+          const ms = opts.single ? room : Math.min(it.ms, room);
+          if (ms < PONDER_MIN_SLICE_MS) { queue = []; continue; }        // nothing fits any more
+          running++; busy.add(w); lastWorker.set(it.uci, w);
+          let ended = false;
+          return { u: it.uci, ms, pass, done: () => { if (ended) return; ended = true; running--; busy.delete(w); if (!running) wake(); } };
+        }
+        if (running > 0) { await new Promise((r) => waiters.push(r)); continue; }    // the pass is still finishing on other workers
+        if (!nextPass()) { ponderDbg.lastPasses = Math.max(0, pass); wake(); return null; }
+      }
+    },
+  };
+}
 
 // ---- the ponder worker pool ----
 // ponderActive: the workers of the running job. ponderSpares: idle workers that are already instantiated AND warmed up, so
@@ -581,8 +652,9 @@ async function runIdle(msg, token) {
 async function runIdleJob(msg, token) {
   const t0 = Date.now();
   const budget = Math.max(200, Math.min(AGGRO_HARD_MAX_MS, Number(msg.ponderMs) || 1500));
-  const deadline = t0 + budget;
+  const deadline = t0 + ponderCeiling(msg, budget);              // 2.0.0: up to ponderMaxMs with ponderUntilMove
   const left = () => deadline - Date.now();
+  ponderDbg.lastPasses = 0;
   const main = aggroGet();
   await main.ready;
   let predicted = null;
@@ -604,7 +676,7 @@ async function runIdleJob(msg, token) {
   // shared queue 1 - ranking: how good is each opponent move for the opponent? (a very short search after each)
   const scoreOf = new Map();
   const scanMs = Math.max(5, Math.min(PONDER_SCAN_MS, Math.floor((budget * PONDER_SCAN_SHARE) / Math.max(1, legal.length))));
-  const scanEnd = t0 + budget * PONDER_SCAN_SHARE;
+  let scanEnd = null;                                          // the ranking window starts with the first ranking search (2.0.0: the predicted reply may come first)
   const rank = { next: 0, pending: 0, ended: false };
   let rankedList = null, resolveRanked = null;
   const ranked = new Promise((r) => { resolveRanked = r; });
@@ -615,6 +687,7 @@ async function runIdleJob(msg, token) {
     resolveRanked();
   };
   const rankClaim = () => {
+    if (scanEnd === null) scanEnd = Date.now() + budget * PONDER_SCAN_SHARE;
     if (!rank.ended && (rank.next >= legal.length || Date.now() > scanEnd || left() < PONDER_OVERRUN_MS || token !== idleToken)) rank.ended = true;
     if (rank.ended) { finishRanking(); return null; }
     rank.pending++;
@@ -626,16 +699,11 @@ async function runIdleJob(msg, token) {
   // 2.0.0: AggroChess's own predicted move gets its reply first, on the first worker that is ready, while the others start
   // ranking; the reply queue then skips it.
   const predictedOk = doPonder && !!predicted && legal.some((m) => m.uci === predicted);
-  let predictedTaken = false;
-  const replyClaim = () => {
-    while (rankedList && replyNext < rankedList.length && predictedTaken && rankedList[replyNext] === predicted) replyNext++;
-    if (token !== idleToken || !rankedList || replyNext >= rankedList.length) return null;
-    const ms = Math.min(slice, left() - PONDER_OVERRUN_MS);
-    if (ms < PONDER_MIN_SLICE_MS) return null;
-    return { u: rankedList[replyNext++], ms };
-  };
+  let predictedTaken = false, passes = null;
+  const getPasses = () => passes || (passes = createReplyPasses({ token, ranked: rankedList, firstSlice: slice, left, until: !!msg.ponderUntilMove,
+    workers: pool, depthCap: 0, single: false, skipFirst: () => (predictedTaken ? predicted : null) }));
   const replySearch = async (w, c) => {
-    ponder.addRunning(c.u);
+    ponder.addRunning(c.u, { startedAt: Date.now(), ms: c.ms });
     try {
       if (PONDER_STEPPED && w.steps) {                      // one depth at a time: every finished depth is a usable (partial) reply
         const sliceEnd = Date.now() + c.ms;
@@ -664,9 +732,8 @@ async function runIdleJob(msg, token) {
       if (token !== idleToken) return;
       idleInfo.pondering = !!msg.ponder;
       if (predictedOk && !predictedTaken) {                    // the first ready worker: the predicted move's reply before anything else
-        predictedTaken = true;
         const ms = Math.min(slice, left() - PONDER_OVERRUN_MS);
-        if (ms >= PONDER_MIN_SLICE_MS) await replySearch(w, { u: predicted, ms });
+        if (ms >= PONDER_MIN_SLICE_MS) { predictedTaken = true; await replySearch(w, { u: predicted, ms }); }
         if (token !== idleToken) return;
       }
       if (first && msg.showEval) {                             // the evaluation line runs on the first worker, the others start ranking meanwhile
@@ -683,8 +750,8 @@ async function runIdleJob(msg, token) {
         } finally { rank.pending--; finishRanking(); }
       }
       await ranked;                                            // the replies are taken in ranked order, so wait for the last ranking search
-      for (let c = replyClaim(); c; c = replyClaim()) {
-        await replySearch(w, c);
+      for (let c = await getPasses().claim(w); c; c = await getPasses().claim(w)) {
+        try { await replySearch(w, c); } finally { c.done(); }
         if (token !== idleToken) return;
       }
     } catch (e) {
@@ -727,7 +794,7 @@ async function analyzeAggroNow(msg) {
     if (!msg.ponder) ponderCancel();
     else {
       const d = ponder.decide(hist ? msg.startFen : null, hist ? msg.moves : null);
-      if (d.decision === 'hit') { ponderStop(); const e = d.result; return { uci: e.uci, best: e.uci, san: e.san, sacrifice: e.sacrifice, depth: e.depth, ponderHit: true }; }
+      if (d.decision === 'hit') { ponderStop(); const e = d.result; noteHitDepth(e.depth); return { uci: e.uci, best: e.uci, san: e.san, sacrifice: e.sacrifice, depth: e.depth, ponderHit: true }; }
       ponderCancel();                                          // miss, late or no entry yet: the ponder workers never delay a real think
     }
     const h = aggroGet();
@@ -831,11 +898,11 @@ function spawnSfWorker(label, hashMb) {
   h.ready = h.ready.catch((e) => { h.kill(); throw e; });      // a worker that failed to start or warm up is never reused
   h.ready.catch(() => {});
   // Searches one position. key = what the result is for (an opponent move, 'rank', 'warm'); movetime comes from `go`.
-  h.search = (startFen, moves, go, key, multipv) => new Promise((resolve, reject) => {
+  h.search = (startFen, moves, go, key, multipv, extra) => new Promise((resolve, reject) => {
     if (h.dead || !h.worker) { reject(new Error('worker was terminated')); return; }
     if (h.task) { reject(new Error('worker is busy')); return; }
     const ms = Number((/movetime (\d+)/.exec(go) || [])[1]) || 1000;
-    const t = { key, lines: new Map(), depth: 0, stopped: false };
+    const t = { key, lines: new Map(), depth: 0, stopped: false, ...(extra || {}) };   // extra: { deepen } (2.0.0, the harvest upgrade)
     let settle; t.promise = new Promise((res) => { settle = res; });      // resolves with the result, or null when the search failed (cancel() and the harvest wait on it)
     t.resolve = (v) => { resolve(v); settle(v); };
     t.reject = (e) => { reject(e); settle(null); };
@@ -888,7 +955,8 @@ async function runIdleSf(msg, token) {
 async function runIdleSfJob(msg, token) {
   const t0 = Date.now();
   const budget = Math.max(200, Math.min(AGGRO_HARD_MAX_MS, Number(msg.ponderMs) || 1500));
-  const deadline = t0 + budget, left = () => deadline - Date.now();
+  const deadline = t0 + ponderCeiling(msg, budget), left = () => deadline - Date.now();   // 2.0.0: up to ponderMaxMs with ponderUntilMove
+  ponderDbg.lastPasses = 0;
   const after = CV.replayUci(msg.startFen, msg.moves);
   if (!after.ok) return;
   const legal = CV.chess.legalMoves(after.pos).map((m) => m.uci);          // the opponent's possible moves
@@ -903,7 +971,12 @@ async function runIdleSfJob(msg, token) {
   const predicted = CV.pvPredict(lastMainPv, msg.startFen, msg.moves);
   const goFor = (ms) => CV.sfGoCommand(depth, ms);
   const req = (w, startFen, moves, ms, key, mpv) => w.search(startFen, moves, goFor(ms), key, mpv);
+  // 2.0.0: pass 1 keeps the 1.8.0 search (go depth N movetime slice: many moves, quickly); deepening passes have no depth
+  // cap in 'delay' / 'clock' mode (go movetime ms). In 'depth' mode they keep the cap and stop once everything has depth N.
+  const depthMode = !(msg.sfSearchMode === 'delay' || msg.sfSearchMode === 'clock');
+  const goPass = (pass, ms) => (pass >= 2 && !depthMode ? 'go movetime ' + Math.max(1, Math.round(ms)) : goFor(ms));
 
+  const slice = Math.max(PONDER_SLICE_MIN_MS, Math.min(PONDER_SLICE_MAX_MS, Math.round(budget / 6)));
   // ranking: lists the opponent's moves, most likely first
   const scoreOf = new Map();
   const rank = { owner: null, next: 0, pending: 0, ended: false };
@@ -911,6 +984,9 @@ async function runIdleSfJob(msg, token) {
   const ranked = new Promise((r) => { resolveRanked = r; });
   const setRanked = (list) => { if (!rankedList) { rankedList = CV.moveFirst(list, predicted); resolveRanked(); } };
   if (mode === 'single') setRanked(legal.slice());
+  let passes = null;
+  const getPasses = () => passes || (passes = createReplyPasses({ token, ranked: rankedList, firstSlice: slice, left, until: !!msg.ponderUntilMove,
+    workers: pool, depthCap: depthMode ? depth : 0, single: mode === 'single' }));
   const scanMs = Math.max(5, Math.min(SF_SCAN_MS, Math.floor((budget * SF_PONDER_SCAN_SHARE) / Math.max(1, legal.length))));
   const scanEnd = t0 + budget * SF_PONDER_SCAN_SHARE;
   const scanClaim = () => {
@@ -919,15 +995,8 @@ async function runIdleSfJob(msg, token) {
     rank.pending++;
     return legal[rank.next++];
   };
-  // replies: most likely opponent move first, each with its own slice; nothing starts after the deadline
-  const slice = Math.max(PONDER_SLICE_MIN_MS, Math.min(PONDER_SLICE_MAX_MS, Math.round(budget / 6)));
-  let replyNext = 0;
-  const replyClaim = () => {
-    if (token !== idleToken || !rankedList || replyNext >= rankedList.length) return null;
-    const ms = mode === 'single' ? left() - PONDER_OVERRUN_MS : Math.min(slice, left() - PONDER_OVERRUN_MS);   // one legal move: think about it for the whole time
-    if (ms < PONDER_MIN_SLICE_MS) return null;
-    return { u: rankedList[replyNext++], ms };
-  };
+  // replies: most likely opponent move first, each with its own slice; nothing starts after the deadline (createReplyPasses;
+  // one legal move: think about it for the whole time)
 
   const work = async (w) => {
     try {
@@ -955,13 +1024,13 @@ async function runIdleSfJob(msg, token) {
         }
       }
       await ranked;
-      for (let c = replyClaim(); c; c = replyClaim()) {
-        ponder.addRunning(c.u);
+      for (let c = await getPasses().claim(w); c; c = await getPasses().claim(w)) {
+        ponder.addRunning(c.u, { startedAt: Date.now(), ms: c.ms });
         try {
-          const r = await req(w, msg.startFen, [...msg.moves, c.u], c.ms, c.u);
+          const r = await w.search(msg.startFen, [...msg.moves, c.u], goPass(c.pass, c.ms), c.u, undefined, { deepen: c.pass >= 2 });
           if (token !== idleToken) return;
           if (!r.stopped && r.best && r.best !== '(none)') ponder.addResult(c.u, { uci: r.best, depth: r.depth, ms: c.ms });
-        } finally { ponder.removeRunning(c.u); }
+        } finally { ponder.removeRunning(c.u); c.done(); }
       }
     } catch (e) {
       if (token === idleToken) { console.error('[ChessVision] Stockfish ponder worker stopped', e); ponderDrop(w); }   // the other workers go on
@@ -1027,7 +1096,7 @@ api.runtime.onMessage.addListener((msg) => {
   if (msg && msg.type === 'aggroIdle') return Promise.resolve(aggroIdle(msg));
   if (msg && msg.type === 'aggroIdleStatus') return Promise.resolve({ pondering: idleInfo.pondering, evalLine: idleInfo.evalLine, found: ponder.found() });
   if (msg && msg.type === 'aggroDebug') {
-    return Promise.resolve({ ponder: { ...ponder.counters }, verify: { checks: aggroDbg.verifyChecks, warnings: aggroDbg.verifyWarnings, last: aggroDbg.lastVerify },
+    return Promise.resolve({ ponder: { ...ponder.counters, passes: ponderDbg.lastPasses, hitDepths: ponderDbg.hitDepths.slice(), harvestUpgrades: ponderDbg.harvestUpgrades, lateWaits: ponderDbg.lateWaits, lateWaitHits: ponderDbg.lateWaitHits }, verify: { checks: aggroDbg.verifyChecks, warnings: aggroDbg.verifyWarnings, last: aggroDbg.lastVerify },
       aggroWorkerAlive: !!(aggroMain && !aggroMain.dead), aggroRestarts: aggroDbg.restarts, aggroFailure: aggroFailure ? aggroFailure.message : null,
       ponderPool: { cap: ponderCap, active: ponderActive.filter((w) => !w.dead).length, spares: ponderSpares.filter((w) => !w.dead).length, wanted: ponderWanted },
       module: { ...aggroModuleInfo, sendFailures: aggroDbg.moduleSendFailures }, ponderHashMb, ponderStepped: PONDER_STEPPED, workerStarts: aggroDbg.workerStarts, lastWorkerStart: aggroDbg.lastStart,

@@ -105,4 +105,37 @@ test('addResult never replaces a deeper result; equal or greater depth replaces 
   assert.strictEqual(p.addResult('c7c5', { uci: 'g1f3', depth: 3 }), false, 'not planned');
 });
 
+// ---- T7: deepening planner ----
+const R = ['a1a2', 'b1b2', 'c1c2', 'd1d2', 'e1e2', 'f1f2', 'g1g2', 'h1h2'];
+test('ponderDeepenPlan: pass 1 = every ranked move with the first slice', () => {
+  for (const workers of [1, 3]) {
+    const p = CV.ponderDeepenPlan({ ranked: R, results: {}, pass: 1, workers, firstSlice: 250, leftMs: 8000 });
+    assert.deepStrictEqual(p, R.map((uci) => ({ uci, ms: 250 })));
+  }
+});
+test('ponderDeepenPlan: pass 2 / 3 with 1 and 3 workers', () => {
+  const p = (pass, workers) => CV.ponderDeepenPlan({ ranked: R, results: {}, pass, workers, firstSlice: 250, leftMs: 30000 });
+  assert.deepStrictEqual(p(2, 1), [{ uci: 'a1a2', ms: 500 }, { uci: 'b1b2', ms: 500 }]);                 // K = max(2, 2)
+  assert.deepStrictEqual(p(3, 1), [{ uci: 'a1a2', ms: 1000 }, { uci: 'b1b2', ms: 1000 }]);
+  assert.deepStrictEqual(p(2, 3), R.slice(0, 6).map((uci) => ({ uci, ms: 500 })));                     // K = 2 x 3
+  assert.deepStrictEqual(p(3, 3), R.slice(0, 6).map((uci) => ({ uci, ms: 1000 })));
+  assert.deepStrictEqual(p(6, 1).map((x) => x.ms), [4000, 4000], 'slice capped at 4000');
+  assert.deepStrictEqual(CV.ponderDeepenPlan({ ranked: ['a1a2'], pass: 2, workers: 3, firstSlice: 250, leftMs: 9000 }), [{ uci: 'a1a2', ms: 500 }], 'K <= ranked');
+});
+test('ponderDeepenPlan: slices fit the deadline; stops when no minimum slice fits', () => {
+  const p = (leftMs, pass) => CV.ponderDeepenPlan({ ranked: R, results: {}, pass, workers: 1, firstSlice: 250, leftMs });
+  assert.deepStrictEqual(p(400, 2).map((x) => x.ms), [400 - CV.PONDER_OVERRUN_MS, 400 - CV.PONDER_OVERRUN_MS]);
+  assert.deepStrictEqual(p(CV.PONDER_MIN_SLICE_MS + CV.PONDER_OVERRUN_MS - 1, 2), []);
+  assert.deepStrictEqual(p(CV.PONDER_MIN_SLICE_MS + CV.PONDER_OVERRUN_MS - 1, 1), []);
+  assert.strictEqual(p(CV.PONDER_MIN_SLICE_MS + CV.PONDER_OVERRUN_MS, 2).length, 2);
+  assert.deepStrictEqual(CV.ponderDeepenPlan({ ranked: [], pass: 1, workers: 1, firstSlice: 250, leftMs: 5000 }), []);
+});
+test('ponderDeepenPlan: depth cap stops deepening once every top result has depth N', () => {
+  const results = { a1a2: { depth: 10 }, b1b2: { depth: 10 } };
+  assert.deepStrictEqual(CV.ponderDeepenPlan({ ranked: R, results, pass: 2, workers: 1, firstSlice: 250, leftMs: 5000, depthCap: 10 }), []);
+  const partial = { a1a2: { depth: 10 }, b1b2: { depth: 7 } };
+  assert.strictEqual(CV.ponderDeepenPlan({ ranked: R, results: partial, pass: 2, workers: 1, firstSlice: 250, leftMs: 5000, depthCap: 10 }).length, 2);
+  assert.strictEqual(CV.ponderDeepenPlan({ ranked: R, results, pass: 2, workers: 1, firstSlice: 250, leftMs: 5000, depthCap: 0 }).length, 2, 'no cap: keeps going');
+});
+
 run();

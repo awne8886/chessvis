@@ -589,8 +589,10 @@
   function startIdle(startFen, moves, myColor) {
     idleKey = CV.ponderKey(startFen, moves); idlePondering = false; idleFound = 0; if (ui) ui.setEval('');
     api.runtime.sendMessage(sfPonderOn()
-      ? { type: 'aggroIdle', engine: 'stockfish', startFen, moves, ponder: true, ponderMs: cfg.sfPonderMs, ponderWorkers: cfg.sfPonderWorkers, ponderHashMb: cfg.sfPonderHashMb, depth: cfg.depth, myColor }
-      : { type: 'aggroIdle', startFen, moves, ponder: cfg.aggroPonder, showEval: cfg.aggroShowEval, ponderMs: cfg.aggroPonderMs, ponderWorkers: cfg.aggroPonderWorkers, ponderHashMb: cfg.aggroPonderHashMb, myColor }).catch(() => {});
+      ? { type: 'aggroIdle', engine: 'stockfish', startFen, moves, ponder: true, ponderMs: cfg.sfPonderMs, ponderWorkers: cfg.sfPonderWorkers, ponderHashMb: cfg.sfPonderHashMb, depth: cfg.depth, myColor,
+        ponderUntilMove: cfg.ponderUntilMove, ponderMaxMs: cfg.ponderMaxMs, sfSearchMode: cfg.sfSearchMode }
+      : { type: 'aggroIdle', startFen, moves, ponder: cfg.aggroPonder, showEval: cfg.aggroShowEval, ponderMs: cfg.aggroPonderMs, ponderWorkers: cfg.aggroPonderWorkers, ponderHashMb: cfg.aggroPonderHashMb, myColor,
+        ponderUntilMove: cfg.ponderUntilMove, ponderMaxMs: cfg.ponderMaxMs }).catch(() => {});
   }
 
   function idleWork(pos) {

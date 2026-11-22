@@ -56,6 +56,8 @@
     // --- 2.0.0: speed (both engines unless noted) ---
     earlyPonder: true,        // start pondering the moment our move is decided, not when the board shows it (false = 1.8.0)
     boardDebounceMs: 80,      // wait after a board change before the stable-read check (250 = the 1.8.0 timing)
+    ponderUntilMove: true,    // keep pondering (deepening the likely replies) until the opponent moves, up to ponderMaxMs (false = the *PonderMs budget, 1.8.0)
+    ponderMaxMs: 8000,        // ceiling of a ponder job with ponderUntilMove
     ponderHitFast: true,      // a ponder hit is answered with the quick delay and the faster hand (false = 1.8.0: normal delay)
     sfSearchMode: 'delay',    // Stockfish full search: 'depth' (1.8.0: go depth N) | 'delay' (search through the human-like pause, depth = minimum) | 'clock'
 
@@ -98,6 +100,7 @@
     sfPonderWorkers: [1, 3, 1],
     sfPonderHashMb: [4, 64, 4],
     sfThreads: [1, 4, 1],
+    ponderMaxMs: [1000, 30000, 500],
     saveSacrificeThreshold: [1, 20, 1],
     maxSavedGames: [5, 200, 1],
     brilliantWaitSec: [1, 15, 1],
@@ -432,6 +435,29 @@
   CV.sfParsePv = function (line) {
     const m = / pv ((?:\S+ ?)+)$/.exec(String(line || '').trim());
     return m ? m[1].trim().split(/\s+/) : [];
+  };
+
+  // ---- 2.0.0: deepening passes while the opponent thinks (pure; background.js) ----
+  CV.PONDER_OVERRUN_MS = 70;            // a search can overrun its ms a little (seen: +50 ms); never start one that could end late
+  CV.PONDER_MIN_SLICE_MS = 80;          // no search shorter than this is worth using as a reply
+  CV.PONDER_DEEPEN_MAX_SLICE_MS = 4000; // longest slice of a deepening pass
+  // The reply searches of one pass: [{ uci, ms }], most likely opponent move first; [] = stop.
+  //   pass 1    = the 1.8.0 reply queue: every ranked move, firstSlice each (the caller still clamps each slice to the deadline)
+  //   pass k>=2 = the top K = min(ranked, max(2, 2 x workers)) moves again, slice min(4000, firstSlice x 2^(k-1))
+  // Stops when the time left (leftMs, minus the overrun allowance) cannot fit PONDER_MIN_SLICE_MS, and, with a depth cap
+  // (Stockfish 'depth' mode: every search is `go depth N ...`), after pass 1 once every top-K result already has depth >= N.
+  CV.ponderDeepenPlan = function ({ ranked, results, pass, workers, firstSlice, leftMs, depthCap }) {
+    const list = Array.isArray(ranked) ? ranked : [];
+    const room = leftMs === undefined || leftMs === null ? Infinity : Number(leftMs) - CV.PONDER_OVERRUN_MS;
+    if (!list.length || !(room >= CV.PONDER_MIN_SLICE_MS)) return [];
+    const first = Math.max(CV.PONDER_MIN_SLICE_MS, Number(firstSlice) || CV.PONDER_MIN_SLICE_MS);
+    const k = Math.max(1, Math.floor(Number(pass)) || 1);
+    if (k === 1) return list.map((uci) => ({ uci, ms: first }));
+    const top = list.slice(0, Math.min(list.length, Math.max(2, 2 * Math.max(1, Math.floor(Number(workers)) || 1))));
+    const cap = Number(depthCap) || 0;
+    if (cap > 0 && top.every((u) => results && results[u] && results[u].depth >= cap)) return [];
+    const ms = Math.min(CV.PONDER_DEEPEN_MAX_SLICE_MS, first * Math.pow(2, k - 1), room);
+    return ms >= CV.PONDER_MIN_SLICE_MS ? top.map((uci) => ({ uci, ms })) : [];
   };
 
   // ---- 2.0.0: seeding the ponder table from the main search's principal variation (pure; background.js) ----
