@@ -347,29 +347,44 @@
   // Stockfish pondering is off while Imperfection is above 0: a prepared reply is always the best line, the imperfection choice would be skipped.
   function sfPonderOn() { return cfg.engine === 'stockfish' && cfg.sfPonder && !(hum() && cfg.imperfection > 0); }
 
-  function askEngine(pos, quick) {
+  // The clock part of a FULL search (sets lastClock): AggroChess soft/hard from my clock (aggroUseClock), the Stockfish time
+  // cap (sfMaxMs, combined with the clock budget when sfUseClock is on). Called before the human-like delay is drawn, so
+  // the delay can be capped by the clock (CV.clock.delayCap) before the engine is asked.
+  function fullPlan(pos) {
+    lastClock = null;
+    const plan = { soft: undefined, hard: undefined, sfCap: cfg.engine === 'stockfish' ? cfg.sfMaxMs : 0 };
+    if (cfg.engine === 'aggro' && cfg.aggroUseClock) {
+      const clk = readMyClock(pos.myColor);
+      const budget = clk && CV.clock.clockBudget({ remainingMs: clk.ms, incrementMs: clk.inc, thinkMs: cfg.thinkMs });
+      if (budget) { plan.soft = budget.soft; plan.hard = budget.hard; lastClock = { ms: clk.ms, mode: budget.mode, soft: budget.soft, hard: budget.hard }; log('clock', clk.ms, 'ms ->', budget); }
+    }
+    if (cfg.engine === 'stockfish' && cfg.sfUseClock) {            // optional: never more than the clock allows (clock.js: <= a quarter of what is left)
+      const clk = readMyClock(pos.myColor);
+      const budget = clk && CV.clock.clockBudget({ remainingMs: clk.ms, incrementMs: clk.inc, thinkMs: cfg.sfMaxMs > 0 ? cfg.sfMaxMs : 5000 });
+      if (budget) { plan.sfCap = CV.sfSearchCap(cfg.sfMaxMs, budget.soft); lastClock = { ms: clk.ms, mode: budget.mode, soft: budget.soft, hard: budget.hard }; log('clock', clk.ms, 'ms -> sf cap', plan.sfCap); }
+    }
+    return plan;
+  }
+
+  // Does the full search use the human-like pause as engine time (2.0.0)? Stockfish: sfSearchMode 'delay' / 'clock';
+  // AggroChess: the constant CV.AGGRO_DELAY_MATCH (false = 1.8.0).
+  const delayMatched = () => (cfg.engine === 'stockfish' ? cfg.sfSearchMode !== 'depth' : !!CV.AGGRO_DELAY_MATCH);
+
+  // quick = the cheap look for an obvious move (Stockfish depth <= 8, AggroChess quickThinkMs; no clock, no pause budget).
+  // plan / softMs: only for the full search (fullPlan, and the delay-matched budget).
+  function askEngine(pos, quick, plan, softMs) {
     const depth = quick ? Math.min(cfg.depth, 8) : cfg.depth;
     const ms = quick ? Math.min(cfg.thinkMs, cfg.quickThinkMs) : cfg.thinkMs;
     const h = histFor(pos);
-    let soft, hard;
-    lastClock = null;
-    if (!quick && cfg.engine === 'aggro' && cfg.aggroUseClock) {     // the quick-reply path keeps its small budget
-      const clk = readMyClock(pos.myColor);
-      const budget = clk && CV.clock.clockBudget({ remainingMs: clk.ms, incrementMs: clk.inc, thinkMs: cfg.thinkMs });
-      if (budget) { soft = budget.soft; hard = budget.hard; lastClock = { ms: clk.ms, mode: budget.mode, soft, hard }; log('clock', clk.ms, 'ms ->', budget); }
-    }
-    let sfCap = !quick && cfg.engine === 'stockfish' ? cfg.sfMaxMs : 0;      // time cap only for the full search; quick looks stay depth <= 8
-    if (!quick && cfg.engine === 'stockfish' && cfg.sfUseClock) {            // optional: never more than the clock allows (clock.js: <= a quarter of what is left)
-      const clk = readMyClock(pos.myColor);
-      const budget = clk && CV.clock.clockBudget({ remainingMs: clk.ms, incrementMs: clk.inc, thinkMs: cfg.sfMaxMs > 0 ? cfg.sfMaxMs : 5000 });
-      if (budget) { sfCap = CV.sfSearchCap(cfg.sfMaxMs, budget.soft); lastClock = { ms: clk.ms, mode: budget.mode, soft: budget.soft, hard: budget.hard }; log('clock', clk.ms, 'ms -> sf cap', sfCap); }
-    }
+    if (quick) lastClock = null;
+    const p = quick || !plan ? { sfCap: 0 } : plan;              // time cap only for the full search; quick looks stay depth <= 8
     return api.runtime.sendMessage({
       type: 'analyze', fen: pos.fen, engine: cfg.engine, depth, ms,
       startFen: h ? h.startFen : null, moves: h ? h.moves : null,       // null = no reliable history: engines get the bare FEN
-      soft, hard, verify: cfg.engine === 'aggro' && cfg.aggroVerify, ponder: sfPonderOn() || (cfg.engine === 'aggro' && cfg.aggroPonder), sfThreads: cfg.engine === 'stockfish' ? cfg.sfThreads : undefined,
+      soft: p.soft, hard: p.hard, verify: cfg.engine === 'aggro' && cfg.aggroVerify, ponder: sfPonderOn() || (cfg.engine === 'aggro' && cfg.aggroPonder), sfThreads: cfg.engine === 'stockfish' ? cfg.sfThreads : undefined,
       imperfection: !quick && cfg.engine === 'stockfish' && hum() ? cfg.imperfection : 0,
-      sfMaxMs: sfCap,
+      sfMaxMs: p.sfCap,
+      sfSearchMode: quick ? 'depth' : cfg.sfSearchMode, softMs: quick ? 0 : (softMs || 0),
     });
   }
 
@@ -400,13 +415,23 @@
       const engineName = cfg.engine === 'stockfish' ? 'Stockfish' : 'AggroChess';
 
       let uci = null, category = null, sacrifice = false, ponderHit = false;
+      // 2.0.0: the human-like delay of a normal move is drawn BEFORE the full search, so the engine can search through it
+      // (delay-matched search). The move timing is unchanged: the wait is still max(delay, engine time).
+      let plannedDelay = null;
+      const fullSearch = () => {
+        const plan = fullPlan(pos);
+        plannedDelay = CV.human.delayFor(cfg, { legalCount: legal.length, category: null });
+        if (lastClock) plannedDelay = CV.clock.delayCap(plannedDelay, lastClock.ms);       // the pause must not eat a short clock
+        const softMs = delayMatched() ? Math.max(0, Math.round(plannedDelay - CV.SF_DELAY_MARGIN_MS - (Date.now() - t0))) : 0;
+        return askEngine(pos, false, plan, softMs);
+      };
 
       if (cfg.quickReplies && cfg.quickOnlyMove && legal.length === 1) {
         uci = legal[0].uci; category = 'only';            // forced: no need to ask the engine
       } else {
         const likely = CV.human.likelyObvious(parsed, legal, ctx, cfg);
         setStatus(likely ? 'quick look (' + engineName + ')\u2026' : 'thinking (' + engineName + ')\u2026', 'on');
-        let res = await askEngine(pos, likely);
+        let res = likely ? await askEngine(pos, true) : await fullSearch();
         if (token !== playToken || !cfg.enabled) return;
         if (cfg.engine === 'aggro' && cfg.aggroVerify && ui) ui.setWarn(res && res.verifyWarning ? 'Verify: ' + res.verifyWarning : '');
         if (res && res.error) {                             // e.g. an engine failed to start: show it, don't hammer the engine
@@ -417,7 +442,7 @@
           category = res && res.uci ? CV.human.classify(parsed, byUci(res.uci), ctx, cfg, legal.length) : null;
           if (!category) {                                  // looked obvious, wasn't: think properly
             setStatus('thinking (' + engineName + ')\u2026', 'on');
-            res = await askEngine(pos, false);
+            res = await fullSearch();
             if (token !== playToken || !cfg.enabled) return;
           }
         } else if (res && res.imperfect && res.best) {
@@ -446,8 +471,9 @@
         if (h) startIdle(h.startFen, [...h.moves, uci], pos.myColor);
       }
 
-      // Human-like pause. The engine already ran, so only the remainder is waited.
-      let delay = CV.human.delayFor(cfg, { legalCount: legal.length, category });
+      // Human-like pause. The engine already ran, so only the remainder is waited. A quick category has its own short
+      // delay; otherwise the delay drawn before the full search is used.
+      let delay = category || plannedDelay === null ? CV.human.delayFor(cfg, { legalCount: legal.length, category }) : plannedDelay;
       if (lastClock) delay = CV.clock.delayCap(delay, lastClock.ms);          // the pause must not eat a short clock
       const wait = Math.max(0, delay - (Date.now() - t0));
       if (wait) await sleep(wait);

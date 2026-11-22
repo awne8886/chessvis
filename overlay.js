@@ -201,6 +201,7 @@ details[open] summary .arrow { transform: rotate(90deg); }
     const sfDet = el('details', {},
       el('summary', {}, el('span', {}, el('span', { class: 'arrow' }, '\u25b8'), 'Stockfish options')),
       el('div', { class: 'group' },
+        seg('sfSearchMode', 'Search', [['depth', 'Depth'], ['delay', 'Delay'], ['clock', 'Clock']], 'tight'),
         toggle('sfUseClock', 'Use the game clock'),
         toggle('sfPonder', 'Ponder on opponent\u2019s time'),
         toggle('earlyPonder', 'Ponder as soon as the move is chosen'),
@@ -208,7 +209,7 @@ details[open] summary .arrow { transform: rotate(90deg); }
         slider('sfPonderWorkers', 'Ponder workers', fmtInt),
         slider('sfPonderHashMb', 'Ponder hash', (v) => v + ' MB'),
         slider('sfThreads', 'Search threads', fmtInt),
-        el('p', { class: 'note' }, 'Clock: caps the search time from your chess.com clock (never more than a quarter of what is left). Ponder: extra Stockfish workers rank the opponent\u2019s moves and prepare replies while they think; a prepared reply is used only if the opponent plays that move. Each ponder worker costs about 40 MB plus its hash and is capped by your CPU count. Pondering is off while Imperfection is above 0. Threads above 1 need the threaded engine and a browser that allows SharedArrayBuffer; otherwise it stays at 1 (see Copy debug info).')));
+        el('p', { class: 'note' }, 'Search: Depth = stop at Search depth (old behaviour). Delay = keep searching through the human-like pause and stop when it is used up (Search depth is then the minimum), so moves come at the same speed but are deeper. Clock = Stockfish\u2019s own time manager from both chess.com clocks (falls back to Delay when your clock cannot be read; untested on the real site). Clock: caps the search time from your chess.com clock (never more than a quarter of what is left). Ponder: extra Stockfish workers rank the opponent\u2019s moves and prepare replies while they think; a prepared reply is used only if the opponent plays that move. Each ponder worker costs about 40 MB plus its hash and is capped by your CPU count. Pondering is off while Imperfection is above 0. Threads above 1 need the threaded engine and a browser that allows SharedArrayBuffer; otherwise it stays at 1 (see Copy debug info).')));
 
     // ---- Game saving ----
     const gmsg = el('p', { class: 'msg', 'aria-live': 'polite' });

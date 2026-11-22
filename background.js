@@ -22,6 +22,8 @@ const IMPERFECTION_MARGIN_CP = 60;
 const IMPERFECTION_LINES = 3; // MultiPV lines searched when imperfection > 0
 
 let sf = null, sfReady = null, sfCurrent = null, sfNext = null;
+let sfLast = null;      // 2.0.0: the last finished main search { mode, depthDone, softMs, hardMs, elapsedMs } (debug info)
+const SF_DELAY_GO = 'go depth 64';   // delay-matched search: effectively unbounded; stopped from JavaScript (CV.sfShouldStop)
 let sfActive = null;    // engine file in use
 let sfPrevCount = null; // pieces in the previous request; null = nothing searched yet (see CV.sfIsNewGame)
 let sfMultiPvSent = null, sfThreadsSent = SF_THREADS;   // setoption is only sent when the value changes
@@ -122,7 +124,7 @@ function sfAttach(worker) {
   sf.onmessage = (e) => {
     const line = typeof e.data === 'string' ? e.data : '';
     if (line.startsWith('info ')) sfInfo(line);
-    else if (line.startsWith('bestmove')) sfBestMove(line.split(' ')[1]);
+    else if (line.startsWith('bestmove')) sfBestMove(line);
   };
   sf.onerror = (e) => console.error('[ChessVision] Stockfish error', e.message);
 }
@@ -179,22 +181,36 @@ function sfStart(job) {
   sfPrevCount = CV.sfPieceCount(job.fen);
   if (sfMultiPvSent !== job.multipv) { sf.postMessage('setoption name MultiPV value ' + job.multipv); sfMultiPvSent = job.multipv; }   // only when it changes
   sf.postMessage(CV.sfPositionCommand(job.fen, job.startFen, job.moves));   // with history: the engine sees repetitions / the 50-move counter
-  sf.postMessage(CV.sfGoCommand(job.depth, job.maxMs));
+  job.startedAt = Date.now();
+  if (job.mode === 'delay') {
+    // 2.0.0 delay-matched search: no depth limit; stopped from here once softMs is used and the minimum depth is done, or at
+    // hardMs. Checked on every info line and on timers (a search can be silent for a while).
+    sf.postMessage(SF_DELAY_GO);
+    job.softTimer = setTimeout(() => sfCheckStop(job), job.softMs);
+    job.hardTimer = setTimeout(() => sfCheckStop(job), job.hardMs);
+  } else sf.postMessage(CV.sfGoCommand(job.depth, job.maxMs));
 }
 
-// Keeps the deepest exact score/line for each MultiPV index of the running job.
+// Sends `stop` (once) when CV.sfShouldStop says so; the normal bestmove handling then resolves the job.
+function sfCheckStop(job) {
+  if (sfCurrent !== job || job.stopSent || job.mode !== 'delay') return;
+  if (CV.sfShouldStop({ elapsedMs: Date.now() - job.startedAt, softMs: job.softMs, depthDone: job.depthDone, minDepth: job.depth, hardMs: job.hardMs })) {
+    job.stopSent = true;
+    sf.postMessage('stop');
+  }
+}
+const sfClearTimers = (job) => { if (job) { clearTimeout(job.softTimer); clearTimeout(job.hardTimer); } };
+
+// Keeps the deepest exact score/line for each MultiPV index of the running job, and (2.0.0) the depth and principal
+// variation of the latest exact MultiPV-1 line: `depthDone` drives the delay-matched stop, `pv` seeds the ponder table.
 function sfInfo(line) {
   const job = sfCurrent;
-  if (!job || job.multipv < 2) return;
-  if (line.includes(' lowerbound') || line.includes(' upperbound')) return;
-  const mpv = /\bmultipv (\d+)/.exec(line), sc = /\bscore (cp|mate) (-?\d+)/.exec(line), pv = / pv (\S+)/.exec(line);
-  const depth = /\bdepth (\d+)/.exec(line);
-  if (!mpv || !sc || !pv) return;
-  job.lines.set(+mpv[1], {
-    uci: pv[1], depth: depth ? +depth[1] : 0,
-    cp: sc[1] === 'cp' ? +sc[2] : null,
-    mate: sc[1] === 'mate' ? +sc[2] : null,
-  });
+  if (!job) return;
+  const p = CV.sfParseInfo(line);
+  if (!p || p.bound) return;                                     // lowerbound / upperbound lines are not exact
+  if (p.mpv === 1) { job.depthDone = p.depth; job.pv = CV.sfParsePv(line); job.pvDepth = p.depth; }
+  if (job.multipv >= 2) job.lines.set(p.mpv, { uci: p.uci, depth: p.depth, cp: p.cp, mate: p.mate });
+  if (job.mode === 'delay') sfCheckStop(job);
 }
 
 // Occasionally returns a near-best alternative instead of the best move. Never when a mate is found.
@@ -209,9 +225,13 @@ function chooseMove(job, best) {
   return alts.length ? alts[Math.floor(Math.random() * alts.length)].uci : best;
 }
 
-function sfBestMove(move) {
+function sfBestMove(line) {
+  const parts = String(line).split(' ');
+  const move = parts[1], ponderTok = parts[2] === 'ponder' ? parts[3] || null : null;
   const job = sfCurrent;
   sfCurrent = null;
+  sfClearTimers(job);
+  if (job) sfLast = { mode: job.mode, depthDone: job.depthDone || 0, softMs: job.softMs, hardMs: job.hardMs, elapsedMs: Date.now() - job.startedAt, superseded: !!sfNext };
   if (sfNext) {
     const n = sfNext;
     sfNext = null;
@@ -219,7 +239,7 @@ function sfBestMove(move) {
     sfStart(n);
   } else if (job) {
     const chosen = chooseMove(job, move);
-    job.resolve({ uci: chosen, best: move, imperfect: chosen !== move });
+    job.resolve({ uci: chosen, best: move, imperfect: chosen !== move, depth: job.depthDone || 0, pv: job.pv || [], pvDepth: job.pvDepth || 0, ponder: ponderTok });
   }
 }
 
@@ -250,6 +270,7 @@ async function analyzeStockfishNow(fen, depth, imperfection, maxMs, startFen, mo
   if (msg.sfThreads !== undefined) { try { await sfApplyThreads(msg.sfThreads); } catch (e) { /* keep the engine we have */ } }
   return new Promise((resolve) => {
     const imp = Math.max(0, Math.min(100, imperfection || 0));
+    const softMs = Math.max(0, Math.min(AGGRO_HARD_MAX_MS, Math.round(Number(msg.softMs)) || 0));
     const job = {
       fen, resolve, startFen: typeof startFen === 'string' ? startFen : null, moves: Array.isArray(moves) ? moves : null,
       depth: Math.max(1, Math.min(20, depth || 10)),
@@ -257,7 +278,12 @@ async function analyzeStockfishNow(fen, depth, imperfection, maxMs, startFen, mo
       imperfection: imp,
       multipv: imp > 0 ? IMPERFECTION_LINES : 1,
       lines: new Map(),
+      // 2.0.0: 'delay' = search through the human-like pause (softMs from the page, depth = minimum); 'depth' = 1.8.0.
+      // A soft budget of 0 (no pause left, or a quick look) searches like 'depth'.
+      mode: (msg.sfSearchMode === 'delay' || msg.sfSearchMode === 'clock') && softMs > 0 ? 'delay' : 'depth',
+      softMs, depthDone: 0, pv: [], pvDepth: 0,
     };
+    job.hardMs = CV.sfHardMs(softMs, job.maxMs);
     if (sfCurrent) {
       if (sfNext) sfNext.resolve(null);
       sfNext = job;
@@ -686,15 +712,13 @@ async function analyzeAggroNow(msg) {
     // 2) older requests' results would be stale
     for (const [id, p] of h.pending) { if (p.think) { h.pending.delete(id); clearTimeout(p.timer); p.resolve({ type: 'bestmove', uci: null }); } }
     const warn = msg.verify ? await aggroVerifyPosition(h, msg) : null;
-    // 3) think: a fixed budget, or the clock budget (soft/hard) when the page sent one
+    // 3) think: a fixed budget, or the clock budget (soft/hard) when the page sent one; 2.0.0: stretched to the human-like
+    //    pause (msg.softMs) when that is longer, never above the clock's hard limit (CV.aggroBudget, pure)
     const pos = aggroPosition(msg);
-    let req;
-    const hardOk = Number(msg.hard) > 0 && Number(msg.soft) > 0;
-    if (hardOk) {
-      const hard = Math.min(AGGRO_HARD_MAX_MS, Math.round(msg.hard)), soft = Math.min(hard, Math.round(msg.soft));   // soft above hard would overrun
-      req = { type: 'think', ...pos, soft, hard, ms: hard };
-    } else req = { type: 'think', ...pos, ms: Math.max(100, Math.min(AGGRO_HARD_MAX_MS, Number(msg.ms) || 1000)) };
-    const reqMs = hardOk ? req.hard : req.ms;
+    const b = CV.aggroBudget({ thinkMs: msg.ms, softMs: msg.softMs, clock: Number(msg.hard) > 0 && Number(msg.soft) > 0 ? { soft: msg.soft, hard: msg.hard } : null });
+    const req = b.hard ? { type: 'think', ...pos, soft: b.soft, hard: b.hard, ms: b.hard } : { type: 'think', ...pos, ms: b.ms };
+    const reqMs = b.hard ? req.hard : req.ms;
+    aggroDbg.lastBudget = b;
     const r = await h.request(req, reqMs * AGGRO_THINK_FACTOR + AGGRO_THINK_MARGIN_MS).catch((e) => {
       if (/no answer within/.test(e.message)) { h.kill(); if (aggroMain === h) aggroMain = null; }   // wasm think() blocks: only a new worker helps
       throw e;
@@ -981,7 +1005,9 @@ api.runtime.onMessage.addListener((msg) => {
       ponderPool: { cap: ponderCap, active: ponderActive.filter((w) => !w.dead).length, spares: ponderSpares.filter((w) => !w.dead).length, wanted: ponderWanted },
       module: { ...aggroModuleInfo, sendFailures: aggroDbg.moduleSendFailures }, ponderHashMb, ponderStepped: PONDER_STEPPED, workerStarts: aggroDbg.workerStarts, lastWorkerStart: aggroDbg.lastStart,
       stockfish: { active: sfActive, threads: sfThreadsSent, threadedFailed: sfDbg.threadedFailed, threadedStarts: sfDbg.threadedStarts, sab: sfSab, module: { ...sfModuleInfo, sendFailures: sfDbg.moduleSendFailures },
-        poolKind: ponderKind, cancelling: ponderCancelling.length, harvested: sfDbg.harvested, harvestFailed: sfDbg.harvestFailed, workerStarts: sfDbg.workerStarts, lastWorkerStart: sfDbg.lastStart, rankMode: SF_RANK_MODE } });
+        poolKind: ponderKind, cancelling: ponderCancelling.length, harvested: sfDbg.harvested, harvestFailed: sfDbg.harvestFailed, workerStarts: sfDbg.workerStarts, lastWorkerStart: sfDbg.lastStart, rankMode: SF_RANK_MODE,
+        searchMode: sfLast ? sfLast.mode : null, lastSearch: sfLast },
+      aggroLastBudget: aggroDbg.lastBudget || null });
   }
   if (!msg || msg.type !== 'analyze') return;
   return msg.engine === 'stockfish'

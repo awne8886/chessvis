@@ -56,6 +56,7 @@
     // --- 2.0.0: speed (both engines unless noted) ---
     earlyPonder: true,        // start pondering the moment our move is decided, not when the board shows it (false = 1.8.0)
     boardDebounceMs: 80,      // wait after a board change before the stable-read check (250 = the 1.8.0 timing)
+    sfSearchMode: 'delay',    // Stockfish full search: 'depth' (1.8.0: go depth N) | 'delay' (search through the human-like pause, depth = minimum) | 'clock'
 
     // --- game recording and saving ---
     saveWithSacrifices: false,       // save a finished game when its counted sacrifices reach the threshold
@@ -105,6 +106,7 @@
     engine: ['aggro', 'stockfish'],
     delayStyle: ['natural', 'uniform'],
     inputMode: ['click', 'drag', 'mixed'],
+    sfSearchMode: ['depth', 'delay', 'clock'],
   };
 
   // Returns a cleaned copy of `obj`: unknown keys dropped, numbers clamped, enums checked.
@@ -377,6 +379,54 @@
   CV.sfRankFromScan = function (legal, scores) {
     return legal.filter((u) => scores.get(u) !== null)
       .sort((x, y) => (scores.has(x) ? scores.get(x) : Infinity) - (scores.has(y) ? scores.get(y) : Infinity));
+  };
+
+  // ---- 2.0.0: delay-matched search (pure; content.js and background.js) ----
+  // The bot waits max(human-like delay, engine time) anyway, so the full search may use the pause: the page draws the delay
+  // BEFORE asking the engine and sends softMs = delay - SF_DELAY_MARGIN_MS - time already spent on this move. The margin
+  // covers the message round trip and the engine's answer to `stop`, so the move is not later than in 1.8.0.
+  CV.SF_DELAY_MARGIN_MS = 40;
+  // AggroChess uses the same pause (CV.aggroBudget). false = the 1.8.0 AggroChess budget (thinkMs / the clock budget only).
+  CV.AGGRO_DELAY_MATCH = true;
+  CV.SF_DELAY_HARD_MIN_MS = 3000;       // hard cap of a delay-matched search without a user / clock cap: max(this, 3 x softMs)
+
+  // Should a delay-matched Stockfish search be stopped now? Yes once the soft budget is used AND the minimum depth is
+  // complete, or whatever the depth once the hard cap is reached. depthDone = depth of the latest exact MultiPV-1 line.
+  CV.sfShouldStop = function ({ elapsedMs, softMs, depthDone, minDepth, hardMs }) {
+    const e = Number(elapsedMs) || 0, soft = Math.max(0, Number(softMs) || 0), d = Number(depthDone) || 0;
+    const min = Math.max(1, Number(minDepth) || 1), hard = Number(hardMs) > 0 ? Number(hardMs) : Infinity;
+    return (e >= soft && d >= min) || e >= hard;
+  };
+
+  // Hard cap of a delay-matched search: the cap the page sent (sfMaxMs, already combined with the clock cap when
+  // sfUseClock is on, see CV.sfSearchCap) when there is one, else max(SF_DELAY_HARD_MIN_MS, 3 x softMs).
+  CV.sfHardMs = function (softMs, capMs) {
+    const cap = Math.max(0, Math.round(Number(capMs)) || 0);
+    if (cap > 0) return cap;
+    return Math.max(CV.SF_DELAY_HARD_MIN_MS, 3 * Math.max(0, Math.round(Number(softMs)) || 0));
+  };
+
+  // AggroChess think budget. thinkMs = the fixed budget, softMs = the delay-matched budget from the page (0 = none),
+  // clock = { soft, hard } from clock.js or null. Without a clock: { ms: max(thinkMs, softMs) }; with a clock:
+  // { soft: max(clock soft, min(softMs, hard)), hard } - never above hard, so the clock rules stay intact.
+  CV.AGGRO_BUDGET_MAX_MS = 60000;
+  CV.aggroBudget = function ({ thinkMs, softMs, clock }) {
+    const max = CV.AGGRO_BUDGET_MAX_MS;
+    const extra = Math.max(0, Math.round(Number(softMs)) || 0);
+    if (clock && Number(clock.hard) > 0 && Number(clock.soft) > 0) {
+      const hard = Math.min(max, Math.round(clock.hard));
+      let soft = Math.min(hard, Math.round(clock.soft));
+      soft = Math.max(soft, Math.min(extra, hard));
+      return { soft, hard };
+    }
+    const think = Math.max(100, Math.min(max, Math.round(Number(thinkMs)) || 1000));
+    return { ms: Math.min(max, Math.max(think, extra)) };
+  };
+
+  // The principal variation of an `info ... pv m1 m2 ...` line as an array ([] when there is none).
+  CV.sfParsePv = function (line) {
+    const m = / pv ((?:\S+ ?)+)$/.exec(String(line || '').trim());
+    return m ? m[1].trim().split(/\s+/) : [];
   };
 
   // ---- allowed pages (allowed-pages.txt) ----
