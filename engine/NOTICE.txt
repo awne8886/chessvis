@@ -1,3 +1,49 @@
-engine/stockfish-19-asm.js  - Stockfish, GPL-3.0 (https://stockfishchess.org)
+Third-party components in engine/ and how they are licensed.
+This file records sources and licences as understood by the project author. It is not legal advice.
+
+engine/stockfish-19-asm.js  - Stockfish, GPL-3.0 (https://stockfishchess.org). Since 1.6.0 only the fallback engine.
 engine/aggrochess.wasm      - AggroChess 4.5.1, GPL-3.0 (https://github.com/PhelRin/AggroChess)
 engine/aggro-worker.js      - worker wrapper supplied with AggroChess, GPL-3.0
+
+Stockfish.js 19, WebAssembly lite single-thread build (added in 1.6.0)
+engine/stockfish-19-lite-single.js    - loader/worker, Stockfish.js 19 (c) 2026 Chess.com, LLC, GPL-3.0
+engine/stockfish-19-lite-single.wasm  - the engine itself (lite NNUE net, single thread, about 1.8 MB), GPL-3.0
+                              Stockfish.js: Nathan Rugg (https://github.com/nmrugg/stockfish.js), based on Stockfish
+                              (c) T. Romstad, M. Costalba, J. Kiiski, G. Linscott and other contributors
+                              (https://github.com/official-stockfish/Stockfish). Stockfish 19 lite nets: sscg13
+                              (https://github.com/sscg13/Stockfish/tree/sf19-1mb).
+                              Licence text: Copying.txt in the package (GPL-3.0); see LICENSE here for the GPL-3.0 text.
+                              Both files were taken unmodified from the npm package "stockfish" 19.0.1, directory bin/:
+                              https://registry.npmjs.org/stockfish/-/stockfish-19.0.1.tgz
+                              (tarball sha256 c3695e2a3afbc61c6439c689cb8b95cec4627bcda407193f6b7c3a5702fac839)
+                              bin/stockfish-19-lite-single.js   sha256 ccb130d7ff29408531c47d859a49f91d59d4f482d05a53eb1a3231a4f624c91a
+                              bin/stockfish-19-lite-single.wasm sha256 ee4f115bdb2d32cadf96cada104a05b5ec257d7ad6f57582190b49bc71f096de
+                              The same release is published at
+                              https://github.com/nmrugg/stockfish.js/releases/tag/v19.0.1 (same file names).
+                              engine/stockfish-19-asm.js is byte-identical to bin/stockfish-19-asm.js of that package
+                              (sha256 c07dad9a00a89f4b1dcba3971d58d8078715556eac0212368e4aab510e1e27c9).
+                              Multi-thread builds are NOT used (they need SharedArrayBuffer / cross-origin isolation).
+
+Maia-3 (added in 1.3.0)
+engine/maia3-23m.fp16.onnx  - Maia-3 23M network weights, exported to ONNX (fp16).
+                              Model: Maia-3 by the CSSLab (University of Toronto), AGPL-3.0
+                              (https://github.com/CSSLab/maia3 - its LICENSE file is the GNU AGPL v3;
+                              Hugging Face: UofTCSSLab/Maia3-23M).
+                              Paper: "Chessformer: A Unified Architecture for Chess Modeling",
+                              Monroe, Eilender, Chalmers, Tang, Anderson, ICLR 2026.
+                              The ONNX/fp16 export is a third-party conversion by "bqrio", AGPL-3.0
+                              (the exact download URL was not recorded in the project files - add it here).
+                              The file is stored in the repository (46 MB).
+maia.js                     - JavaScript port of the Maia-3 board tokenizer, move vocabulary and move
+                              mirroring from CSSLab/maia3 (maia3/dataset.py, maia3/utils.py), AGPL-3.0.
+                              The file is distributed here under the project's licence terms for ported
+                              AGPL-3.0 code; keep this attribution.
+
+engine/ort.wasm.min.js, engine/ort-wasm-simd-threaded.mjs, engine/ort-wasm-simd-threaded.wasm
+                            - onnxruntime-web 1.31.1, MIT (https://github.com/microsoft/onnxruntime,
+                              Copyright (c) Microsoft Corporation). All three files must come from the
+                              same version.
+
+Combining: the extension's own code is GPL-3.0 (see LICENSE). GPL-3.0 and AGPL-3.0 code may be combined
+(GPL-3.0 section 13 / AGPL-3.0 section 13); the AGPL-3.0 parts keep their own terms, including the
+requirement to offer corresponding source. MIT code is compatible with both.

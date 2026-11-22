@@ -1,0 +1,15 @@
+# ChessVision - pages where auto-play is allowed.
+#
+# One entry per line. Blank lines and lines starting with # are ignored.
+# Entries are matched against the page address without "https://" and "www.".
+# An entry matches that page and everything below it, e.g.
+#     chess.com/play/computer
+# matches chess.com/play/computer and chess.com/play/computer/anything.
+# "*" matches any text, e.g.  *.chess.com/play/computer
+#
+# After editing, reload the add-on (about:debugging) and refresh the chess.com tab.
+# Intended use: pages where you play against the computer bots.
+
+chess.com/play/computer
+chess.com/
+lichess.org/

@@ -1,20 +1,50 @@
 {
   "manifest_version": 2,
   "name": "ChessVision",
-  "version": "1.2.0",
-  "description": "Auto-plays chess against bots using local Stockfish or the Tal-style AggroChess engine.",
+  "version": "1.8.0",
+  "description": "Auto-plays chess against chess.com bots using local Stockfish or the Tal-style AggroChess engine, with an on-page control panel.",
   "browser_specific_settings": {
     "gecko": {
       "id": "chessvision@awne8886",
-      "data_collection_permissions": { "required": ["none"] }
+      "data_collection_permissions": {
+        "required": [
+          "none"
+        ]
+      }
     }
   },
-  "permissions": ["storage", "*://*.chess.com/*"],
-  "background": { "scripts": ["background.js"] },
+  "permissions": [
+    "storage",
+    "clipboardWrite",
+    "*://*.chess.com/*",
+    "*://*.chesscomfiles.com/*",
+    "*://*.lichess.org/*"
+  ],
+  "background": {
+    "scripts": [
+      "settings.js",
+      "chessmini.js",
+      "background.js"
+    ]
+  },
   "content_scripts": [
     {
-      "matches": ["*://*.chess.com/*"],
-      "js": ["content.js"],
+      "matches": [
+        "*://*.chess.com/*",
+        "*://*.lichess.org/*"
+      ],
+      "js": [
+        "settings.js",
+        "chessmini.js",
+        "humanize.js",
+        "boardstate.js",
+        "clock.js",
+        "pgn.js",
+        "brilliant.js",
+        "recorder.js",
+        "overlay.js",
+        "content.js"
+      ],
       "run_at": "document_idle"
     }
   ],
