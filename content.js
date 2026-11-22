@@ -230,6 +230,7 @@
       const r = board.getBoundingClientRect();
       mouse = { x: Math.min(innerWidth - 5, Math.max(5, r.left + rand(0.1, 0.9) * r.width)), y: Math.min(innerHeight - 5, r.bottom + rand(20, 120)) };
     }
+    if (mouse.x === x && mouse.y === y) return;                  // already there (aimMove glided during the pause): no empty path
     const smooth = hum() && cfg.mouseMove;
     const path = CV.human.buildPath(mouse.x, mouse.y, x, y, smooth ? { speed: fast ? 2.2 : 1 } : { linear: true, steps: linearSteps });
     for (const p of path) { moveTo(p.x, p.y, buttons); await sleep(p.dt); }
@@ -262,10 +263,23 @@
     await releaseAt(b.x, b.y, false);
   }
 
-  async function executeMove(uci, color) {
+  // The click points of a move, computed once (off-centre points are random, so aim and finish must use the same ones).
+  function movePoints(uci) {
     const f1 = FILES.indexOf(uci[0]) + 1, r1 = +uci[1];
     const f2 = FILES.indexOf(uci[2]) + 1, r2 = +uci[3];
-    const from = squarePoint(f1, r1), to = squarePoint(f2, r2);
+    return { from: squarePoint(f1, r1), to: squarePoint(f2, r2) };
+  }
+
+  // 2.0.0: the cursor glides to the from-square while the human-like pause runs (play() does both at once), then
+  // finishMove presses / clicks / drags from there. Returns the points for finishMove.
+  async function aimMove(uci) {
+    const pts = movePoints(uci);
+    await glideTo(pts.from.x, pts.from.y);
+    return pts;
+  }
+
+  async function finishMove(pts, uci, color) {
+    const { from, to } = pts;
     let mode = CV.human.pickInput(cfg);
     if (mode === 'drag' && dragDisabled) mode = 'click';   // drag did not register earlier
     lastMode = mode;
@@ -289,6 +303,11 @@
         await clickAt(r.left + r.width / 2 + rand(-jitter, jitter) * r.width, r.top + r.height / 2 + rand(-jitter, jitter) * r.height);
       } else log('promotion picker not found');
     }
+  }
+
+  // Aim + finish in one go (the path without a concurrent pause).
+  async function executeMove(uci, color) {
+    await finishMove(await aimMove(uci), uci, color);
   }
 
   // ---------- Engine ----------
@@ -476,7 +495,14 @@
       let delay = category || plannedDelay === null ? CV.human.delayFor(cfg, { legalCount: legal.length, category }) : plannedDelay;
       if (lastClock) delay = CV.clock.delayCap(delay, lastClock.ms);          // the pause must not eat a short clock
       const wait = Math.max(0, delay - (Date.now() - t0));
-      if (wait) await sleep(wait);
+      fast = !!category || !!(lastClock && lastClock.mode === 'low');     // low on time: the faster hand too (set before the glide below)
+      // 2.0.0: with the curved cursor the glide to the from-square runs DURING the pause (if it takes longer than the
+      // pause, no extra wait is added). The position is re-checked after both, before anything is clicked; if it changed
+      // the cursor simply stays where it is.
+      let pts = null;
+      if (hum() && cfg.mouseMove) {
+        [pts] = await Promise.all([aimMove(uci), wait ? sleep(wait) : null]);
+      } else if (wait) await sleep(wait);
       if (token !== playToken || !cfg.enabled) return;
 
       const now = buildFen();
@@ -487,10 +513,10 @@
 
       const mv = byUci(uci);
       ownMove = { afterCount: pos.count - (mv && mv.capture ? 1 : 0) };
-      fast = !!category || !!(lastClock && lastClock.mode === 'low');     // low on time: the faster hand too
       // remember what is being played; it counts only if the board then shows exactly this move from this position
       rec.noteBotMove({ fen: pos.fen, uci, color: pos.myColor, sacrifice, engine: cfg.engine, flagKnown: cfg.engine === 'aggro' && category !== 'only' });
-      await executeMove(uci, pos.myColor);
+      if (pts) await finishMove(pts, uci, pos.myColor);
+      else await executeMove(uci, pos.myColor);
     } catch (e) {
       setStatus('error: ' + (e && e.message ? e.message : e), 'err');
       console.error('[ChessVision]', e);
