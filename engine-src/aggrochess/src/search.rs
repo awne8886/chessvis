@@ -137,6 +137,14 @@ impl TranspositionTable {
 
     #[inline]
     fn bucket(&self, hash: u64) -> usize {
+        // ChessVision 2.0.2: (hash * buckets) >> 64 without a u128 multiply (on wasm32 that is a call to __multi3).
+        // Exact for buckets < 2^32: with hash = H * 2^32 + L, hash * buckets = H*b*2^32 + L*b, and the low 32 bits of
+        // L*b can never carry into bit 64; H*b + ((L*b) >> 32) <= (2^32-1)^2 + 2^32 - 1 < 2^64.
+        let b = self.buckets as u64;
+        if b < (1u64 << 32) {
+            let hi = (hash >> 32) * b + (((hash & 0xffff_ffff) * b) >> 32);
+            return (hi >> 32) as usize * 2;
+        }
         (((hash as u128) * (self.buckets as u128)) >> 64) as usize * 2
     }
 

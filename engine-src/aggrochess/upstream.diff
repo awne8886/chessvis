@@ -21,7 +21,22 @@
  pub static TT_SIZE_MB: AtomicUsize = AtomicUsize::new(128);
  pub static NUM_THREADS: AtomicUsize = AtomicUsize::new(1);
  /// Draw score penalty (centipawns) from the engine's point of view.
-@@ -1281,8 +1285,8 @@
+@@ -133,6 +137,14 @@
+ 
+     #[inline]
+     fn bucket(&self, hash: u64) -> usize {
++        // ChessVision 2.0.2: (hash * buckets) >> 64 without a u128 multiply (on wasm32 that is a call to __multi3).
++        // Exact for buckets < 2^32: with hash = H * 2^32 + L, hash * buckets = H*b*2^32 + L*b, and the low 32 bits of
++        // L*b can never carry into bit 64; H*b + ((L*b) >> 32) <= (2^32-1)^2 + 2^32 - 1 < 2^64.
++        let b = self.buckets as u64;
++        if b < (1u64 << 32) {
++            let hi = (hash >> 32) * b + (((hash & 0xffff_ffff) * b) >> 32);
++            return (hi >> 32) as usize * 2;
++        }
+         (((hash as u128) * (self.buckets as u128)) >> 64) as usize * 2
+     }
+ 
+@@ -1281,8 +1293,8 @@
  
      #[inline]
      fn check_time(&mut self) {
@@ -32,7 +47,7 @@
              if let Some(p) = &self.parent_stop {
                  if p.load(Ordering::Relaxed) {
                      self.stop.store(true, Ordering::Relaxed);
-@@ -2631,10 +2635,10 @@
+@@ -2631,10 +2643,10 @@
          let cap = (200.0 * 1.45f64.powi(skill)) as u64;
          limits.nodes = Some(limits.nodes.map_or(cap, |n| n.min(cap)));
          eval::NOISE.store((20 - skill) * 7, Ordering::Relaxed);
@@ -47,7 +62,7 @@
          eval::NOISE_SEED.store(seed, Ordering::Relaxed);
      } else {
          eval::NOISE.store(0, Ordering::Relaxed);
-@@ -2834,7 +2838,7 @@
+@@ -2834,7 +2846,7 @@
  
          let elapsed = start.elapsed();
          if print_info {
