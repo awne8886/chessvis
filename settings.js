@@ -419,16 +419,22 @@
   // clock = { soft, hard } from clock.js or null. Without a clock: { ms: max(thinkMs, softMs) }; with a clock:
   // { soft: max(clock soft, min(softMs, hard)), hard } - never above hard, so the clock rules stay intact.
   CV.AGGRO_BUDGET_MAX_MS = 60000;
-  CV.aggroBudget = function ({ thinkMs, softMs, clock }) {
-    const max = CV.AGGRO_BUDGET_MAX_MS;
+  // spentMs (T10): time a quick look already used on this move when it turned out not obvious; it is taken off the think
+  // time (floor 100 ms, or the clock soft when that is lower) so quick look + full think stay within the configured budget.
+  CV.AGGRO_BUDGET_FLOOR_MS = 100;
+  CV.aggroBudget = function ({ thinkMs, softMs, clock, spentMs }) {
+    const max = CV.AGGRO_BUDGET_MAX_MS, floor = CV.AGGRO_BUDGET_FLOOR_MS;
     const extra = Math.max(0, Math.round(Number(softMs)) || 0);
+    const spent = Math.max(0, Math.round(Number(spentMs)) || 0);
     if (clock && Number(clock.hard) > 0 && Number(clock.soft) > 0) {
-      const hard = Math.min(max, Math.round(clock.hard));
+      let hard = Math.min(max, Math.round(clock.hard));
       let soft = Math.min(hard, Math.round(clock.soft));
+      if (spent) { const s0 = Math.max(Math.min(floor, soft), soft - spent); hard = Math.max(s0, hard - spent); soft = s0; }
       soft = Math.max(soft, Math.min(extra, hard));
       return { soft, hard };
     }
-    const think = Math.max(100, Math.min(max, Math.round(Number(thinkMs)) || 1000));
+    let think = Math.max(floor, Math.min(max, Math.round(Number(thinkMs)) || 1000));
+    if (spent) think = Math.max(floor, think - spent);
     return { ms: Math.min(max, Math.max(think, extra)) };
   };
 

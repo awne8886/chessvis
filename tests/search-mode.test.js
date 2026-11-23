@@ -64,4 +64,15 @@ test('settings: sfSearchMode is an enum with default delay', () => {
   assert.deepStrictEqual(CV.sanitize({ sfSearchMode: 'fast' }), {});
 });
 
+test('T10: aggroBudget subtracts a quick look (floor 100 ms) and stays within the clock', () => {
+  assert.deepStrictEqual(CV.aggroBudget({ thinkMs: 1000, spentMs: 300 }), { ms: 700 });
+  assert.deepStrictEqual(CV.aggroBudget({ thinkMs: 1000, spentMs: 990 }), { ms: 100 });
+  assert.deepStrictEqual(CV.aggroBudget({ thinkMs: 1000, spentMs: 0 }), { ms: 1000 });
+  assert.deepStrictEqual(CV.aggroBudget({ thinkMs: 1000, spentMs: 300, softMs: 900 }), { ms: 900 }, 'the pause still counts');
+  const b = CV.aggroBudget({ thinkMs: 1000, spentMs: 300, clock: { soft: 800, hard: 2000 } });
+  assert.deepStrictEqual(b, { soft: 500, hard: 1700 });
+  const low = CV.aggroBudget({ thinkMs: 1000, spentMs: 300, clock: { soft: 40, hard: 90 } });
+  assert.ok(low.soft <= low.hard && low.hard <= 90 && low.soft === 40, JSON.stringify(low));
+});
+
 run();

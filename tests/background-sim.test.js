@@ -177,4 +177,15 @@ test('T9: clock mode that answers before softMs continues as a delay search; no 
   assert.strictEqual(CV.sfClockGo({ wtime: 61000.4, btime: 59000, winc: 2000, binc: 2000 }), 'go wtime 61000 btime 59000 winc 2000 binc 2000');
 });
 
+test('T10: the main Stockfish worker is warmed up before the first search', async () => {
+  const bg = makeBackground({ stepMs: 2 });
+  await analyzeSf(bg, [], { sfSearchMode: 'depth' });
+  const mainId = bg.log.find((l) => l.cmd === 'go depth 10').w;
+  const main = bg.log.filter((l) => l.w === mainId).map((l) => l.cmd);
+  const iWarm = main.indexOf('go movetime 10'), iFirst = main.indexOf('go depth 10');
+  assert.ok(iWarm >= 0 && iWarm < iFirst, main.join(' | '));
+  assert.ok(main[iWarm - 1].startsWith('position fen r3k2r/'), 'the warm-up position');
+  assert.ok(typeof bg.get('sfDbg.mainWarmMs') === 'number');
+});
+
 run();

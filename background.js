@@ -142,6 +142,9 @@ function initStockfish() {
       r = await sfSpawn(SF_FALLBACK_FILE);
       sfActive = SF_FALLBACK_FILE;
     }
+    // 2.0.0 (T10): warm the main worker like the ponder workers before sfReady resolves: the first search of a fresh engine
+    // pays for its own lazy set-up. Measured in Node: ~20 ms here, first depth-10 search 56 -> 39 ms. Never fatal.
+    sfDbg.mainWarmMs = await sfWarmMain(r.worker);
     sfAttach(r.worker);
     sfThreadsSent = SF_THREADS;
     sfDbg.workerStarts++; sfDbg.lastStart = { label: 'main', file: sfActive, how: r.how || 'direct' };
@@ -151,6 +154,24 @@ function initStockfish() {
   })();
   sfReady.catch((e) => console.error('[ChessVision] Stockfish could not be started', e));
 }
+
+// go movetime SF_WARM_MS on SF_WARM_FEN, then ucinewgame + isready. Resolves the time it took, or null (timeout / error:
+// the engine is used as it is).
+function sfWarmMain(w) {
+  return new Promise((resolve) => {
+    const t0 = Date.now();
+    let stage = 'bestmove';
+    const done = (v) => { clearTimeout(timer); w.onmessage = null; resolve(v); };
+    const timer = setTimeout(() => done(null), SF_MAIN_WARM_TIMEOUT_MS);
+    w.onmessage = (e) => {
+      const line = typeof e.data === 'string' ? e.data : '';
+      if (stage === 'bestmove' && line.startsWith('bestmove')) { stage = 'readyok'; w.postMessage('ucinewgame'); w.postMessage('isready'); }
+      else if (stage === 'readyok' && line === 'readyok') done(Date.now() - t0);
+    };
+    try { w.postMessage('position fen ' + SF_WARM_FEN); w.postMessage('go movetime ' + SF_WARM_MS); } catch (e) { done(null); }
+  });
+}
+const SF_MAIN_WARM_TIMEOUT_MS = 2000;
 
 // Optional: the threaded build for the main worker (setting sfThreads > 1). Needs SharedArrayBuffer (runtime test, sfSab).
 // Any failure keeps the single-thread engine and is remembered (no retry loop). Returns the thread count in use.
@@ -1144,7 +1165,8 @@ api.runtime.onMessage.addListener((msg) => {
       module: { ...aggroModuleInfo, sendFailures: aggroDbg.moduleSendFailures }, ponderHashMb, ponderStepped: PONDER_STEPPED, workerStarts: aggroDbg.workerStarts, lastWorkerStart: aggroDbg.lastStart,
       stockfish: { active: sfActive, threads: sfThreadsSent, threadedFailed: sfDbg.threadedFailed, threadedStarts: sfDbg.threadedStarts, sab: sfSab, module: { ...sfModuleInfo, sendFailures: sfDbg.moduleSendFailures },
         poolKind: ponderKind, cancelling: ponderCancelling.length, harvested: sfDbg.harvested, harvestFailed: sfDbg.harvestFailed, workerStarts: sfDbg.workerStarts, lastWorkerStart: sfDbg.lastStart, rankMode: SF_RANK_MODE,
-        searchMode: sfLast ? sfLast.mode : null, lastSearch: sfLast, pvSeeds: sfDbg.pvSeeds },
+        searchMode: sfLast ? sfLast.mode : null, depthDone: sfLast ? sfLast.depthDone : null, softMs: sfLast ? sfLast.softMs : null, elapsedMs: sfLast ? sfLast.elapsedMs : null,
+        lastSearch: sfLast, pvSeeds: sfDbg.pvSeeds, mainWarmMs: sfDbg.mainWarmMs === undefined ? null : sfDbg.mainWarmMs },
       aggroLastBudget: aggroDbg.lastBudget || null });
   }
   if (!msg || msg.type !== 'analyze') return;

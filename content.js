@@ -423,7 +423,7 @@
       soft: p.soft, hard: p.hard, verify: cfg.engine === 'aggro' && cfg.aggroVerify, ponder: sfPonderOn() || (cfg.engine === 'aggro' && cfg.aggroPonder), sfThreads: cfg.engine === 'stockfish' ? cfg.sfThreads : undefined,
       imperfection: !quick && cfg.engine === 'stockfish' && hum() ? cfg.imperfection : 0,
       sfMaxMs: p.sfCap,
-      sfSearchMode: quick ? 'depth' : (p.searchMode || cfg.sfSearchMode), softMs: quick ? 0 : (softMs || 0), uciClock: quick ? undefined : p.uciClock,
+      sfSearchMode: quick ? 'depth' : (p.searchMode || cfg.sfSearchMode), softMs: quick ? 0 : (softMs || 0), uciClock: quick ? undefined : p.uciClock, spentMs: quick ? 0 : (p.spentMs || 0),
     });
   }
 
@@ -457,8 +457,10 @@
       // 2.0.0: the human-like delay of a normal move is drawn BEFORE the full search, so the engine can search through it
       // (delay-matched search). The move timing is unchanged: the wait is still max(delay, engine time).
       let plannedDelay = null;
+      let quickSpent = 0;                                   // T10: AggroChess quick look that turned out not obvious
       const fullSearch = () => {
         const plan = fullPlan(pos);
+        if (quickSpent && cfg.engine === 'aggro') plan.spentMs = quickSpent;
         plannedDelay = CV.human.delayFor(cfg, { legalCount: legal.length, category: null });
         if (lastClock) plannedDelay = CV.clock.delayCap(plannedDelay, lastClock.ms);       // the pause must not eat a short clock
         const softMs = delayMatched() ? Math.max(0, Math.round(plannedDelay - CV.SF_DELAY_MARGIN_MS - (Date.now() - t0))) : 0;
@@ -470,7 +472,9 @@
       } else {
         const likely = CV.human.likelyObvious(parsed, legal, ctx, cfg);
         setStatus(likely ? 'quick look (' + engineName + ')\u2026' : 'thinking (' + engineName + ')\u2026', 'on');
+        const tq = Date.now();
         let res = likely ? await askEngine(pos, true) : await fullSearch();
+        if (likely) quickSpent = Date.now() - tq;
         if (token !== playToken || !cfg.enabled) return;
         if (cfg.engine === 'aggro' && cfg.aggroVerify && ui) ui.setWarn(res && res.verifyWarning ? 'Verify: ' + res.verifyWarning : '');
         if (res && res.error) {                             // e.g. an engine failed to start: show it, don't hammer the engine
