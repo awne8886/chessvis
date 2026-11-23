@@ -833,7 +833,7 @@ async function runIdleJob(msg, token) {
       if (!doPonder) return;
       for (let m = rankClaim(); m; m = rankClaim()) {
         try {
-          const a = await req(w, { type: 'analyze', ...posFor(msg.startFen, [...msg.moves, m.uci]), ms: scanMs }, scanMs);
+          const a = await req(w, { type: 'analyze', ...posFor(msg.startFen, [...msg.moves, m.uci]), ms: scanMs, floor: CV.AGGRO_SCAN_FLOOR_MS }, scanMs);
           if (!a || a.none) scoreOf.set(m.uci, null);          // we would have no move there (game over): nothing to prepare
           else scoreOf.set(m.uci, ourScore(a, msg.myColor) - (m.uci === predicted ? 30 : 0));   // lowest = best for the opponent
         } finally { rank.pending--; finishRanking(); }

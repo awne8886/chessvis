@@ -26,7 +26,8 @@ test('the exports the worker and the benchmarks use are there', () => {
   for (const file of BUILDS) {
     const names = WebAssembly.Module.exports(new WebAssembly.Module(fs.readFileSync(path.join(ROOT, file)))).map((e) => e.name);
     for (const n of ['memory', 'io_ptr', 'io_size', 'set_position', 'think', 'think_clock', 'think_depth', 'analyze', 'legal_moves', 'fen',
-      'game_status', 'in_check', 'side_to_move', 'ponder_move', 'move_see', 'is_book_move', 'clear_hash', 'set_tt_mb', 'last_info']) {
+      'game_status', 'in_check', 'side_to_move', 'ponder_move', 'move_see', 'is_book_move', 'clear_hash', 'set_tt_mb', 'last_info',
+      'analyze_floor', 'think_floor']) {
       assert.ok(names.includes(n), file + ' exports ' + n);
     }
   }
@@ -43,6 +44,17 @@ test('plain and SIMD builds give the same timed answers (fake clock)', () => {
     return r.join(' | ') + ' | calls ' + e.calls.now + '/' + e.calls.rnd;
   });
   assert.strictEqual(outs[1], outs[0]);
+});
+
+test('small budgets: analyze_floor / think_floor honour floors below 20 / 30 ms, the old exports keep theirs', () => {
+  const e = aggro('engine/aggrochess-simd.wasm', { clock: 'fake', step: 0.05 });
+  e.pos('r3k2r/p1ppqpb1/bn2pnp1/3PN3/1p2P3/2N2Q1p/PPPBBPPP/R3K2R w KQkq - 0 1|');
+  const span = (f) => { const t0 = e.calls.now; f(); return e.calls.now - t0; };   // fake clock: js_now calls ~ time searched
+  const a20 = span(() => e.analyze(5)), a3 = span(() => e.analyzeFloor(5, 3)), a12 = span(() => e.analyzeFloor(12, 3));
+  const t30 = span(() => e.think(5)), t3 = span(() => e.thinkFloor(5, 5, 3));
+  assert.ok(a3 < a12 && a12 < a20, [a3, a12, a20].join(' '));
+  assert.ok(t3 < t30, [t3, t30].join(' '));
+  assert.strictEqual(e.analyzeFloor(30, 3).split(' ').length, 5, 'same answer format');
 });
 
 run();

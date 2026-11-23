@@ -285,11 +285,20 @@ fn score_text(score: i32) -> String {
     }
 }
 
+/// The shortest search `think`, `think_clock` and `think_depth` run (ms).
+const THINK_FLOOR_MS: u32 = 30;
+/// The shortest search `analyze` runs (ms).
+const ANALYZE_FLOOR_MS: u32 = 20;
+
 fn think_limits(soft_ms: u32, hard_ms: u32) -> u32 {
     think_limits_depth(soft_ms, hard_ms, None)
 }
 
 fn think_limits_depth(soft_ms: u32, hard_ms: u32, depth: Option<i32>) -> u32 {
+    think_limits_floor(soft_ms, hard_ms, depth, THINK_FLOOR_MS)
+}
+
+fn think_limits_floor(soft_ms: u32, hard_ms: u32, depth: Option<i32>, floor_ms: u32) -> u32 {
     let s = with_game(|g| {
         let board = g.board.clone();
         if legal_moves_of(&board).is_empty() {
@@ -303,8 +312,8 @@ fn think_limits_depth(soft_ms: u32, hard_ms: u32, depth: Option<i32>) -> u32 {
             }
         }
         LAST_INFO.lock().unwrap().clear();
-        let soft = Duration::from_millis(soft_ms.max(30) as u64);
-        let hard = Duration::from_millis(hard_ms.max(30) as u64);
+        let soft = Duration::from_millis(soft_ms.max(floor_ms) as u64);
+        let hard = Duration::from_millis(hard_ms.max(floor_ms) as u64);
         let limits = search::Limits { depth, soft: Some(soft), hard: Some(hard), nodes: None, asked: None };
         let stop = Arc::new(AtomicBool::new(false));
         let (best, score) = search::search_position(&board, &g.history, limits, stop, true);
@@ -342,6 +351,13 @@ pub extern "C" fn think_clock(soft_ms: u32, hard_ms: u32) -> u32 {
     think_limits(soft_ms, hard_ms.max(soft_ms))
 }
 
+/// ChessVision 2.0.2: `think_clock` with its own time floor (1-30 ms instead of 30), for short searches the page wants
+/// to stay short.
+#[no_mangle]
+pub extern "C" fn think_floor(soft_ms: u32, hard_ms: u32, floor_ms: u32) -> u32 {
+    think_limits_floor(soft_ms, hard_ms.max(soft_ms), None, floor_ms.clamp(1, THINK_FLOOR_MS))
+}
+
 /// One step of a search that can be cancelled between steps (for pondering): search to `depth` plies, at most `hard_ms`
 /// milliseconds, and answer like `think`. The hash table is kept between calls, so calling it with depth 1, 2, 3 ...
 /// resumes where the last call ended. The page decides when to stop; nothing here runs between two calls.
@@ -367,6 +383,17 @@ pub extern "C" fn set_tt_mb(mb: u32) -> u32 {
 /// from White's point of view, or "none" when there is no legal move.
 #[no_mangle]
 pub extern "C" fn analyze(ms: u32) -> u32 {
+    analyze_ms(ms.max(ANALYZE_FLOOR_MS))
+}
+
+/// ChessVision 2.0.2: `analyze` with its own time floor (1-20 ms instead of 20). The ponder job ranks the opponent's
+/// moves with one very short analysis after each (5-12 ms); with the 20 ms floor every one of them took 20 ms.
+#[no_mangle]
+pub extern "C" fn analyze_floor(ms: u32, floor_ms: u32) -> u32 {
+    analyze_ms(ms.max(floor_ms.clamp(1, ANALYZE_FLOOR_MS)))
+}
+
+fn analyze_ms(ms: u32) -> u32 {
     let s = with_game(|g| {
         let board = g.board.clone();
         if legal_moves_of(&board).is_empty() {
@@ -385,7 +412,7 @@ pub extern "C" fn analyze(ms: u32) -> u32 {
         let last_score = search::LAST_SCORE.load(Ordering::Relaxed);
         let last_obj = search::LAST_OBJ.load(Ordering::Relaxed);
         LAST_INFO.lock().unwrap().clear();
-        let t = Duration::from_millis(ms.max(20) as u64);
+        let t = Duration::from_millis(ms as u64);
         let limits = search::Limits { depth: None, soft: Some(t), hard: Some(t), nodes: None, asked: None };
         let stop = Arc::new(AtomicBool::new(false));
         let (best, score) = search::search_position(&board, &g.history, limits, stop, true);

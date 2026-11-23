@@ -125,7 +125,8 @@ onmessage = (e) => {
         } else if (m.type === 'analyze') {
             // neutral analysis of the position after m.moves, plus facts about the move played next
             ex.set_position(write(posText(m)));
-            const out = read(ex.analyze(m.ms)).split(' ');
+            // 2.0.2: m.floor = the shortest search wanted (the ranking scans: 3 ms; plain analyze() never searches less than 20 ms)
+            const out = read(typeof m.floor === 'number' && typeof ex.analyze_floor === 'function' ? ex.analyze_floor(m.ms, m.floor) : ex.analyze(m.ms)).split(' ');
             let see = 0;
             let book = false;
             if (m.next) {

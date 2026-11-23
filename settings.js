@@ -472,6 +472,12 @@
   // hash (busy ones are terminated: a wasm think cannot be interrupted); a new game sends it `clear` before its next
   // job. false = 2.0.0: every AggroChess ponder worker is terminated when its job ends or is cancelled.
   CV.AGGRO_PONDER_RECYCLE = true;
+  // The ranking pass of an AggroChess ponder job asks for 5-12 ms per opponent move; the engine's analyze() never
+  // searched less than 20 ms, so a pass over 30 moves took >= 600 ms and ran out of its window (budget x 0.35) before the
+  // last moves. 2.0.2 engines take a floor with the request (analyze_floor). 20 = 2.0.0.
+  // Measured (tests/bench-ponder-rank.js, 80 positions, opponent AggroChess 150 ms, budget 1500): moves ranked in the
+  // window 24.8 -> 33.5 of 33.9; opponent's move in the top 1 / 3 / 5 / 8: 44 / 68 / 73 / 75% -> 55 / 74 / 85 / 88%.
+  CV.AGGRO_SCAN_FLOOR_MS = 3;
 
   // ---- 2.0.0: AggroChess `late` with the move's reply search almost done (pure; background.js) ----
   // meta = { startedAt, ms } of the running reply search, mainBudgetMs = the think budget a normal search would get.
