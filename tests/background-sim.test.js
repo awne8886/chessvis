@@ -283,4 +283,71 @@ test('B1: no relaxed SIMD -> the plain build; a relaxed build that fails to star
   assert.strictEqual(JSON.stringify(bg2.get('sfCandidates()')), JSON.stringify(['engine/stockfish-19-lite-single.js']));
 });
 
+// 2.0.3: seen on a phone with 2.0.2: a delay search ran 4 752 ms with a 3 000 ms cap, and 27 Stockfish workers were started
+// for 31 ponder jobs. The debug info now says why and when `stop` was sent, how long the bestmove took after it and how late
+// the timers fired, counts overruns, and counts terminated Stockfish workers by reason.
+test('2.0.3: Stockfish debug info: why/when the main search was stopped, overruns, kill reasons', async () => {
+  const slow = makeBackground({ stepMs: 200, sfStopDelayMs: 400 });   // the minimum depth needs 2 s; stop takes 400 ms
+  await analyzeSf(slow, [], { sfSearchMode: 'delay', softMs: 100, sfMaxMs: 300 });
+  const l = slow.get('sfLast');
+  assert.strictEqual(l.stopBy, 'hard timer');
+  assert.ok(l.stopAtMs >= 290 && l.stopAtMs < 600, 'stop at the cap: ' + l.stopAtMs);
+  assert.ok(l.replyAfterStopMs >= 380, 'bestmove 400 ms after stop: ' + l.replyAfterStopMs);
+  assert.ok(l.hardTimerLateMs >= 0 && l.hardTimerLateMs < 150 && l.softTimerLateMs >= 0, JSON.stringify(l));
+  assert.strictEqual(slow.get('sfDbg.overruns'), 1);
+  assert.strictEqual(slow.get('sfDbg.lastOverruns')[0].elapsedMs, l.elapsedMs);
+
+  const fast = makeBackground({ stepMs: 10 });
+  await analyzeSf(fast, [], { sfSearchMode: 'delay', softMs: 200 });
+  const f = fast.get('sfLast');
+  assert.ok(['info', 'soft timer'].includes(f.stopBy) && f.replyAfterStopMs < 100 && Array.isArray(f.lastDepthAt), JSON.stringify(f));
+  assert.strictEqual(fast.get('sfDbg.overruns'), 0);
+  const superseding = analyzeSf(fast, ['e2e4'], { sfSearchMode: 'delay', softMs: 400 });
+  await sleep(50);
+  await analyzeSf(fast, ['e2e4', 'e7e5'], { sfSearchMode: 'delay', softMs: 50 });
+  await superseding;
+  assert.strictEqual(fast.get('sfDbg.lastOverruns').length, 0);
+
+  // ponder workers that do not answer `stop` within 1.5 s are terminated: counted by reason
+  // (and a new job that had claimed such a worker gets a new one in its place)
+  const stuck = makeBackground({ stepMs: 50, sfHangOnStop: true });       // depth 10 needs 500 ms: mid-search at 300 ms
+  await stuck.send(sfIdle(['e2e4'], { ponderWorkers: 1 }));
+  await sleep(300);
+  await stuck.send(sfIdle(['e2e4', 'e7e5', 'g1f3'], { ponderWorkers: 1 }));
+  await sleep(1800);
+  const kills = stuck.get('sfDbg.kills');
+  assert.ok(kills['no bestmove after stop'] >= 1, JSON.stringify(kills));
+  assert.strictEqual(stuck.get('sfDbg.claimReplaced'), 1);
+  assert.ok(stuck.get('ponderActive.filter((w) => !w.dead && w.task).length') === 1, 'the job searches on its new worker');
+  await stuck.send({ type: 'aggroInvalidate' });
+});
+
+const sfIdle = (moves, extra) => ({ type: 'aggroIdle', engine: 'stockfish', startFen: START, moves, ponder: true, ponderMs: 3000, ponderWorkers: 2, ponderHashMb: 16, depth: 10, myColor: 'w', ponderUntilMove: true, ponderMaxMs: 5000, sfSearchMode: 'delay', ...extra });
+// 2.0.3: the next ponder job begins while the last job's Stockfish workers are still answering `stop` (right after a
+// hit, or the early ponder after our move): it takes them instead of starting new workers and terminating them after.
+async function sfJobSwitch(claim) {
+  const bg = makeBackground({ stepMs: 5, sfStopDelayMs: 20 });
+  bg.get('CV.SF_CLAIM_STOPPING = ' + claim);
+  const sfCount = () => bg.workers.filter((w) => w.kind === 'sf').length;
+  await bg.send(sfIdle(['e2e4']));
+  await sleep(300);
+  const before = sfCount();
+  for (const moves of [['e2e4', 'e7e5', 'g1f3'], ['e2e4', 'e7e5', 'g1f3', 'b8c6', 'f1b5'], ['e2e4', 'e7e5', 'g1f3', 'b8c6', 'f1b5', 'a7a6', 'b5a4']]) {
+    await bg.send(sfIdle(moves));
+    await sleep(250);
+  }
+  const out = { started: sfCount() - before, kills: bg.get('sfDbg.kills'), claimed: bg.get('sfDbg.claimedWhileStopping'), pondering: bg.get('idleInfo.pondering'),
+    found: bg.get('ponder.get().results') ? Object.keys(bg.get('ponder.get().results')).length : 0 };
+  await bg.send({ type: 'aggroInvalidate' });
+  return out;
+}
+test('2.0.3: a new Stockfish ponder job takes the workers that are still stopping (no new workers)', async () => {
+  const on = await sfJobSwitch(true), off = await sfJobSwitch(false);
+  if (process.env.SHOW) console.log({ on, off });
+  assert.strictEqual(on.started, 0, 'no worker started: ' + JSON.stringify(on));
+  assert.ok(on.claimed >= 6 && !on.kills['pool full after cancel'], JSON.stringify(on));
+  assert.ok(on.pondering && on.found > 0, 'the claimed workers search the new job');
+  assert.ok(off.started >= 6 && off.kills['pool full after cancel'] >= 6, '2.0.2: new workers each job: ' + JSON.stringify(off));
+});
+
 run();

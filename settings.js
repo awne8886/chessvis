@@ -476,6 +476,9 @@
   // finished game. Seen on a phone (2.0.2): the bot's only move followed by our mate in one made every search return in
   // under 3 ms, and the job ran 21 271 passes until the bot moved. false = 2.0.2 (no reply is ever settled).
   CV.PONDER_SETTLE = true;
+  // 2.0.3: a new Stockfish ponder job takes workers that are still being stopped (they are free a few ms later) instead
+  // of starting new ones; false = 2.0.2 (start new workers; the stopped ones are terminated when the pool is full).
+  CV.SF_CLAIM_STOPPING = true;
   CV.PONDER_SETTLE_FRACTION = 0.25;
   CV.ponderSettled = function ({ ms, elapsedMs, depthBefore, depthAfter }) {
     if (!CV.PONDER_SETTLE) return false;

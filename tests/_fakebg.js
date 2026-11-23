@@ -48,7 +48,11 @@ function makeBackground(opts = {}) {
         const [fenPart, movesPart] = m.slice('position fen '.length).split(' moves ');
         this.pos = CV.replayUci(fenPart, movesPart ? movesPart.split(' ') : []).pos;
       } else if (m.startsWith('go')) this.go(m);
-      else if (m === 'stop') { if (this.search) setTimeout(() => this.finish(), 1); }
+      else if (m === 'stop') {
+        // 2.0.3: sfStopDelayMs = a slow stop; sfHangOnStop = the search never answers after a stop (a stuck worker)
+        if (this.search && opts.sfHangOnStop) { const s = this.search; clearTimeout(s.timer); clearTimeout(s.mt); return; }
+        if (this.search) setTimeout(() => this.finish(), opts.sfStopDelayMs || 1);
+      }
     }
     go(cmd) {
       const dMax = +((/depth (\d+)/.exec(cmd) || [])[1] || 64);
