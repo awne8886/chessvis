@@ -57,8 +57,9 @@ function battery() {
   for (const f of BENCH_FENS) s.push(['clear'], ['pos', ''], ['pos', f + '|'], ['thinkDepth', 8, 3500]);
   return s;
 }
-function runBattery(file, step) {
+function runBattery(file, step, warm) {
   const e = aggro(file, { clock: 'fake', step });
+  if (warm) warm(e);                                          // e.g. the worker's warm-up, which must leave no trace
   return battery().map((op) => {
     let r;
     switch (op[0]) {
@@ -263,4 +264,5 @@ function main() {
   if (has('--json')) console.log(JSON.stringify(table, null, 2));
   else for (const [f, row] of Object.entries(table)) { console.log(f); for (const [k, v] of Object.entries(row)) console.log('  ' + k.padEnd(12) + v); }
 }
-main();
+if (require.main === module) main();
+module.exports = { runBattery, battery };

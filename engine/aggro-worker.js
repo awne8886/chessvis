@@ -22,7 +22,11 @@ const INIT_WAIT_MS = 3000;
 // (about 40-65 ms in Node). Pay that now, on a position that is not in the opening book, then put the engine back in
 // its fresh state: empty hash, and set_position('') = start position, no moves (that resets the per-game state it keeps).
 const WARM_FEN = 'r3k2r/p1ppqpb1/bn2pnp1/3PN3/1p2P3/2N2Q1p/PPPBBPPP/R3K2R w KQkq - 0 1';
-const WARM_MS = 5;      // the engine searches at least 30 ms whatever it is given
+const WARM_MS = 5;      // the engine searches at least 30 ms whatever it is given (only builds without think_depth use it)
+// 2.0.2: think_depth(1) does the same lazy set-up (net, book, hash table) without the 30 ms think floor: ~15 ms less
+// per worker start in Node (45 -> 28 ms with the 2.0.2 engine). Checked: a worker warmed either way answers a battery of
+// 145 timed calls exactly like a cold one (tests/bench-engines.js runBattery with a warm-up).
+const WARM_DEPTH = 1, WARM_DEPTH_MS = 1000;
 
 let started = false;
 
@@ -78,7 +82,7 @@ function warmUp() {
     const t0 = performance.now();
     applyTt();
     ex.set_position(write(WARM_FEN + '|'));
-    read(ex.think(WARM_MS));
+    read(typeof ex.think_depth === 'function' ? ex.think_depth(WARM_DEPTH, WARM_DEPTH_MS) : ex.think(WARM_MS));
     ex.clear_hash();
     ex.set_position(write(''));
     return Math.round(performance.now() - t0);

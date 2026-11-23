@@ -40,6 +40,8 @@ function aggro(file, opts = {}) {
   const read = (n) => dec.decode(new Uint8Array(ex.memory.buffer, ex.io_ptr(), n).slice());
   return {
     ex, calls, module,
+    reseed: (v) => { s = v === undefined ? 12345 : v; },     // the random sequence from the start again (after a warm-up)
+    resetClock: () => { t = 0; },
     pos: (text) => ex.set_position(write(text)),
     think: (ms) => read(ex.think(ms)),
     thinkClock: (soft, hard) => read(ex.think_clock(soft, hard)),

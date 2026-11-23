@@ -128,7 +128,9 @@ fn mate_in_one(b: &Board) -> Option<Move> {
 
 impl<'a> MateSearch<'a> {
     pub fn new(deadline: Instant, stop: &'a AtomicBool) -> Self {
-        MateSearch { tt: vec![Entry::default(); 1 << TT_BITS], nodes: 0, deadline, stop, aborted: false, node_limit: u64::MAX, goal: 0, threat_depth: 2, lite_threats: false }
+        // ChessVision 2.0.2: allocated zeroed (16 MB) instead of filled; Entry::default() is all zero
+        // SAFETY: Entry is plain integers; all-zero = Entry::default()
+        MateSearch { tt: unsafe { crate::search::zeroed_vec(1 << TT_BITS) }, nodes: 0, deadline, stop, aborted: false, node_limit: u64::MAX, goal: 0, threat_depth: 2, lite_threats: false }
     }
 
     fn idx(&self, key: u64) -> usize {

@@ -18,7 +18,12 @@ const SCALE: i32 = 400;
 const QA: i32 = 255;
 const QB: i32 = 64;
 
-static NET_BYTES: &[u8] = include_bytes!("../aggro.nnue");
+/// ChessVision 2.0.2: the nets are embedded 64-byte aligned, so their weights are read in place as i16 (zero-copy, see
+/// `i16s`) instead of being copied into vectors when the engine starts.
+#[repr(C, align(64))]
+struct Aligned<const N: usize>([u8; N]);
+static NET_DATA: Aligned<{ include_bytes!("../aggro.nnue").len() }> = Aligned(*include_bytes!("../aggro.nnue"));
+static NET_BYTES: &[u8] = &NET_DATA.0;
 
 /// Output scale in percent. The net's evaluations come out larger than the classical
 /// evaluation's (it learned from game results too), so they are scaled down to the classical
@@ -26,9 +31,9 @@ static NET_BYTES: &[u8] = include_bytes!("../aggro.nnue");
 pub static OUT_SCALE: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(67);
 
 pub struct Net {
-    ft_w: Vec<i16>,
-    ft_b: Vec<i16>,
-    out_w: Vec<i16>,
+    ft_w: &'static [i16],
+    ft_b: &'static [i16],
+    out_w: &'static [i16],
     out_b: Vec<i32>,
 }
 
@@ -40,14 +45,15 @@ static NET: OnceLock<Net> = OnceLock::new();
 /// the main net, which counts the bishop, is far off. It is the main net trained further on
 /// such endings; keeping that in a net of its own leaves the main net's judgement of every
 /// other position exactly as it was.
-static OCB_BYTES: &[u8] = include_bytes!("../aggro-ocb.nnue");
+static OCB_DATA: Aligned<{ include_bytes!("../aggro-ocb.nnue").len() }> = Aligned(*include_bytes!("../aggro-ocb.nnue"));
+static OCB_BYTES: &[u8] = &OCB_DATA.0;
 static OCB: OnceLock<Net> = OnceLock::new();
 pub static OCB_NET_ON: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
 
 #[inline]
 fn ocb_net() -> &'static Net {
     OCB.get_or_init(|| match std::env::var("AGGRO_OCBNET") {
-        Ok(f) => parse(&std::fs::read(f).expect("AGGRO_OCBNET file")),
+        Ok(f) => parse(Box::leak(std::fs::read(f).expect("AGGRO_OCBNET file").into_boxed_slice())),
         Err(_) => parse(OCB_BYTES),
     })
 }
@@ -67,13 +73,26 @@ pub fn evaluate_ocb(board: &Board) -> i32 {
     a.evaluate_with(n, board)
 }
 
-fn parse(v: &[u8]) -> Net {
+/// Little-endian i16 values: read in place when the bytes are 2-aligned on a little-endian target (WebAssembly, x86),
+/// else copied once.
+fn i16s(v: &'static [u8]) -> &'static [i16] {
+    #[cfg(target_endian = "little")]
+    {
+        if v.as_ptr() as usize % std::mem::align_of::<i16>() == 0 {
+            // SAFETY: 2-aligned, 'static, len / 2 whole values, and i16 has no invalid bit patterns
+            return unsafe { std::slice::from_raw_parts(v.as_ptr() as *const i16, v.len() / 2) };
+        }
+    }
+    Box::leak(v.chunks_exact(2).map(|c| i16::from_le_bytes([c[0], c[1]])).collect::<Vec<_>>().into_boxed_slice())
+}
+
+fn parse(v: &'static [u8]) -> Net {
     assert_eq!(&v[0..4], b"AGNN", "bad network file");
     let h = u32::from_le_bytes(v[4..8].try_into().unwrap()) as usize;
     assert_eq!(h, H, "network has a different hidden size");
     let mut off = 8;
-    let mut rd = |n: usize| -> Vec<i16> {
-        let r = (0..n).map(|i| i16::from_le_bytes([v[off + 2 * i], v[off + 2 * i + 1]])).collect();
+    let mut rd = |n: usize| -> &'static [i16] {
+        let r = i16s(&v[off..off + 2 * n]);
         off += 2 * n;
         r
     };
@@ -87,7 +106,7 @@ fn parse(v: &[u8]) -> Net {
 #[inline]
 pub fn net() -> &'static Net {
     NET.get_or_init(|| match std::env::var("AGGRO_NET") {
-        Ok(f) => parse(&std::fs::read(f).expect("AGGRO_NET file")),
+        Ok(f) => parse(Box::leak(std::fs::read(f).expect("AGGRO_NET file").into_boxed_slice())),
         Err(_) => parse(NET_BYTES),
     })
 }
@@ -137,7 +156,7 @@ impl Accumulator {
 
     fn refresh_with(&mut self, n: &Net, board: &Board) {
         for persp in 0..2 {
-            self.v[persp].copy_from_slice(&n.ft_b);
+            self.v[persp].copy_from_slice(n.ft_b);
         }
         for color in [Color::White, Color::Black] {
             for piece in Piece::ALL {

@@ -73,6 +73,21 @@ pub struct TranspositionTable {
 
 const EVAL_NONE: i32 = -32001;
 
+/// ChessVision 2.0.2: a Vec of `n` values allocated already zeroed (alloc_zeroed: in WebAssembly fresh memory pages are
+/// zero, so nothing is written) instead of being filled value by value.
+/// SAFETY (caller): the all-zero bit pattern must be the value wanted for T (integers, atomics, plain structs of them).
+pub(crate) unsafe fn zeroed_vec<T>(n: usize) -> Vec<T> {
+    if n == 0 || std::mem::size_of::<T>() == 0 {
+        return Vec::new();
+    }
+    let layout = std::alloc::Layout::array::<T>(n).expect("table size");
+    let p = std::alloc::alloc_zeroed(layout) as *mut T;
+    if p.is_null() {
+        std::alloc::handle_alloc_error(layout);
+    }
+    Vec::from_raw_parts(p, n, n)
+}
+
 fn pack_move(mv: Option<Move>) -> u64 {
     match mv {
         None => 0,
@@ -111,10 +126,9 @@ impl TranspositionTable {
         let bytes = mb.max(1) * 1024 * 1024;
         let entries = (bytes / std::mem::size_of::<TTEntry>()).max(2);
         let buckets = (entries / 2).max(1);
-        let mut v = Vec::with_capacity(buckets * 2);
-        for _ in 0..buckets * 2 {
-            v.push(TTEntry { key: AtomicU64::new(0), data: AtomicU64::new(0) });
-        }
+        // ChessVision 2.0.2: allocated zeroed (two AtomicU64 0 = an empty entry) instead of 2 x 2^20 pushes for 32 MB
+        // SAFETY: an all-zero TTEntry is key 0, data 0, exactly what the pushes made
+        let v: Vec<TTEntry> = unsafe { zeroed_vec(buckets * 2) };
         Self { entries: v, buckets, age: AtomicU8::new(0), mb }
     }
 

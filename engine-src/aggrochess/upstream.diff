@@ -21,7 +21,43 @@
  pub static TT_SIZE_MB: AtomicUsize = AtomicUsize::new(128);
  pub static NUM_THREADS: AtomicUsize = AtomicUsize::new(1);
  /// Draw score penalty (centipawns) from the engine's point of view.
-@@ -133,6 +137,14 @@
+@@ -69,6 +73,21 @@
+ 
+ const EVAL_NONE: i32 = -32001;
+ 
++/// ChessVision 2.0.2: a Vec of `n` values allocated already zeroed (alloc_zeroed: in WebAssembly fresh memory pages are
++/// zero, so nothing is written) instead of being filled value by value.
++/// SAFETY (caller): the all-zero bit pattern must be the value wanted for T (integers, atomics, plain structs of them).
++pub(crate) unsafe fn zeroed_vec<T>(n: usize) -> Vec<T> {
++    if n == 0 || std::mem::size_of::<T>() == 0 {
++        return Vec::new();
++    }
++    let layout = std::alloc::Layout::array::<T>(n).expect("table size");
++    let p = std::alloc::alloc_zeroed(layout) as *mut T;
++    if p.is_null() {
++        std::alloc::handle_alloc_error(layout);
++    }
++    Vec::from_raw_parts(p, n, n)
++}
++
+ fn pack_move(mv: Option<Move>) -> u64 {
+     match mv {
+         None => 0,
+@@ -107,10 +126,9 @@
+         let bytes = mb.max(1) * 1024 * 1024;
+         let entries = (bytes / std::mem::size_of::<TTEntry>()).max(2);
+         let buckets = (entries / 2).max(1);
+-        let mut v = Vec::with_capacity(buckets * 2);
+-        for _ in 0..buckets * 2 {
+-            v.push(TTEntry { key: AtomicU64::new(0), data: AtomicU64::new(0) });
+-        }
++        // ChessVision 2.0.2: allocated zeroed (two AtomicU64 0 = an empty entry) instead of 2 x 2^20 pushes for 32 MB
++        // SAFETY: an all-zero TTEntry is key 0, data 0, exactly what the pushes made
++        let v: Vec<TTEntry> = unsafe { zeroed_vec(buckets * 2) };
+         Self { entries: v, buckets, age: AtomicU8::new(0), mb }
+     }
+ 
+@@ -133,6 +151,14 @@
  
      #[inline]
      fn bucket(&self, hash: u64) -> usize {
@@ -36,7 +72,7 @@
          (((hash as u128) * (self.buckets as u128)) >> 64) as usize * 2
      }
  
-@@ -1281,8 +1293,8 @@
+@@ -1281,8 +1307,8 @@
  
      #[inline]
      fn check_time(&mut self) {
@@ -47,7 +83,7 @@
              if let Some(p) = &self.parent_stop {
                  if p.load(Ordering::Relaxed) {
                      self.stop.store(true, Ordering::Relaxed);
-@@ -2631,10 +2643,10 @@
+@@ -2631,10 +2657,10 @@
          let cap = (200.0 * 1.45f64.powi(skill)) as u64;
          limits.nodes = Some(limits.nodes.map_or(cap, |n| n.min(cap)));
          eval::NOISE.store((20 - skill) * 7, Ordering::Relaxed);
@@ -62,7 +98,7 @@
          eval::NOISE_SEED.store(seed, Ordering::Relaxed);
      } else {
          eval::NOISE.store(0, Ordering::Relaxed);
-@@ -2834,7 +2846,7 @@
+@@ -2834,7 +2860,7 @@
  
          let elapsed = start.elapsed();
          if print_info {
@@ -73,7 +109,91 @@
                  "info depth {} seldepth {} score {} nodes {} nps {} hashfull {} time {} pv {}",
 --- a/src/nnue.rs
 +++ b/src/nnue.rs
-@@ -113,6 +113,11 @@
+@@ -18,7 +18,12 @@
+ const QA: i32 = 255;
+ const QB: i32 = 64;
+ 
+-static NET_BYTES: &[u8] = include_bytes!("../aggro.nnue");
++/// ChessVision 2.0.2: the nets are embedded 64-byte aligned, so their weights are read in place as i16 (zero-copy, see
++/// `i16s`) instead of being copied into vectors when the engine starts.
++#[repr(C, align(64))]
++struct Aligned<const N: usize>([u8; N]);
++static NET_DATA: Aligned<{ include_bytes!("../aggro.nnue").len() }> = Aligned(*include_bytes!("../aggro.nnue"));
++static NET_BYTES: &[u8] = &NET_DATA.0;
+ 
+ /// Output scale in percent. The net's evaluations come out larger than the classical
+ /// evaluation's (it learned from game results too), so they are scaled down to the classical
+@@ -26,9 +31,9 @@
+ pub static OUT_SCALE: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(67);
+ 
+ pub struct Net {
+-    ft_w: Vec<i16>,
+-    ft_b: Vec<i16>,
+-    out_w: Vec<i16>,
++    ft_w: &'static [i16],
++    ft_b: &'static [i16],
++    out_w: &'static [i16],
+     out_b: Vec<i32>,
+ }
+ 
+@@ -40,14 +45,15 @@
+ /// the main net, which counts the bishop, is far off. It is the main net trained further on
+ /// such endings; keeping that in a net of its own leaves the main net's judgement of every
+ /// other position exactly as it was.
+-static OCB_BYTES: &[u8] = include_bytes!("../aggro-ocb.nnue");
++static OCB_DATA: Aligned<{ include_bytes!("../aggro-ocb.nnue").len() }> = Aligned(*include_bytes!("../aggro-ocb.nnue"));
++static OCB_BYTES: &[u8] = &OCB_DATA.0;
+ static OCB: OnceLock<Net> = OnceLock::new();
+ pub static OCB_NET_ON: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
+ 
+ #[inline]
+ fn ocb_net() -> &'static Net {
+     OCB.get_or_init(|| match std::env::var("AGGRO_OCBNET") {
+-        Ok(f) => parse(&std::fs::read(f).expect("AGGRO_OCBNET file")),
++        Ok(f) => parse(Box::leak(std::fs::read(f).expect("AGGRO_OCBNET file").into_boxed_slice())),
+         Err(_) => parse(OCB_BYTES),
+     })
+ }
+@@ -67,13 +73,26 @@
+     a.evaluate_with(n, board)
+ }
+ 
+-fn parse(v: &[u8]) -> Net {
++/// Little-endian i16 values: read in place when the bytes are 2-aligned on a little-endian target (WebAssembly, x86),
++/// else copied once.
++fn i16s(v: &'static [u8]) -> &'static [i16] {
++    #[cfg(target_endian = "little")]
++    {
++        if v.as_ptr() as usize % std::mem::align_of::<i16>() == 0 {
++            // SAFETY: 2-aligned, 'static, len / 2 whole values, and i16 has no invalid bit patterns
++            return unsafe { std::slice::from_raw_parts(v.as_ptr() as *const i16, v.len() / 2) };
++        }
++    }
++    Box::leak(v.chunks_exact(2).map(|c| i16::from_le_bytes([c[0], c[1]])).collect::<Vec<_>>().into_boxed_slice())
++}
++
++fn parse(v: &'static [u8]) -> Net {
+     assert_eq!(&v[0..4], b"AGNN", "bad network file");
+     let h = u32::from_le_bytes(v[4..8].try_into().unwrap()) as usize;
+     assert_eq!(h, H, "network has a different hidden size");
+     let mut off = 8;
+-    let mut rd = |n: usize| -> Vec<i16> {
+-        let r = (0..n).map(|i| i16::from_le_bytes([v[off + 2 * i], v[off + 2 * i + 1]])).collect();
++    let mut rd = |n: usize| -> &'static [i16] {
++        let r = i16s(&v[off..off + 2 * n]);
+         off += 2 * n;
+         r
+     };
+@@ -87,7 +106,7 @@
+ #[inline]
+ pub fn net() -> &'static Net {
+     NET.get_or_init(|| match std::env::var("AGGRO_NET") {
+-        Ok(f) => parse(&std::fs::read(f).expect("AGGRO_NET file")),
++        Ok(f) => parse(Box::leak(std::fs::read(f).expect("AGGRO_NET file").into_boxed_slice())),
+         Err(_) => parse(NET_BYTES),
+     })
+ }
+@@ -113,6 +132,11 @@
  
  #[inline(always)]
  fn add(acc: &mut [i16; H], w: &[i16]) {
@@ -85,7 +205,16 @@
      for (a, b) in acc.iter_mut().zip(w) {
          *a = a.wrapping_add(*b);
      }
-@@ -298,6 +303,11 @@
+@@ -132,7 +156,7 @@
+ 
+     fn refresh_with(&mut self, n: &Net, board: &Board) {
+         for persp in 0..2 {
+-            self.v[persp].copy_from_slice(&n.ft_b);
++            self.v[persp].copy_from_slice(n.ft_b);
+         }
+         for color in [Color::White, Color::Black] {
+             for piece in Piece::ALL {
+@@ -298,6 +322,11 @@
              return unsafe { update_avx2(out, src, a0, s0, a1, s1) };
          }
      }
@@ -97,7 +226,7 @@
      update_body(out, src, a0, s0, a1, s1)
  }
  
-@@ -316,9 +326,99 @@
+@@ -316,9 +345,99 @@
              return unsafe { screlu_dot_avx2(acc, w) };
          }
      }
@@ -231,3 +360,14 @@
  
  const TT_BITS: u32 = 20;
  
+@@ -128,7 +128,9 @@
+ 
+ impl<'a> MateSearch<'a> {
+     pub fn new(deadline: Instant, stop: &'a AtomicBool) -> Self {
+-        MateSearch { tt: vec![Entry::default(); 1 << TT_BITS], nodes: 0, deadline, stop, aborted: false, node_limit: u64::MAX, goal: 0, threat_depth: 2, lite_threats: false }
++        // ChessVision 2.0.2: allocated zeroed (16 MB) instead of filled; Entry::default() is all zero
++        // SAFETY: Entry is plain integers; all-zero = Entry::default()
++        MateSearch { tt: unsafe { crate::search::zeroed_vec(1 << TT_BITS) }, nodes: 0, deadline, stop, aborted: false, node_limit: u64::MAX, goal: 0, threat_depth: 2, lite_threats: false }
+     }
+ 
+     fn idx(&self, key: u64) -> usize {
