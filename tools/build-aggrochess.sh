@@ -8,12 +8,15 @@
 #
 # Pinned tools (a different version gives a different binary, maybe a different speed, but must not change a search;
 # check with: node tests/bench-engines.js --diff OLD.wasm NEW.wasm and node tests/engine-signature.test.js):
-#   Rust     1.100.0 (rustc 0ef1bc386 2026-11-09), target wasm32-unknown-unknown, installed with rustup
-#   wasm-opt binaryen version_132 (only with WASM_OPT=1, see below)
+#   Rust     1.100.0 (rustc 0ef1bc386 2026-11-09, the newest stable in Nov 2026), target wasm32-unknown-unknown, rustup
+#   wasm-opt binaryen version_132 (downloaded into .build/ and checked by sha256 when BINARYEN is not given)
 # Crate dependencies are pinned by engine-src/aggrochess/Cargo.lock (cargo --locked).
 #
-# WASM_OPT=1 runs `wasm-opt -O3` with the feature set rustc emitted on top (BINARYEN=/path/to/binaryen/bin, default:
-# wasm-opt on PATH). Not used for the shipped 2.0.2 binaries (see docs/REFERENCE.md, 2.0.2 changelog).
+# wasm-opt -O3 runs on cargo's output with the feature set rustc emits (bulk-memory, nontrapping-fptoint, sign-ext,
+# mutable-globals, multivalue, reference-types, bulk-memory-opt, call-indirect-overlong; + simd128 for the SIMD build;
+# check with: wasm-opt --detect-features --print-features FILE). Since 2.0.2: 11% smaller (2.06 -> 1.84 MB), the same
+# search, speed within noise. It drops the name section: WASM_OPT=0 gives cargo's output with function names (profiling).
+# BINARYEN=/path/to/binaryen/bin uses an installed binaryen (it should be version_132).
 set -euo pipefail
 
 RUST_TOOLCHAIN=1.100.0
@@ -43,12 +46,26 @@ echo "using $(rustup run "$RUST_TOOLCHAIN" rustc -V)"
 CARGO_HOME_DIR=${CARGO_HOME:-$HOME/.cargo}
 REMAP="--remap-path-prefix=$CARGO_HOME_DIR=/cargo"
 
+BINARYEN_VERSION=132
+BINARYEN_SHA256=195ddc94f9bc89f45abdabb0b9eea86023d727ba90eac8b35b80f2544fc30572   # binaryen-version_132-x86_64-linux.tar.gz
+if [ "${WASM_OPT:-1}" = "1" ] && [ -z "${BINARYEN:-}" ]; then
+  BINARYEN=$ROOT/.build/binaryen-$BINARYEN_VERSION/bin
+  if [ ! -x "$BINARYEN/wasm-opt" ]; then
+    mkdir -p "$ROOT/.build/dl"
+    tgz=$ROOT/.build/dl/binaryen-$BINARYEN_VERSION.tar.gz
+    curl -sSL -o "$tgz" "https://github.com/WebAssembly/binaryen/releases/download/version_$BINARYEN_VERSION/binaryen-version_$BINARYEN_VERSION-x86_64-linux.tar.gz"
+    echo "$BINARYEN_SHA256  $tgz" | sha256sum -c - >/dev/null
+    mkdir -p "$ROOT/.build/binaryen-$BINARYEN_VERSION" && tar -xzf "$tgz" -C "$ROOT/.build/binaryen-$BINARYEN_VERSION" --strip-components=1
+  fi
+fi
+[ "${WASM_OPT:-1}" = "1" ] && echo "using $("$BINARYEN/wasm-opt" --version)"
+
 build() {   # $1 = output name, $2 = extra RUSTFLAGS, $3 = target dir
   (cd "$CRATE" && RUSTFLAGS="$2 $REMAP" CARGO_TARGET_DIR="$CRATE/$3" \
     cargo "+$RUST_TOOLCHAIN" build --release --locked --target wasm32-unknown-unknown)
   local wasm="$CRATE/$3/wasm32-unknown-unknown/release/aggrochess_web.wasm"
-  if [ "${WASM_OPT:-0}" = "1" ]; then
-    local opt="${BINARYEN:+$BINARYEN/}wasm-opt"
+  if [ "${WASM_OPT:-1}" = "1" ]; then
+    local opt="$BINARYEN/wasm-opt"
     "$opt" -O3 --enable-bulk-memory --enable-bulk-memory-opt --enable-nontrapping-float-to-int --enable-sign-ext \
       --enable-mutable-globals --enable-multivalue --enable-reference-types --enable-call-indirect-overlong \
       $( [ -n "$2" ] && echo --enable-simd ) "$wasm" -o "$OUT/$1"
