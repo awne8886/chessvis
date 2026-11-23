@@ -48,7 +48,15 @@ engine/stockfish-19-lite-single-rsimd.wasm    built with WebAssembly relaxed SIM
                               code (src/nnue/simd.h, GPL-3.0). No lichess / AGPL code is used.
                               engine/stockfish-19-lite-single-rsimd.js   sha256 0212ceb41bfd67782f72f8e7ae2afc0cb4ee99856a3c41bd3ba2df4461a5501a
                               engine/stockfish-19-lite-single-rsimd.wasm sha256 744ae23293592254667b4b4fe2d5eae17319945ee06c51e364792b524880e6e7
-                              Multi-thread builds are NOT used (they need SharedArrayBuffer / cross-origin isolation).
+engine/stockfish-19-lite.js    - 2.0.0: the multi-threaded lite build of the same package (Stockfish.js 19.0.1, lite net,
+engine/stockfish-19-lite.wasm    GPL-3.0), used only for the main worker when the setting sfThreads is above 1 AND the runtime
+                              test of SharedArrayBuffer / Atomics / shared memory passes (it fails in Firefox's extension
+                              background page: no cross-origin isolation; then the single-thread files above are used).
+                              Both files were taken unmodified from the same npm package "stockfish" 19.0.1 (tarball sha256
+                              above), directory bin/; checked byte for byte against that tarball in 2.0.3:
+                              engine/stockfish-19-lite.js   sha256 dac939ff529668e0168b2f615145ec18b029b753deb6963fd7319d788f964333
+                              engine/stockfish-19-lite.wasm sha256 ddf06cdaf0b8e35c11b40530e44db96c2a99c9029c8d621dd9fca97e4872770c
+engine/sf-worker.js           - 2.0.2: ChessVision's own worker wrapper for the Stockfish builds (GPL-3.0, see LICENSE).
 
 Maia-3 (added in 1.3.0; REMOVED in 1.7.8 - none of the files below is shipped any more, the entries are kept for the record)
 engine/maia3-23m.fp16.onnx  - Maia-3 23M network weights, exported to ONNX (fp16).
