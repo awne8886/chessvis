@@ -153,4 +153,28 @@ test('T8: late with too much left -> no wait, normal think', async () => {
   assert.strictEqual(bg.get('ponderDbg.lateWaits'), 0);
 });
 
+test('T9: clock mode sends go wtime/btime, stops at the hard cap', async () => {
+  const bg = makeBackground({ stepMs: 10 });
+  const t0 = Date.now();
+  await analyzeSf(bg, [], { sfSearchMode: 'clock', softMs: 100, sfMaxMs: 300, uciClock: { wtime: 60000, btime: 50000, winc: 0, binc: 0 } });
+  const ms = Date.now() - t0;
+  assert.ok(bg.log.some((l) => l.cmd === 'go wtime 60000 btime 50000 winc 0 binc 0'));
+  assert.ok(ms >= 290 && ms < 800, 'hard cap: ' + ms);
+  assert.strictEqual(bg.get('sfLast').mode, 'clock');
+});
+
+test('T9: clock mode that answers before softMs continues as a delay search; no clock = delay/depth', async () => {
+  const bg = makeBackground({ stepMs: 10 });
+  const t0 = Date.now();
+  await analyzeSf(bg, [], { sfSearchMode: 'clock', softMs: 300, uciClock: { wtime: 3000, btime: 3000, winc: 0, binc: 0 } });   // fake: 3000 / 30 = 100 ms
+  const ms = Date.now() - t0;
+  assert.ok(ms >= 290, 'kept searching through the pause: ' + ms);
+  assert.ok(bg.log.some((l) => l.cmd === 'go depth 64'));
+  assert.strictEqual(bg.get('sfLast').mode, 'delay (clock, extended)');
+  await analyzeSf(bg, ['e2e4'], { sfSearchMode: 'clock', softMs: 50, uciClock: null });
+  assert.strictEqual(bg.get('sfLast').mode, 'delay');
+  assert.strictEqual(CV.sfClockGo({ wtime: 1000, btime: 0 }), null);
+  assert.strictEqual(CV.sfClockGo({ wtime: 61000.4, btime: 59000, winc: 2000, binc: 2000 }), 'go wtime 61000 btime 59000 winc 2000 binc 2000');
+});
+
 run();

@@ -318,8 +318,9 @@
   const NAME_SELECTORS = ['.player-component .user-username-component', '[data-test-element="user-tagline-username"]', '.user-tagline-username', '[class*="user-username"]'];
   const clsOf = (el) => String((el.className && el.className.baseVal !== undefined ? el.className.baseVal : el.className) || '').toLowerCase();
 
-  // My clock in ms (+ increment if the page shows one), or null.
-  function readMyClock(myColor) {
+  // A clock in ms (+ increment if the page shows one), or null. which = 'me' (my colour's clock, else the bottom one) or
+  // 'opp' (2.0.0: the other colour's clock, else the top one). CANDIDATE selectors, unverified on the real site.
+  function readClock(myColor, which) {
     try {
       const seen = new Set(), cands = [];
       for (const sel of CLOCK_SELECTORS) {
@@ -330,11 +331,12 @@
           if (ms !== null) cands.push({ ms, cls: clsOf(el) });
         }
       }
-      const mine = myColor === 'w' ? 'white' : 'black', other = myColor === 'w' ? 'black' : 'white';
-      // my colour's clock first (works with a flipped board), else the clock at the bottom, which is mine
-      const pick = cands.find((c) => c.cls.includes('clock-' + mine)) ||
-                   cands.find((c) => c.cls.includes(mine) && !c.cls.includes(other)) ||
-                   cands.find((c) => /(^|[\s-])bottom($|[\s-])/.test(c.cls));
+      const mineC = myColor === 'w' ? 'white' : 'black', otherC = myColor === 'w' ? 'black' : 'white';
+      const [want, avoid, side] = which === 'opp' ? [otherC, mineC, 'top'] : [mineC, otherC, 'bottom'];
+      // that colour's clock first (works with a flipped board), else the clock at the bottom (mine) / top (the opponent's)
+      const pick = cands.find((c) => c.cls.includes('clock-' + want)) ||
+                   cands.find((c) => c.cls.includes(want) && !c.cls.includes(avoid)) ||
+                   cands.find((c) => new RegExp('(^|[\\s-])' + side + '($|[\\s-])').test(c.cls));
       if (!pick) return null;
       let inc = 0;
       for (const sel of INCREMENT_SELECTORS) {
@@ -344,6 +346,8 @@
       return { ms: pick.ms, inc };
     } catch (e) { return null; }
   }
+  const readMyClock = (myColor) => readClock(myColor, 'me');
+  const readOppClock = (myColor) => readClock(myColor, 'opp');
 
   // { me, opp } player names (top name = opponent, bottom = me), or null.
   function readNames() {
@@ -377,6 +381,22 @@
       const budget = clk && CV.clock.clockBudget({ remainingMs: clk.ms, incrementMs: clk.inc, thinkMs: cfg.thinkMs });
       if (budget) { plan.soft = budget.soft; plan.hard = budget.hard; lastClock = { ms: clk.ms, mode: budget.mode, soft: budget.soft, hard: budget.hard }; log('clock', clk.ms, 'ms ->', budget); }
     }
+    if (cfg.engine === 'stockfish' && cfg.sfSearchMode === 'clock') {
+      // 2.0.0 'clock' mode: Stockfish's own time manager gets both clocks (go wtime/btime/winc/binc); a JS timer stops it at
+      // the clock.js hard limit (<= a quarter of what is left, and <= sfMaxMs when set). No readable clock of mine = 'delay'
+      // for this move. The opponent's clock unreadable = mine for both. Clock selectors: unverified on the real site.
+      const clk = readMyClock(pos.myColor);
+      const budget = clk && CV.clock.clockBudget({ remainingMs: clk.ms, incrementMs: clk.inc, thinkMs: cfg.sfMaxMs > 0 ? cfg.sfMaxMs : 5000 });
+      if (!budget) { plan.searchMode = 'delay'; log('clock mode: my clock not readable, delay mode for this move'); }
+      else {
+        const opp = readOppClock(pos.myColor), oppMs = opp ? opp.ms : clk.ms, inc = clk.inc || 0;
+        plan.uciClock = pos.myColor === 'w' ? { wtime: clk.ms, btime: oppMs, winc: inc, binc: inc } : { wtime: oppMs, btime: clk.ms, winc: inc, binc: inc };
+        plan.sfCap = CV.sfSearchCap(cfg.sfMaxMs, budget.hard);
+        lastClock = { ms: clk.ms, mode: budget.mode, soft: budget.soft, hard: budget.hard, opp: opp ? opp.ms : null };
+        log('clock mode', plan.uciClock, 'hard', plan.sfCap);
+      }
+      return plan;
+    }
     if (cfg.engine === 'stockfish' && cfg.sfUseClock) {            // optional: never more than the clock allows (clock.js: <= a quarter of what is left)
       const clk = readMyClock(pos.myColor);
       const budget = clk && CV.clock.clockBudget({ remainingMs: clk.ms, incrementMs: clk.inc, thinkMs: cfg.sfMaxMs > 0 ? cfg.sfMaxMs : 5000 });
@@ -403,7 +423,7 @@
       soft: p.soft, hard: p.hard, verify: cfg.engine === 'aggro' && cfg.aggroVerify, ponder: sfPonderOn() || (cfg.engine === 'aggro' && cfg.aggroPonder), sfThreads: cfg.engine === 'stockfish' ? cfg.sfThreads : undefined,
       imperfection: !quick && cfg.engine === 'stockfish' && hum() ? cfg.imperfection : 0,
       sfMaxMs: p.sfCap,
-      sfSearchMode: quick ? 'depth' : cfg.sfSearchMode, softMs: quick ? 0 : (softMs || 0),
+      sfSearchMode: quick ? 'depth' : (p.searchMode || cfg.sfSearchMode), softMs: quick ? 0 : (softMs || 0), uciClock: quick ? undefined : p.uciClock,
     });
   }
 

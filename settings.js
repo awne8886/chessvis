@@ -498,6 +498,16 @@
     return first && list.includes(first) ? [first, ...list.filter((u) => u !== first)] : list.slice();
   };
 
+  // The `go` command of Stockfish's own time manager ('clock' mode, 2.0.0) from { wtime, btime, winc, binc } in ms, or null
+  // when the clocks are not usable.
+  CV.sfClockGo = function (c) {
+    if (!c) return null;
+    const n = (v) => Math.max(0, Math.round(Number(v)) || 0);
+    const w = n(c.wtime), b = n(c.btime);
+    if (!(w > 0) || !(b > 0)) return null;
+    return 'go wtime ' + w + ' btime ' + b + ' winc ' + n(c.winc) + ' binc ' + n(c.binc);
+  };
+
   // ---- allowed pages (allowed-pages.txt) ----
   // Turns the file's text into a list of normalised entries.
   CV.parseAllowlist = function (text) {

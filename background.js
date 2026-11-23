@@ -24,6 +24,7 @@ const IMPERFECTION_LINES = 3; // MultiPV lines searched when imperfection > 0
 let sf = null, sfReady = null, sfCurrent = null, sfNext = null;
 let lastMainPv = null;  // 2.0.0: { startFen, moves, pv, depth, ponder } of the last main search (seeds the ponder table, CV.pvSeed)
 let sfLast = null;      // 2.0.0: the last finished main search { mode, depthDone, softMs, hardMs, elapsedMs } (debug info)
+const SF_CLOCK_EXTEND_MIN_MS = 30;  // 'clock' mode: a time-managed search that ends at least this long before softMs is continued
 const SF_DELAY_GO = 'go depth 64';   // delay-matched search: effectively unbounded; stopped from JavaScript (CV.sfShouldStop)
 let sfActive = null;    // engine file in use
 let sfPrevCount = null; // pieces in the previous request; null = nothing searched yet (see CV.sfIsNewGame)
@@ -189,12 +190,17 @@ function sfStart(job) {
     sf.postMessage(SF_DELAY_GO);
     job.softTimer = setTimeout(() => sfCheckStop(job), job.softMs);
     job.hardTimer = setTimeout(() => sfCheckStop(job), job.hardMs);
+  } else if (job.mode === 'clock') {
+    sf.postMessage(job.clockGo);
+    job.hardTimer = setTimeout(() => sfCheckStop(job), job.hardMs);
   } else sf.postMessage(CV.sfGoCommand(job.depth, job.maxMs));
 }
 
 // Sends `stop` (once) when CV.sfShouldStop says so; the normal bestmove handling then resolves the job.
 function sfCheckStop(job) {
-  if (sfCurrent !== job || job.stopSent || job.mode !== 'delay') return;
+  if (sfCurrent !== job || job.stopSent) return;
+  if (job.mode === 'clock') { if (Date.now() - job.startedAt >= job.hardMs) { job.stopSent = true; sf.postMessage('stop'); } return; }
+  if (job.mode !== 'delay') return;
   if (CV.sfShouldStop({ elapsedMs: Date.now() - job.startedAt, softMs: job.softMs, depthDone: job.depthDone, minDepth: job.depth, hardMs: job.hardMs })) {
     job.stopSent = true;
     sf.postMessage('stop');
@@ -230,9 +236,19 @@ function sfBestMove(line) {
   const parts = String(line).split(' ');
   const move = parts[1], ponderTok = parts[2] === 'ponder' ? parts[3] || null : null;
   const job = sfCurrent;
+  // 'clock' mode: Stockfish's time manager answered before the human-like pause was used: keep searching the same position
+  // as a delay-matched search until softMs (same job, same start time, the hash carries the tree over).
+  if (job && job.mode === 'clock' && !job.stopSent && !sfNext && Date.now() - job.startedAt < job.softMs - SF_CLOCK_EXTEND_MIN_MS) {
+    job.mode = 'delay'; job.extended = true;
+    sf.postMessage(CV.sfPositionCommand(job.fen, job.startFen, job.moves));
+    sf.postMessage(SF_DELAY_GO);
+    clearTimeout(job.softTimer);
+    job.softTimer = setTimeout(() => sfCheckStop(job), Math.max(0, job.softMs - (Date.now() - job.startedAt)));
+    return;
+  }
   sfCurrent = null;
   sfClearTimers(job);
-  if (job) sfLast = { mode: job.mode, depthDone: job.depthDone || 0, softMs: job.softMs, hardMs: job.hardMs, elapsedMs: Date.now() - job.startedAt, superseded: !!sfNext };
+  if (job) sfLast = { mode: job.mode + (job.extended ? ' (clock, extended)' : ''), depthDone: job.depthDone || 0, softMs: job.softMs, hardMs: job.hardMs, elapsedMs: Date.now() - job.startedAt, superseded: !!sfNext };
   if (sfNext) {
     const n = sfNext;
     sfNext = null;
@@ -295,7 +311,10 @@ async function analyzeStockfishNow(fen, depth, imperfection, maxMs, startFen, mo
       lines: new Map(),
       // 2.0.0: 'delay' = search through the human-like pause (softMs from the page, depth = minimum); 'depth' = 1.8.0.
       // A soft budget of 0 (no pause left, or a quick look) searches like 'depth'.
-      mode: (msg.sfSearchMode === 'delay' || msg.sfSearchMode === 'clock') && softMs > 0 ? 'delay' : 'depth',
+      // 'clock' (T9) = Stockfish's own time manager with both clocks; JS stops it at hardMs, and a search that ends before
+      // softMs continues as a delay-matched search (the hash carries over), so the pause stays a lower bound.
+      mode: msg.sfSearchMode === 'clock' && CV.sfClockGo(msg.uciClock) ? 'clock' : (msg.sfSearchMode === 'delay' || msg.sfSearchMode === 'clock') && softMs > 0 ? 'delay' : 'depth',
+      clockGo: CV.sfClockGo(msg.uciClock),
       softMs, depthDone: 0, pv: [], pvDepth: 0,
     };
     job.hardMs = CV.sfHardMs(softMs, job.maxMs);
