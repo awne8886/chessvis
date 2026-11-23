@@ -59,6 +59,7 @@
     ponderUntilMove: true,    // keep pondering (deepening the likely replies) until the opponent moves, up to ponderMaxMs (false = the *PonderMs budget, 1.8.0)
     ponderMaxMs: 8000,        // ceiling of a ponder job with ponderUntilMove
     ponderHitFast: true,      // a ponder hit is answered with the quick delay and the faster hand (false = 1.8.0: normal delay)
+    ponderHitTopUp: true,     // 2.0.2: on a ponder hit the main worker searches on through that pause when it can go deeper than the prepared reply (false = 2.0.0)
     sfSearchMode: 'delay',    // Stockfish full search: 'depth' (1.8.0: go depth N) | 'delay' (search through the human-like pause, depth = minimum) | 'clock'
 
     // --- game recording and saving ---
@@ -478,6 +479,35 @@
   // Measured (tests/bench-ponder-rank.js, 80 positions, opponent AggroChess 150 ms, budget 1500): moves ranked in the
   // window 24.8 -> 33.5 of 33.9; opponent's move in the top 1 / 3 / 5 / 8: 44 / 68 / 73 / 75% -> 55 / 74 / 85 / 88%.
   CV.AGGRO_SCAN_FLOOR_MS = 3;
+
+  // ---- 2.0.2: ponder hits never lose depth (pure; background.js) ----
+  // A prepared reply is often shallower than what the main worker reaches in the pause a hit is played after anyway
+  // (Stockfish pass-1 replies: go depth N movetime slice, depth <= 10; PV seeds: depth - 2). The page draws that pause up
+  // front and sends hitSoftMs = pause - SF_DELAY_MARGIN_MS - time spent; on a hit the background searches the position
+  // on the main worker within hitSoftMs when that is expected to go deeper, and plays the deeper of the two results.
+  CV.HIT_TOPUP_MIN_MS = 30;             // shorter than this, the main worker adds nothing (a fresh search, message round trips)
+  // { search, ms, reason }. engine 'sf': search when expectedDepth (CV.expectedDepth of the recent main searches; null =
+  // not known yet) is above storedDepth. engine 'aggro': search when hitSoftMs is at least storedMs, the slice the stored
+  // reply was searched with (its depth is not comparable across budgets; 0 / unknown = search).
+  CV.hitTopUp = function ({ engine, storedDepth, storedMs, hitSoftMs, expectedDepth }) {
+    const ms = Math.max(0, Math.round(Number(hitSoftMs)) || 0);
+    if (ms < CV.HIT_TOPUP_MIN_MS) return { search: false, ms, reason: 'no time' };
+    if (engine === 'aggro') {
+      const slice = Math.max(0, Number(storedMs) || 0);
+      return slice > ms ? { search: false, ms, reason: 'slice longer' } : { search: true, ms, reason: 'pause >= slice' };
+    }
+    if (expectedDepth === null || expectedDepth === undefined) return { search: true, ms, reason: 'no model yet' };
+    return Number(expectedDepth) > (Number(storedDepth) || 0) ? { search: true, ms, reason: 'deeper expected' } : { search: false, ms, reason: 'not deeper' };
+  };
+  // The depth a main search is expected to complete within ms: for each recent search (samples = [[[depth, ms], ...], ...],
+  // the time each depth was completed at), the deepest depth done by ms; the median over the searches. null = no samples.
+  CV.expectedDepth = function (samples, ms) {
+    const list = (Array.isArray(samples) ? samples : []).filter((s) => Array.isArray(s) && s.length);
+    if (!list.length) return null;
+    const reach = list.map((s) => s.reduce((d, [depth, t]) => (t <= ms && depth > d ? depth : d), 0)).sort((a, b) => a - b);
+    const n = reach.length;
+    return n % 2 ? reach[(n - 1) / 2] : (reach[n / 2 - 1] + reach[n / 2]) / 2;
+  };
 
   // ---- 2.0.0: AggroChess `late` with the move's reply search almost done (pure; background.js) ----
   // meta = { startedAt, ms } of the running reply search, mainBudgetMs = the think budget a normal search would get.

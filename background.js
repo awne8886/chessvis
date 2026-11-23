@@ -236,7 +236,7 @@ function sfInfo(line) {
   if (!job) return;
   const p = CV.sfParseInfo(line);
   if (!p || p.bound) return;                                     // lowerbound / upperbound lines are not exact
-  if (p.mpv === 1) { job.depthDone = p.depth; job.pv = CV.sfParsePv(line); job.pvDepth = p.depth; }
+  if (p.mpv === 1) { job.depthDone = p.depth; job.pv = CV.sfParsePv(line); job.pvDepth = p.depth; (job.depthAt || (job.depthAt = [])).push([p.depth, Date.now() - job.startedAt]); }
   if (job.multipv >= 2) job.lines.set(p.mpv, { uci: p.uci, depth: p.depth, cp: p.cp, mate: p.mate });
   if (job.mode === 'delay') sfCheckStop(job);
 }
@@ -269,7 +269,8 @@ function sfBestMove(line) {
   }
   sfCurrent = null;
   sfClearTimers(job);
-  if (job) sfLast = { mode: job.mode + (job.extended ? ' (clock, extended)' : ''), depthDone: job.depthDone || 0, softMs: job.softMs, hardMs: job.hardMs, elapsedMs: Date.now() - job.startedAt, superseded: !!sfNext };
+  if (job) sfLast = { mode: job.mode + (job.extended ? ' (clock, extended)' : ''), depthDone: job.depthDone || 0, softMs: job.softMs, hardMs: job.hardMs, elapsedMs: Date.now() - job.startedAt, superseded: !!sfNext, topUp: !!job.topUp };
+  if (job && job.mode === 'delay' && job.depthAt && job.depthAt.length) { sfDepthSamples.push(job.depthAt); if (sfDepthSamples.length > 8) sfDepthSamples.shift(); }   // 2.0.2: CV.expectedDepth
   if (sfNext) {
     const n = sfNext;
     sfNext = null;
@@ -287,6 +288,7 @@ async function analyzeStockfish(fen, depth, imperfection, maxMs, startFen, moves
   try { return await analyzeStockfishNow(fen, depth, imperfection, maxMs, startFen, moves, msg || {}); } finally { aggroThinking--; ponderTopUp(); }
 }
 async function analyzeStockfishNow(fen, depth, imperfection, maxMs, startFen, moves, msg) {
+  const t0 = Date.now();
   try { await sfReady; } catch (e) { return { error: 'Stockfish: could not start (' + ((e && e.message) || e) + ')' }; }
   // 1) a reply already found while pondering wins; anything else stops the ponder workers at once (stop + isready, never waited for)
   if (!msg.ponder) { if (ponderKind === 'sf') ponderCancel(); }
@@ -306,7 +308,18 @@ async function analyzeStockfishNow(fen, depth, imperfection, maxMs, startFen, mo
         if (res && res.best && res.best !== '(none)' && res.key === opp && res.depth > (e.depth || 0)) { e = { uci: res.best, depth: res.depth }; ponderDbg.harvestUpgrades++; }
       }
       noteHitDepth(e.depth);
-      return { uci: e.uci, best: e.uci, depth: e.depth, ponderHit: true };
+      const res = { uci: e.uci, best: e.uci, depth: e.depth, ponderHit: true };
+      // 2.0.2 (C2): search on through the pause the page waits anyway when the main worker should get deeper
+      const left = hitLeftMs(msg, t0);
+      const plan = left > 0 ? CV.hitTopUp({ engine: 'sf', storedDepth: e.depth, hitSoftMs: left, expectedDepth: CV.expectedDepth(sfDepthSamples, left) }) : null;
+      if (plan && plan.search) {
+        res.topUp = startHitTopUp('sf', e, plan.ms, async () => {
+          const r = await sfHitSearch(fen, startFen, moves, plan.ms);
+          if (r && r.uci && r.pv && r.pv[0] === r.uci && r.depth > (e.depth || 0)) lastMainPv = { startFen, moves: moves.slice(), pv: r.pv.slice(), depth: r.pvDepth, ponder: r.ponder };
+          return r ? { uci: r.uci, best: r.uci, depth: r.depth } : null;
+        });
+      }
+      return res;
     }
     if (d.decision === 'late' && d.running && ponderKind === 'sf') {          // a worker is on exactly this move: take what it has if it is deep enough
       const opp = moves[moves.length - 1], w = ponderActive.find((x) => x.kind === 'sf' && x.task && x.task.key === opp), tp = w && w.task.promise;
@@ -354,6 +367,53 @@ async function analyzeStockfishNow(fen, depth, imperfection, maxMs, startFen, mo
     lastMainPv = pv ? { startFen, moves: moves.slice(), pv: pv.slice(), depth: res.pv && res.pv[0] === res.uci ? res.pvDepth : 0, ponder: res.ponder } : null;
   } else if (res) lastMainPv = null;
   return res ? { uci: res.uci, best: res.best, imperfect: res.imperfect, depth: res.depth } : res;
+}
+
+// ======================= Ponder-hit top-up (2.0.2, C2) =======================
+// On a ponder hit the page waits a human-like pause anyway (it drew it up front and sent hitSoftMs). When CV.hitTopUp
+// says the main worker can get deeper than the prepared reply within that time, the hit is answered at once with the
+// prepared move (provisional: the cursor aims at it) plus { topUp: { id, ms } }, and the main worker searches the same
+// position meanwhile. The page asks for the final move ({ type: 'hitTopUp', id }) before it clicks: the deeper of the
+// two (Stockfish: a deeper completed depth; AggroChess: at least the stored depth). Stockfish runs a delay-mode search
+// (soft = hard = ms), AggroChess think(ms). While it runs no spare ponder worker is made (aggroThinking), as for any real search.
+const hitJobs = new Map();
+let hitSeq = 0;
+const sfDepthSamples = [];      // [[depth, ms], ...] per recent delay-mode main search (CV.expectedDepth)
+const hitLeftMs = (msg, t0) => Math.max(0, Math.min(AGGRO_HARD_MAX_MS, Math.round(Number(msg.hitSoftMs) || 0)) - (Date.now() - t0));
+function startHitTopUp(engine, stored, ms, run) {
+  const id = ++hitSeq;
+  ponderDbg.topUps++;
+  aggroThinking++;
+  const p = (async () => {
+    let r = null;
+    try { r = await run(); } catch (e) { r = null; }
+    const d0 = stored.depth || 0;
+    const deeper = !!(r && r.uci && r.uci !== '(none)' && (engine === 'aggro' ? (r.depth || 0) >= d0 : (r.depth || 0) > d0));
+    const out = deeper ? { ...r, before: d0, changed: r.uci !== stored.uci, used: true }
+      : { uci: stored.uci, best: stored.uci, san: stored.san, sacrifice: stored.sacrifice, depth: d0, before: d0, changed: false, used: false };
+    if (deeper) ponderDbg.topUpUsed++;
+    if (out.changed) ponderDbg.hitChanged++;
+    ponderDbg.topUpDepths.push([d0, out.depth || 0, r ? r.depth || 0 : null]);
+    if (ponderDbg.topUpDepths.length > 20) ponderDbg.topUpDepths.shift();
+    return out;
+  })().finally(() => { aggroThinking--; ponderTopUp(); });
+  hitJobs.set(id, p);
+  while (hitJobs.size > 8) hitJobs.delete(hitJobs.keys().next().value);
+  return { id, ms };
+}
+// The final move of a top-up (null when unknown); resolves when its search has ended.
+function hitFinal(id) {
+  const p = hitJobs.get(Number(id));
+  hitJobs.delete(Number(id));
+  return p || Promise.resolve(null);
+}
+// A delay-mode search of exactly ms on the main Stockfish worker (no minimum depth); resolves like analyzeStockfishNow's job.
+function sfHitSearch(fen, startFen, moves, ms) {
+  return new Promise((resolve) => {
+    const job = { fen, resolve, startFen, moves, depth: 1, maxMs: 0, imperfection: 0, multipv: 1, lines: new Map(), mode: 'delay', clockGo: null,
+      softMs: ms, hardMs: ms, depthDone: 0, pv: [], pvDepth: 0, topUp: true };
+    if (sfCurrent) { if (sfNext) sfNext.resolve(null); sfNext = job; sf.postMessage('stop'); } else sfStart(job);
+  });
 }
 
 // ======================= Icon download (brilliant layer c) =======================
@@ -565,7 +625,10 @@ const aggroRunning = new Map();
 const ponderDbg = { lastPasses: 0, hitDepths: [], harvestUpgrades: 0, lateWaits: 0, lateWaitHits: 0,
   // 2.0.2 (C1): AggroChess ponder workers created / recycled with their hash / terminated (busy); ponder jobs; workers a
   // job got that were still starting (cold); jobs whose first worker had searched the line that was played (warm line)
-  aggroSpawns: 0, aggroRecycled: 0, aggroKilled: 0, jobs: 0, claimCold: 0, claimWarmLine: 0 };
+  aggroSpawns: 0, aggroRecycled: 0, aggroKilled: 0, jobs: 0, claimCold: 0, claimWarmLine: 0,
+  // 2.0.2 (C2): ponder-hit top-ups started / whose result was deeper and used / that changed the move; the last 20 as
+  // [depth of the prepared reply, depth played, depth the top-up reached]
+  topUps: 0, topUpUsed: 0, hitChanged: 0, topUpDepths: [] };
 const noteHitDepth = (d) => { ponderDbg.hitDepths.push(d || 0); if (ponderDbg.hitDepths.length > 20) ponderDbg.hitDepths.shift(); };
 
 // The job's ceiling (ms): the *PonderMs budget (1.8.0), or with ponderUntilMove (2.0.0) max(budget, ponderMaxMs): the job
@@ -877,6 +940,7 @@ async function analyzeAggro(msg) {
   try { return await analyzeAggroNow(msg); } finally { aggroThinking--; ponderTopUp(); }
 }
 async function analyzeAggroNow(msg) {
+  const t0 = Date.now();
   try {
     // 1) an answer already found while pondering wins; anything else stops the ponder worker at once
     const hist = typeof msg.startFen === 'string' && Array.isArray(msg.moves);
@@ -887,7 +951,22 @@ async function analyzeAggroNow(msg) {
     if (!msg.ponder) ponderCancel();
     else {
       const d = ponder.decide(hist ? msg.startFen : null, hist ? msg.moves : null);
-      if (d.decision === 'hit') { ponderStop(); const e = d.result; noteHitDepth(e.depth); return { uci: e.uci, best: e.uci, san: e.san, sacrifice: e.sacrifice, depth: e.depth, ponderHit: true }; }
+      if (d.decision === 'hit') {
+        ponderStop(); const e = d.result; noteHitDepth(e.depth);
+        const res = { uci: e.uci, best: e.uci, san: e.san, sacrifice: e.sacrifice, depth: e.depth, ponderHit: true };
+        // 2.0.2 (C2): think(pause) on the main worker when the pause is at least the slice the reply was searched with
+        const left = hitLeftMs(msg, t0);
+        const plan = left > 0 ? CV.hitTopUp({ engine: 'aggro', storedDepth: e.depth, storedMs: e.ms, hitSoftMs: left }) : null;
+        if (plan && plan.search) {
+          res.topUp = startHitTopUp('aggro', e, plan.ms, async () => {
+            const h = aggroGet();
+            await h.ready;
+            const r = await h.request({ type: 'think', ...aggroPosition(msg), ms: plan.ms }, plan.ms * AGGRO_THINK_FACTOR + AGGRO_THINK_MARGIN_MS);
+            return aggroResult(r);
+          });
+        }
+        return res;
+      }
       // 2.0.0 `late`: a ponder worker is on exactly this move and almost done. Wait for it (bounded) instead of thinking from
       // scratch; the other ponder workers are killed at once. This is the only case where a real search waits for pondering.
       const opp = hist ? msg.moves[msg.moves.length - 1] : null;
@@ -1199,9 +1278,11 @@ api.runtime.onMessage.addListener((msg) => {
   if (msg && msg.type === 'clearEngines') { clearEngines(); return Promise.resolve({ ok: true }); }
   if (msg && msg.type === 'aggroInvalidate') { ponderWanted = false; ponderCancel(); return Promise.resolve({ ok: true }); }   // also frees the spares
   if (msg && msg.type === 'aggroIdle') return Promise.resolve(aggroIdle(msg));
+  if (msg && msg.type === 'hitTopUp') return hitFinal(msg.id);
   if (msg && msg.type === 'aggroIdleStatus') return Promise.resolve({ pondering: idleInfo.pondering, evalLine: idleInfo.evalLine, found: ponder.found() });
   if (msg && msg.type === 'aggroDebug') {
     return Promise.resolve({ ponder: { ...ponder.counters, passes: ponderDbg.lastPasses, hitDepths: ponderDbg.hitDepths.slice(), harvestUpgrades: ponderDbg.harvestUpgrades, lateWaits: ponderDbg.lateWaits, lateWaitHits: ponderDbg.lateWaitHits,
+      hitTopUp: { started: ponderDbg.topUps, used: ponderDbg.topUpUsed, changed: ponderDbg.hitChanged, depths: ponderDbg.topUpDepths.slice() },
       aggroWorkers: { jobs: ponderDbg.jobs, spawns: ponderDbg.aggroSpawns, respawnsPerMove: ponderDbg.jobs ? +(ponderDbg.aggroSpawns / ponderDbg.jobs).toFixed(2) : null, recycled: ponderDbg.aggroRecycled, killed: ponderDbg.aggroKilled, coldClaims: ponderDbg.claimCold, warmLineFirst: ponderDbg.claimWarmLine, recycle: !!CV.AGGRO_PONDER_RECYCLE } },
       verify: { checks: aggroDbg.verifyChecks, warnings: aggroDbg.verifyWarnings, last: aggroDbg.lastVerify },
       aggroWorkerAlive: !!(aggroMain && !aggroMain.dead), aggroRestarts: aggroDbg.restarts, aggroFailure: aggroFailure ? aggroFailure.message : null,

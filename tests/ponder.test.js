@@ -163,4 +163,29 @@ test('lateWaitMs: wait only when the search ends within min(400, half the main b
   assert.strictEqual(CV.lateWaitMs({ startedAt: 0 }, 0, 1000), null);
 });
 
+test('2.0.2 C2: CV.hitTopUp decides when the main worker can deepen a ponder hit', () => {
+  // Stockfish: by the expected depth of the recent main searches
+  assert.strictEqual(CV.hitTopUp({ engine: 'sf', storedDepth: 10, hitSoftMs: 180, expectedDepth: 14 }).search, true);
+  assert.strictEqual(CV.hitTopUp({ engine: 'sf', storedDepth: 16, hitSoftMs: 180, expectedDepth: 14 }).search, false);
+  assert.strictEqual(CV.hitTopUp({ engine: 'sf', storedDepth: 14, hitSoftMs: 180, expectedDepth: 14 }).search, false);
+  assert.strictEqual(CV.hitTopUp({ engine: 'sf', storedDepth: 10, hitSoftMs: 180, expectedDepth: null }).search, true, 'no model yet: try');
+  assert.strictEqual(CV.hitTopUp({ engine: 'sf', storedDepth: 4, hitSoftMs: 20, expectedDepth: 30 }).search, false, 'too short');
+  // AggroChess: by the slice the stored reply was searched with
+  assert.strictEqual(CV.hitTopUp({ engine: 'aggro', storedMs: 250, hitSoftMs: 200 }).search, false);
+  assert.strictEqual(CV.hitTopUp({ engine: 'aggro', storedMs: 250, hitSoftMs: 250 }).search, true);
+  assert.strictEqual(CV.hitTopUp({ engine: 'aggro', storedMs: 0, hitSoftMs: 120 }).search, true);
+  assert.strictEqual(CV.hitTopUp({ engine: 'aggro', storedMs: 120, hitSoftMs: undefined }).search, false);
+  assert.strictEqual(CV.hitTopUp({ engine: 'sf', storedDepth: 8, hitSoftMs: 99.6, expectedDepth: 12 }).ms, 100);
+});
+
+test('2.0.2 C2: CV.expectedDepth = median over recent searches of the deepest depth done by ms', () => {
+  const a = [[8, 5], [10, 16], [12, 60], [14, 150], [16, 400]], b = [[8, 8], [10, 30], [12, 120], [14, 300]], c = [[10, 10], [13, 90]];
+  assert.strictEqual(CV.expectedDepth([], 100), null);
+  assert.strictEqual(CV.expectedDepth(null, 100), null);
+  assert.strictEqual(CV.expectedDepth([a], 100), 12);
+  assert.strictEqual(CV.expectedDepth([a, b, c], 100), 12);      // reached 12, 10, 13: median 12
+  assert.strictEqual(CV.expectedDepth([a, b], 150), 13);         // 14 and 12
+  assert.strictEqual(CV.expectedDepth([a], 1), 0);
+});
+
 run();
