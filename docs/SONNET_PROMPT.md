@@ -1,5 +1,7 @@
 # Task: ChessVision 1.9.0 — speed and engine-strength improvements
 
+> **Status:** implemented and released as **2.0.0** (the owner chose 2.0.0 instead of 1.9.0). What was done, measured and left open is in `chessvision-project-summary.md` and the 2.0.0 changelog in `docs/REFERENCE.md`.
+
 You are working on **ChessVision**, a Firefox (Manifest V2) extension in this repository that plays chess against chess.com **bots** with local WebAssembly engines (Stockfish 19 lite and AggroChess 4.6.1). Your job is to implement the improvements below, in the order given, with tests, documentation and a version bump to **1.9.0**.
 
 Work carefully and verify as you go. Do not guess about code you have not read: read each function before you change it.
