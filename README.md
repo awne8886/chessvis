@@ -1,10 +1,10 @@
 # ChessVision
 
-ChessVision is a Firefox extension (Manifest V2, version 1.8.0) that plays chess against the **computer bots** on chess.com by itself. It reads the board from the page, asks a chess engine that runs locally inside the extension for a move, and plays that move with synthetic pointer events. No server is involved: both engines are WebAssembly binaries that ship in `engine/`.
+ChessVision is a Firefox extension (Manifest V2, version 2.0.0) that plays chess against the **computer bots** on chess.com by itself. It reads the board from the page, asks a chess engine that runs locally inside the extension for a move, and plays that move with synthetic pointer events. No server is involved: both engines are WebAssembly binaries that ship in `engine/`.
 
 > **Scope.** ChessVision only acts on pages listed in [`allowed-pages.txt`](allowed-pages.txt) and is meant for bot games. Do not use it against people, in rated play, or anywhere engine help is not allowed.
 
-This README explains **how the extension is built and why**: every file, the path a move takes from the board to the engine and back, and the tricks that make it fast. The complete settings table, troubleshooting guide and changelog are in [`docs/REFERENCE.md`](docs/REFERENCE.md) (the README that shipped in the 1.8.0 zip).
+This README explains **how the extension is built and why**: every file, the path a move takes from the board to the engine and back, and the tricks that make it fast. The complete settings table, troubleshooting guide and changelog are in [`docs/REFERENCE.md`](docs/REFERENCE.md) (the README that shipped in the 1.8.0 zip, updated for 2.0.0).
 
 ---
 
@@ -73,15 +73,15 @@ Communication is **pull-based**: the tab asks (`runtime.sendMessage`), the backg
 
 What happens between "the opponent moved" and "our piece lands", with the file and function responsible:
 
-1. **Mutation seen** — `content.js › attach()` installs a `MutationObserver` on the board element (child list + `class` attributes). Every change calls `schedule(250)`: a debounce, so a burst of DOM changes during chess.com's animation leads to one board read. A **watchdog** (`startWatchdog`, default every 1000 ms) calls the same `check()` in case a mutation was missed.
+1. **Mutation seen** — `content.js › attach()` installs a `MutationObserver` on the board element (child list + `class` attributes). Every change calls `scheduleStable(boardDebounceMs)` (default 80 ms): after the debounce the board is read twice, one animation frame + 20 ms apart, and `check()` runs only when both reads agree (`boardstate.js › signature`), so a half-updated board never reaches the tracker. A **watchdog** (`startWatchdog`, default every 1000 ms) calls `check()` directly in case a mutation was missed.
 2. **Board read** — `readPosition()` collects every `.piece` element (`wp`, `bk`, … classes and `square-XY`) into an 8×8 grid plus the highlighted last-move squares. `boardstate.js › buildPosition` turns that into a placement, side to move (from which colour moved onto the highlighted square), castling rights and en-passant square.
 3. **Tracking** — `boardstate.js › createTracker().observe()` compares the new placement with the last known one and finds the legal move (or two) that explains it. It keeps the full **move history from the start position**, which is why the engines get `position fen <start> moves …` instead of a bare FEN: they then see threefold repetition and the 50-move counter. It also detects takebacks and new games.
 4. **Our turn?** — `check()`: if it is the opponent's turn, `idleWork()` starts pondering (see below) and the status shows `WFO`. If it is our turn and this position was not handled yet, `play(pos)` runs.
 5. **Quick-reply shortcut** — `humanize.js › likelyObvious()` asks whether any legal move could be an "obvious" one (only move, recapture, promotion, mate in one). If yes, the engine is first asked a **cheap** question (Stockfish depth ≤ 8, AggroChess `quickThinkMs`). If its answer really is one of those categories, it is played with the short "quick" delay. A forced move (one legal move) is played without asking any engine.
-6. **Engine request** — `askEngine()` sends `{type:'analyze', startFen, moves, depth | ms | soft/hard, ponder, …}` to the background. `background.js › analyzeStockfish / analyzeAggro` first checks the **ponder table**: if a reply for exactly this position was prepared while the opponent was thinking, it is returned at once (`ponderHit`). Otherwise the main worker searches.
-7. **Human-like pause** — `humanize.js › delayFor()` draws a delay (log-normal between `minDelay` and `maxDelay`, with rare "hesitations"). The engine time already spent counts toward it, so the real wait is `max(delay, engine time)`, never the sum.
+6. **Engine request** — for a normal move the human-like delay is drawn first (step 7), then `askEngine()` sends `{type:'analyze', startFen, moves, depth | ms | soft/hard, ponder, …}` to the background. `background.js › analyzeStockfish / analyzeAggro` first checks the **ponder table**: if a reply for exactly this position was prepared while the opponent was thinking, it is returned at once (`ponderHit`). Otherwise the main worker searches. In the default `sfSearchMode: 'delay'` the message carries `softMs` (the delay minus 40 ms minus the time already spent) and Stockfish searches until that is used and Search depth is complete (`CV.sfShouldStop`); AggroChess thinks `max(Think time, softMs)`. As soon as the move is known, the **ponder job for the opponent's turn starts** (early ponder).
+7. **Human-like pause** — `humanize.js › delayFor()` draws a delay (log-normal between `minDelay` and `maxDelay`, with rare "hesitations"; the quick range for quick replies and, with `ponderHitFast`, for ponder hits). The engine time already spent counts toward it, so the real wait is `max(delay, engine time)`, never the sum. With the curved cursor, the glide to the from-square (`aimMove`) runs **during** the pause.
 8. **Re-check** — just before moving, the board is read again; if the position changed (opponent took back, game ended) the move is dropped.
-9. **Input** — `executeMove()` glides the cursor along a Bézier path (`humanize.js › buildPath`), clicks the from-square, then the to-square (or drags), and picks the promotion piece if needed. Events are dispatched on the element under the point **skipping the panel**, so a panel dragged over the board can never swallow a move.
+9. **Input** — `finishMove()` (or `executeMove()` = `aimMove` + `finishMove` without a pause) glides the cursor along a Bézier path (`humanize.js › buildPath`), clicks the from-square, then the to-square (or drags), and picks the promotion piece if needed. Events are dispatched on the element under the point **skipping the panel**, so a panel dragged over the board can never swallow a move.
 10. **Confirmation** — 1.8 s later the board is read again. If our move did not register, the attempt is repeated (up to 3 times), switching from drag to click if a drag failed.
 
 ---
@@ -146,9 +146,11 @@ Classic pondering guesses **one** opponent move and searches it. Measured in thi
 * **Tokens.** Every ponder job carries `idleToken`; every async step re-checks it, so results of an outdated job can never leak into the next position. A new game bumps `ponderGen`, and recycled Stockfish workers send `ucinewgame` before their next job.
 * **Hidden tab** → pondering stops (`visibilitychange`), to save battery.
 
-### When pondering starts today
+### When pondering starts (2.0.0)
 
-Pondering starts when the page **observes** that it is the opponent's turn: after our human-like delay, after the cursor movement and clicks, after chess.com has shown the move, and after the 250 ms debounce. With default human-like settings that is roughly 1-2 s after the engine already knew which move we would play. Starting the ponder job at the moment our move is **decided** is the single biggest improvement available; see [below](#where-the-time-actually-goes-and-what-could-be-faster).
+With `earlyPonder` (default on) the ponder job for the position after our move starts **the moment `play()` knows the move**, before the human-like pause, the cursor, chess.com's animation and the next board read. The idle key is the move history (`CV.ponderKey`), so when the page later observes the opponent's turn it recognises the running job and only polls it. If the move is dropped or does not register, the next check computes another key and restarts the job, and `ponder.decide()` answers `miss` for any position that does not extend the pondered one. In the jsdom smoke run the job began on average ~1.15 s before the opponent's move instead of ~0.5 s (`ponder.avgLeadMs` in Copy debug info).
+
+With `ponderUntilMove` (default on) the job no longer stops at the ponder time: after the first pass over the likely opponent moves it **deepens** the most likely ones (`CV.ponderDeepenPlan`, top `max(2, 2 x workers)` moves, slices doubling up to 4 s, on the worker that searched each move before) until the opponent moves or `ponderMaxMs` (8 s). The Stockfish main search's principal variation seeds the table (`CV.pvSeed`): if the opponent plays the expected reply, the answer is ready at zero cost.
 
 ---
 
@@ -213,7 +215,7 @@ AggroChess uses this by default (`aggroUseClock`). For Stockfish it is an option
 | `overlay.js` | The on-page panel in a Shadow DOM (chess.com's CSS cannot touch it). Draggable, collapsible, every setting. |
 | `settings.js` | Defaults, limits, validation (`sanitize`), import/export, and pure helpers shared with the background: UCI command builders, ponder state, ranking, thread-count and SAB checks, allowlist matching. |
 | `chessmini.js` | A small legal-move generator: FEN parsing, legal moves, make-move, check/mate. Used for tracking, quick replies, verification and PGN, never to choose moves. |
-| `boardstate.js` | Grid → FEN, highlight analysis, castling rights, and the history tracker. |
+| `boardstate.js` | Grid → FEN, highlight analysis, castling rights, the history tracker, and the board signature for the stable read. |
 | `humanize.js` | Quick-reply classification, delays, cursor paths, input choice. |
 | `clock.js` | Clock parsing and search budgets. |
 | `recorder.js` / `pgn.js` | Game reconstruction and PGN / SAN output, sacrifice counting, saved-game list rules. |
@@ -229,7 +231,8 @@ AggroChess uses this by default (`aggroUseClock`). For Stockfish it is an option
 | `engine/NOTICE.txt` | Third-party sources and licences. |
 | `chessvision-project-summary.md` | Hand-over notes between development sessions: what was done, what was measured, what is unverified. |
 | `docs/REFERENCE.md` | The full user manual: every setting with key / range / default, troubleshooting, changelog. |
-| `docs/SONNET_PROMPT.md` | The planned 1.9.0 speed / strength improvements, written as an implementation task. |
+| `docs/SONNET_PROMPT.md` | The speed / strength improvements, written as an implementation task (planned as 1.9.0, released as 2.0.0). |
+| `tests/` | Plain Node tests (`*.test.js`), the fake-worker background harness (`_fakebg.js`) and the delay-mode benchmark (`bench-delay-mode.js`). |
 
 ---
 
@@ -254,25 +257,19 @@ A phone is typically several times slower than these figures. None of this has b
 
 ## Where the time actually goes, and what could be faster
 
-With the default settings (Stockfish depth 10, human-like play on), the time from "opponent moved" to "our piece lands" is roughly:
+With the default settings (Stockfish, Search depth 10 as a minimum, human-like play on), the time from "opponent moved" to "our piece lands" in 2.0.0 is roughly:
 
-| Stage | Typical time |
-| --- | --- |
-| Debounce before the board is read | 250 ms after the last DOM change |
-| Engine (Stockfish depth 10) | 2-25 ms (0 on a ponder hit) |
-| Human-like delay | 300-800 ms (80-300 ms for quick replies) |
-| Cursor glide + two clicks | ~0.5-1.5 s |
+| Stage | 1.8.0 | 2.0.0 |
+| --- | --- | --- |
+| Debounce before the board is read | 250 ms | 80 ms + one frame + 20 ms (stable read) |
+| Engine | 2-25 ms at depth 10, then idle | searches **through** the pause: depth ~14-18 in Node (0 on a ponder hit) |
+| Human-like delay | 300-800 ms (80-300 for quick replies) | the same; 80-300 ms on a ponder hit (`ponderHitFast`) |
+| Cursor glide + two clicks | ~0.5-1.5 s after the pause | the glide to the from-square runs during the pause (160-520 ms saved) |
+| Pondering starts | ~1-2 s after the move was decided | when the move is decided, and runs until the opponent moves |
 
-So with Stockfish the **engine is almost never the bottleneck**: the debounce, the pause and the cursor are. That points to the most useful improvements:
+Measured (`tests/bench-delay-mode.js`, real Stockfish loader in Node, 10 middlegame positions): `go depth 10` reaches depth 10 in 16 ms (median); a delay-matched search with a 300 ms pause reaches depth 15.8 on average, with 800 ms depth 18.1. The table is in [`docs/REFERENCE.md`](docs/REFERENCE.md#changelog).
 
-* **Start pondering when our move is decided**, not when the board shows it (≈1-2 s more pondering per move).
-* **Read the opponent's move sooner** (a shorter, "stable read" debounce instead of a flat 250 ms).
-* **Use the human-like pause as free engine time**: the bot waits 300-800 ms anyway; a time-based search inside that pause reaches depth ~14 instead of 10 at no cost in speed.
-* **Move the cursor during the pause** instead of after it.
-* **Seed the ponder table from the main search's principal variation** (its second and third moves are a ready-made prediction and reply).
-* **Keep pondering until the opponent moves** and deepen the most likely replies instead of stopping at a fixed budget.
-
-The full list, with risks, settings and an exact implementation plan, is in [`docs/SONNET_PROMPT.md`](docs/SONNET_PROMPT.md) (written as a task description for an implementation session).
+What is left: everything above was measured in Node and in a jsdom mock of the page, not in Firefox or on chess.com (see `chessvision-project-summary.md` for the list of real-browser checks). The watchdog still reads the board directly; a stable read for it too is an open point. [`docs/SONNET_PROMPT.md`](docs/SONNET_PROMPT.md) is the task description these changes were implemented from (written for "1.9.0", released as 2.0.0).
 
 ---
 
@@ -282,7 +279,7 @@ The full list, with risks, settings and an exact implementation plan, is in [`do
 
 * Keep the separation: DOM code only in `content.js` / `overlay.js`, logic in the pure modules.
 * No new dependencies, no build step. Manifest changes only for the version, new content scripts, or an explicitly approved permission.
-* Tests run with plain `node tests/*.test.js`. **Note:** the 1.8.0 zip does not contain the `tests/` folder or `.github/` that the hand-over notes mention.
+* Tests run with plain Node: `for t in tests/*.test.js; do node "$t" || exit 1; done`. The 1.8.0 zip did not contain the `tests/` folder or `.github/` its notes mention; `tests/` was recreated in 2.0.0 (see `docs/REFERENCE.md › Development`).
 * Keep `docs/REFERENCE.md` (settings + changelog), the tests and `chessvision-project-summary.md` in sync with every change.
 * Mark anything that depends on the real chess.com site as unverified until it has been checked.
 

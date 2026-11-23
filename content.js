@@ -6,7 +6,7 @@
   window.__chessvisionLoaded = true;
 
   const DEBUG = true;
-  const FALLBACK_VERSION = '1.8.0';
+  const FALLBACK_VERSION = '2.0.0';
   const VERSION = (() => { try { return api.runtime.getManifest().version || FALLBACK_VERSION; } catch (e) { return FALLBACK_VERSION; } })();
   const log = (...a) => DEBUG && console.log('[ChessVision]', ...a);
   const { FILES } = CV.chess;
@@ -23,11 +23,14 @@
   const ATTEMPTS_MAX = 3;          // retries if a move does not register
   const RETRY_AFTER_MS = 1800;     // how long to wait before deciding a move did not register
   const BUSY_TIMEOUT_MS = 45000;   // a move attempt stuck longer than this is abandoned
+  const STABLE_GAP_MS = 20;        // stable read: second board read one animation frame + this long after the first
+  const UNSTABLE_MAX = 10;         // after this many unstable reads in a row, check() runs anyway (the watchdog would too)
 
   let cfg = { ...CV.DEFAULTS };
   let board = null, observer = null, debounceTimer = null, watchdogTimer = null;
   let busy = false, busySince = 0, playToken = 0, recheckPending = false;
   let lastHandledKey = null, attempts = 0;
+  let unstableReads = 0, unstableRun = 0, stableSeq = 0;   // stable-read debounce (2.0.0): total / in a row / cancels an outdated check
   let rights = BS.freshRights();
   const tracker = BS.createTracker();            // the one game-tracking mechanism (history, new game, takeback)
   const rec = CV.createRecorder();               // records every ply the tracker reports
@@ -143,9 +146,11 @@
     }
   }
 
-  function buildFen() {
+  // obs: the observation check() already made (observeBoard's result), so one check() reads the board once. Without it
+  // (the re-check in play(), the retry timer, debug info) the board is read fresh.
+  function buildFen(obs) {
     if (!board) return null;
-    const obs = isAllowedPage() ? observeBoard() : null;
+    if (obs === undefined) obs = isAllowedPage() ? observeBoard() : null;
     let st = obs && obs.st, p = obs && obs.p;
     if (!obs) {
       st = readBoardState();
@@ -157,6 +162,13 @@
     const myColor = board.classList.contains('flipped') ? 'b' : 'w';
     const fen = BS.assembleFen({ placement: p.placement, turn: p.turn, castle: p.castle, ep: p.ep, halfmove: info ? info.halfmove : 0, fullmove: info ? info.fullmove : 1 });
     return { fen, turn: p.turn, myColor, count: st.count, lastTo: p.lastTo };
+  }
+
+  // Pieces + highlights as one string (BS.signature); '' without a board.
+  function boardSignature() {
+    if (!board) return '';
+    const p = readPosition();
+    return BS.signature(p.grid, p.highlights);
   }
 
   // startFen + moves for an engine, only when the tracked history ends exactly at this position; else null.
@@ -218,6 +230,7 @@
       const r = board.getBoundingClientRect();
       mouse = { x: Math.min(innerWidth - 5, Math.max(5, r.left + rand(0.1, 0.9) * r.width)), y: Math.min(innerHeight - 5, r.bottom + rand(20, 120)) };
     }
+    if (mouse.x === x && mouse.y === y) return;                  // already there (aimMove glided during the pause): no empty path
     const smooth = hum() && cfg.mouseMove;
     const path = CV.human.buildPath(mouse.x, mouse.y, x, y, smooth ? { speed: fast ? 2.2 : 1 } : { linear: true, steps: linearSteps });
     for (const p of path) { moveTo(p.x, p.y, buttons); await sleep(p.dt); }
@@ -250,10 +263,23 @@
     await releaseAt(b.x, b.y, false);
   }
 
-  async function executeMove(uci, color) {
+  // The click points of a move, computed once (off-centre points are random, so aim and finish must use the same ones).
+  function movePoints(uci) {
     const f1 = FILES.indexOf(uci[0]) + 1, r1 = +uci[1];
     const f2 = FILES.indexOf(uci[2]) + 1, r2 = +uci[3];
-    const from = squarePoint(f1, r1), to = squarePoint(f2, r2);
+    return { from: squarePoint(f1, r1), to: squarePoint(f2, r2) };
+  }
+
+  // 2.0.0: the cursor glides to the from-square while the human-like pause runs (play() does both at once), then
+  // finishMove presses / clicks / drags from there. Returns the points for finishMove.
+  async function aimMove(uci) {
+    const pts = movePoints(uci);
+    await glideTo(pts.from.x, pts.from.y);
+    return pts;
+  }
+
+  async function finishMove(pts, uci, color) {
+    const { from, to } = pts;
     let mode = CV.human.pickInput(cfg);
     if (mode === 'drag' && dragDisabled) mode = 'click';   // drag did not register earlier
     lastMode = mode;
@@ -279,6 +305,11 @@
     }
   }
 
+  // Aim + finish in one go (the path without a concurrent pause).
+  async function executeMove(uci, color) {
+    await finishMove(await aimMove(uci), uci, color);
+  }
+
   // ---------- Engine ----------
   // CANDIDATE selectors for chess.com's clocks / player names. Untested against the real site; each reader
   // returns null when nothing matches or parses and never throws.
@@ -287,8 +318,9 @@
   const NAME_SELECTORS = ['.player-component .user-username-component', '[data-test-element="user-tagline-username"]', '.user-tagline-username', '[class*="user-username"]'];
   const clsOf = (el) => String((el.className && el.className.baseVal !== undefined ? el.className.baseVal : el.className) || '').toLowerCase();
 
-  // My clock in ms (+ increment if the page shows one), or null.
-  function readMyClock(myColor) {
+  // A clock in ms (+ increment if the page shows one), or null. which = 'me' (my colour's clock, else the bottom one) or
+  // 'opp' (2.0.0: the other colour's clock, else the top one). CANDIDATE selectors, unverified on the real site.
+  function readClock(myColor, which) {
     try {
       const seen = new Set(), cands = [];
       for (const sel of CLOCK_SELECTORS) {
@@ -299,11 +331,12 @@
           if (ms !== null) cands.push({ ms, cls: clsOf(el) });
         }
       }
-      const mine = myColor === 'w' ? 'white' : 'black', other = myColor === 'w' ? 'black' : 'white';
-      // my colour's clock first (works with a flipped board), else the clock at the bottom, which is mine
-      const pick = cands.find((c) => c.cls.includes('clock-' + mine)) ||
-                   cands.find((c) => c.cls.includes(mine) && !c.cls.includes(other)) ||
-                   cands.find((c) => /(^|[\s-])bottom($|[\s-])/.test(c.cls));
+      const mineC = myColor === 'w' ? 'white' : 'black', otherC = myColor === 'w' ? 'black' : 'white';
+      const [want, avoid, side] = which === 'opp' ? [otherC, mineC, 'top'] : [mineC, otherC, 'bottom'];
+      // that colour's clock first (works with a flipped board), else the clock at the bottom (mine) / top (the opponent's)
+      const pick = cands.find((c) => c.cls.includes('clock-' + want)) ||
+                   cands.find((c) => c.cls.includes(want) && !c.cls.includes(avoid)) ||
+                   cands.find((c) => new RegExp('(^|[\\s-])' + side + '($|[\\s-])').test(c.cls));
       if (!pick) return null;
       let inc = 0;
       for (const sel of INCREMENT_SELECTORS) {
@@ -313,6 +346,8 @@
       return { ms: pick.ms, inc };
     } catch (e) { return null; }
   }
+  const readMyClock = (myColor) => readClock(myColor, 'me');
+  const readOppClock = (myColor) => readClock(myColor, 'opp');
 
   // { me, opp } player names (top name = opponent, bottom = me), or null.
   function readNames() {
@@ -335,29 +370,60 @@
   // Stockfish pondering is off while Imperfection is above 0: a prepared reply is always the best line, the imperfection choice would be skipped.
   function sfPonderOn() { return cfg.engine === 'stockfish' && cfg.sfPonder && !(hum() && cfg.imperfection > 0); }
 
-  function askEngine(pos, quick) {
+  // The clock part of a FULL search (sets lastClock): AggroChess soft/hard from my clock (aggroUseClock), the Stockfish time
+  // cap (sfMaxMs, combined with the clock budget when sfUseClock is on). Called before the human-like delay is drawn, so
+  // the delay can be capped by the clock (CV.clock.delayCap) before the engine is asked.
+  function fullPlan(pos) {
+    lastClock = null;
+    const plan = { soft: undefined, hard: undefined, sfCap: cfg.engine === 'stockfish' ? cfg.sfMaxMs : 0 };
+    if (cfg.engine === 'aggro' && cfg.aggroUseClock) {
+      const clk = readMyClock(pos.myColor);
+      const budget = clk && CV.clock.clockBudget({ remainingMs: clk.ms, incrementMs: clk.inc, thinkMs: cfg.thinkMs });
+      if (budget) { plan.soft = budget.soft; plan.hard = budget.hard; lastClock = { ms: clk.ms, mode: budget.mode, soft: budget.soft, hard: budget.hard }; log('clock', clk.ms, 'ms ->', budget); }
+    }
+    if (cfg.engine === 'stockfish' && cfg.sfSearchMode === 'clock') {
+      // 2.0.0 'clock' mode: Stockfish's own time manager gets both clocks (go wtime/btime/winc/binc); a JS timer stops it at
+      // the clock.js hard limit (<= a quarter of what is left, and <= sfMaxMs when set). No readable clock of mine = 'delay'
+      // for this move. The opponent's clock unreadable = mine for both. Clock selectors: unverified on the real site.
+      const clk = readMyClock(pos.myColor);
+      const budget = clk && CV.clock.clockBudget({ remainingMs: clk.ms, incrementMs: clk.inc, thinkMs: cfg.sfMaxMs > 0 ? cfg.sfMaxMs : 5000 });
+      if (!budget) { plan.searchMode = 'delay'; log('clock mode: my clock not readable, delay mode for this move'); }
+      else {
+        const opp = readOppClock(pos.myColor), oppMs = opp ? opp.ms : clk.ms, inc = clk.inc || 0;
+        plan.uciClock = pos.myColor === 'w' ? { wtime: clk.ms, btime: oppMs, winc: inc, binc: inc } : { wtime: oppMs, btime: clk.ms, winc: inc, binc: inc };
+        plan.sfCap = CV.sfSearchCap(cfg.sfMaxMs, budget.hard);
+        lastClock = { ms: clk.ms, mode: budget.mode, soft: budget.soft, hard: budget.hard, opp: opp ? opp.ms : null };
+        log('clock mode', plan.uciClock, 'hard', plan.sfCap);
+      }
+      return plan;
+    }
+    if (cfg.engine === 'stockfish' && cfg.sfUseClock) {            // optional: never more than the clock allows (clock.js: <= a quarter of what is left)
+      const clk = readMyClock(pos.myColor);
+      const budget = clk && CV.clock.clockBudget({ remainingMs: clk.ms, incrementMs: clk.inc, thinkMs: cfg.sfMaxMs > 0 ? cfg.sfMaxMs : 5000 });
+      if (budget) { plan.sfCap = CV.sfSearchCap(cfg.sfMaxMs, budget.soft); lastClock = { ms: clk.ms, mode: budget.mode, soft: budget.soft, hard: budget.hard }; log('clock', clk.ms, 'ms -> sf cap', plan.sfCap); }
+    }
+    return plan;
+  }
+
+  // Does the full search use the human-like pause as engine time (2.0.0)? Stockfish: sfSearchMode 'delay' / 'clock';
+  // AggroChess: the constant CV.AGGRO_DELAY_MATCH (false = 1.8.0).
+  const delayMatched = () => (cfg.engine === 'stockfish' ? cfg.sfSearchMode !== 'depth' : !!CV.AGGRO_DELAY_MATCH);
+
+  // quick = the cheap look for an obvious move (Stockfish depth <= 8, AggroChess quickThinkMs; no clock, no pause budget).
+  // plan / softMs: only for the full search (fullPlan, and the delay-matched budget).
+  function askEngine(pos, quick, plan, softMs) {
     const depth = quick ? Math.min(cfg.depth, 8) : cfg.depth;
     const ms = quick ? Math.min(cfg.thinkMs, cfg.quickThinkMs) : cfg.thinkMs;
     const h = histFor(pos);
-    let soft, hard;
-    lastClock = null;
-    if (!quick && cfg.engine === 'aggro' && cfg.aggroUseClock) {     // the quick-reply path keeps its small budget
-      const clk = readMyClock(pos.myColor);
-      const budget = clk && CV.clock.clockBudget({ remainingMs: clk.ms, incrementMs: clk.inc, thinkMs: cfg.thinkMs });
-      if (budget) { soft = budget.soft; hard = budget.hard; lastClock = { ms: clk.ms, mode: budget.mode, soft, hard }; log('clock', clk.ms, 'ms ->', budget); }
-    }
-    let sfCap = !quick && cfg.engine === 'stockfish' ? cfg.sfMaxMs : 0;      // time cap only for the full search; quick looks stay depth <= 8
-    if (!quick && cfg.engine === 'stockfish' && cfg.sfUseClock) {            // optional: never more than the clock allows (clock.js: <= a quarter of what is left)
-      const clk = readMyClock(pos.myColor);
-      const budget = clk && CV.clock.clockBudget({ remainingMs: clk.ms, incrementMs: clk.inc, thinkMs: cfg.sfMaxMs > 0 ? cfg.sfMaxMs : 5000 });
-      if (budget) { sfCap = CV.sfSearchCap(cfg.sfMaxMs, budget.soft); lastClock = { ms: clk.ms, mode: budget.mode, soft: budget.soft, hard: budget.hard }; log('clock', clk.ms, 'ms -> sf cap', sfCap); }
-    }
+    if (quick) lastClock = null;
+    const p = quick || !plan ? { sfCap: 0 } : plan;              // time cap only for the full search; quick looks stay depth <= 8
     return api.runtime.sendMessage({
       type: 'analyze', fen: pos.fen, engine: cfg.engine, depth, ms,
       startFen: h ? h.startFen : null, moves: h ? h.moves : null,       // null = no reliable history: engines get the bare FEN
-      soft, hard, verify: cfg.engine === 'aggro' && cfg.aggroVerify, ponder: sfPonderOn() || (cfg.engine === 'aggro' && cfg.aggroPonder), sfThreads: cfg.engine === 'stockfish' ? cfg.sfThreads : undefined,
+      soft: p.soft, hard: p.hard, verify: cfg.engine === 'aggro' && cfg.aggroVerify, ponder: sfPonderOn() || (cfg.engine === 'aggro' && cfg.aggroPonder), sfThreads: cfg.engine === 'stockfish' ? cfg.sfThreads : undefined,
       imperfection: !quick && cfg.engine === 'stockfish' && hum() ? cfg.imperfection : 0,
-      sfMaxMs: sfCap,
+      sfMaxMs: p.sfCap,
+      sfSearchMode: quick ? 'depth' : (p.searchMode || cfg.sfSearchMode), softMs: quick ? 0 : (softMs || 0), uciClock: quick ? undefined : p.uciClock, spentMs: quick ? 0 : (p.spentMs || 0),
     });
   }
 
@@ -388,13 +454,27 @@
       const engineName = cfg.engine === 'stockfish' ? 'Stockfish' : 'AggroChess';
 
       let uci = null, category = null, sacrifice = false, ponderHit = false;
+      // 2.0.0: the human-like delay of a normal move is drawn BEFORE the full search, so the engine can search through it
+      // (delay-matched search). The move timing is unchanged: the wait is still max(delay, engine time).
+      let plannedDelay = null;
+      let quickSpent = 0;                                   // T10: AggroChess quick look that turned out not obvious
+      const fullSearch = () => {
+        const plan = fullPlan(pos);
+        if (quickSpent && cfg.engine === 'aggro') plan.spentMs = quickSpent;
+        plannedDelay = CV.human.delayFor(cfg, { legalCount: legal.length, category: null });
+        if (lastClock) plannedDelay = CV.clock.delayCap(plannedDelay, lastClock.ms);       // the pause must not eat a short clock
+        const softMs = delayMatched() ? Math.max(0, Math.round(plannedDelay - CV.SF_DELAY_MARGIN_MS - (Date.now() - t0))) : 0;
+        return askEngine(pos, false, plan, softMs);
+      };
 
       if (cfg.quickReplies && cfg.quickOnlyMove && legal.length === 1) {
         uci = legal[0].uci; category = 'only';            // forced: no need to ask the engine
       } else {
         const likely = CV.human.likelyObvious(parsed, legal, ctx, cfg);
         setStatus(likely ? 'quick look (' + engineName + ')\u2026' : 'thinking (' + engineName + ')\u2026', 'on');
-        let res = await askEngine(pos, likely);
+        const tq = Date.now();
+        let res = likely ? await askEngine(pos, true) : await fullSearch();
+        if (likely) quickSpent = Date.now() - tq;
         if (token !== playToken || !cfg.enabled) return;
         if (cfg.engine === 'aggro' && cfg.aggroVerify && ui) ui.setWarn(res && res.verifyWarning ? 'Verify: ' + res.verifyWarning : '');
         if (res && res.error) {                             // e.g. an engine failed to start: show it, don't hammer the engine
@@ -405,7 +485,7 @@
           category = res && res.uci ? CV.human.classify(parsed, byUci(res.uci), ctx, cfg, legal.length) : null;
           if (!category) {                                  // looked obvious, wasn't: think properly
             setStatus('thinking (' + engineName + ')\u2026', 'on');
-            res = await askEngine(pos, false);
+            res = await fullSearch();
             if (token !== playToken || !cfg.enabled) return;
           }
         } else if (res && res.imperfect && res.best) {
@@ -425,11 +505,30 @@
         return;
       }
 
-      // Human-like pause. The engine already ran, so only the remainder is waited.
-      let delay = CV.human.delayFor(cfg, { legalCount: legal.length, category });
+      // Early ponder (2.0.0): the move is final, so the opponent's turn can be prepared now instead of after the pause, the
+      // cursor, chess.com's animation and the next board read. If the move is then discarded or does not register, the
+      // next check() computes another key and restarts the job, and the background's decide() answers `miss` for any
+      // position that does not extend this one (see sameBase in CV.createPonderState).
+      if (cfg.earlyPonder && idleWanted() && byUci(uci) && !document.hidden) {
+        const h = histFor(pos);
+        if (h) startIdle(h.startFen, [...h.moves, uci], pos.myColor);
+      }
+
+      // Human-like pause. The engine already ran, so only the remainder is waited. A quick category has its own short
+      // delay; otherwise the delay drawn before the full search is used.
+      // 2.0.0: a ponder hit with ponderHitFast gets the quick range too (fastReply), without becoming a quick category.
+      const fastReply = !category && ponderHit && cfg.ponderHitFast && cfg.quickReplies;
+      let delay = category || fastReply || plannedDelay === null ? CV.human.delayFor(cfg, { legalCount: legal.length, category, fastReply }) : plannedDelay;
       if (lastClock) delay = CV.clock.delayCap(delay, lastClock.ms);          // the pause must not eat a short clock
       const wait = Math.max(0, delay - (Date.now() - t0));
-      if (wait) await sleep(wait);
+      fast = !!category || fastReply || !!(lastClock && lastClock.mode === 'low');     // low on time: the faster hand too (set before the glide below)
+      // 2.0.0: with the curved cursor the glide to the from-square runs DURING the pause (if it takes longer than the
+      // pause, no extra wait is added). The position is re-checked after both, before anything is clicked; if it changed
+      // the cursor simply stays where it is.
+      let pts = null;
+      if (hum() && cfg.mouseMove) {
+        [pts] = await Promise.all([aimMove(uci), wait ? sleep(wait) : null]);
+      } else if (wait) await sleep(wait);
       if (token !== playToken || !cfg.enabled) return;
 
       const now = buildFen();
@@ -440,10 +539,10 @@
 
       const mv = byUci(uci);
       ownMove = { afterCount: pos.count - (mv && mv.capture ? 1 : 0) };
-      fast = !!category || !!(lastClock && lastClock.mode === 'low');     // low on time: the faster hand too
       // remember what is being played; it counts only if the board then shows exactly this move from this position
       rec.noteBotMove({ fen: pos.fen, uci, color: pos.myColor, sacrifice, engine: cfg.engine, flagKnown: cfg.engine === 'aggro' && category !== 'only' });
-      await executeMove(uci, pos.myColor);
+      if (pts) await finishMove(pts, uci, pos.myColor);
+      else await executeMove(uci, pos.myColor);
     } catch (e) {
       setStatus('error: ' + (e && e.message ? e.message : e), 'err');
       console.error('[ChessVision]', e);
@@ -470,8 +569,9 @@
   }
 
   function check(reason) {
+    let obs;
     if (board && allowed !== null && isAllowedPage()) {          // observe before anything can return early
-      try { observeBoard(); } catch (e) { console.error('[ChessVision] observe failed', e); }
+      try { obs = observeBoard() || undefined; } catch (e) { console.error('[ChessVision] observe failed', e); }
     }
     if (!cfg.enabled) { setStatus('off'); return; }
     if (allowed === null) { setStatus('loading page list\u2026'); return; }
@@ -482,7 +582,7 @@
         playToken++; busy = false;                      // late results from the old attempt are ignored
       } else { recheckPending = true; return; }         // don't lose the update, look again once free
     }
-    const pos = buildFen();
+    const pos = buildFen(obs);                                   // the observation above: no second board read
     if (!pos) { setStatus('no board found', 'warn'); return; }
     const over = gameOverFor(pos);
     if (over) {
@@ -503,20 +603,32 @@
     play(pos);
   }
 
-  // ---------- AggroChess idle work (opponent's turn) ----------
+  // ---------- Idle work (opponent's turn): pondering / evaluation line ----------
+  // Is idle work wanted for the current engine and settings? (idleWork and the early ponder in play() use the same rule)
+  function idleWanted() { return sfPonderOn() || (cfg.engine === 'aggro' && (cfg.aggroPonder || cfg.aggroShowEval)); }
+
+  // Starts the background idle job for the position startFen + moves (the opponent to move there). The idle key is the
+  // HISTORY key, not the FEN: play() starts the job for the position after our move before the board shows it (early
+  // ponder, 2.0.0), and idleWork() later recognises the same position by the same key and only polls.
+  function startIdle(startFen, moves, myColor) {
+    idleKey = CV.ponderKey(startFen, moves); idlePondering = false; idleFound = 0; if (ui) ui.setEval('');
+    api.runtime.sendMessage(sfPonderOn()
+      ? { type: 'aggroIdle', engine: 'stockfish', startFen, moves, ponder: true, ponderMs: cfg.sfPonderMs, ponderWorkers: cfg.sfPonderWorkers, ponderHashMb: cfg.sfPonderHashMb, depth: cfg.depth, myColor,
+        ponderUntilMove: cfg.ponderUntilMove, ponderMaxMs: cfg.ponderMaxMs, sfSearchMode: cfg.sfSearchMode }
+      : { type: 'aggroIdle', startFen, moves, ponder: cfg.aggroPonder, showEval: cfg.aggroShowEval, ponderMs: cfg.aggroPonderMs, ponderWorkers: cfg.aggroPonderWorkers, ponderHashMb: cfg.aggroPonderHashMb, myColor,
+        ponderUntilMove: cfg.ponderUntilMove, ponderMaxMs: cfg.ponderMaxMs }).catch(() => {});
+  }
+
   function idleWork(pos) {
-    const sfIdle = sfPonderOn();
-    if (!sfIdle && (cfg.engine !== 'aggro' || !(cfg.aggroPonder || cfg.aggroShowEval))) return;
+    if (!idleWanted()) return;
     const h = histFor(pos);
     if (!h) return;
-    if (idleKey !== pos.fen) {                                   // start once per position
-      idleKey = pos.fen; idlePondering = false; idleFound = 0; if (ui) ui.setEval('');
-      api.runtime.sendMessage(sfIdle
-        ? { type: 'aggroIdle', engine: 'stockfish', startFen: h.startFen, moves: h.moves, ponder: true, ponderMs: cfg.sfPonderMs, ponderWorkers: cfg.sfPonderWorkers, ponderHashMb: cfg.sfPonderHashMb, depth: cfg.depth, myColor: pos.myColor }
-        : { type: 'aggroIdle', startFen: h.startFen, moves: h.moves, ponder: cfg.aggroPonder, showEval: cfg.aggroShowEval, ponderMs: cfg.aggroPonderMs, ponderWorkers: cfg.aggroPonderWorkers, ponderHashMb: cfg.aggroPonderHashMb, myColor: pos.myColor }).catch(() => {});
+    const key = CV.ponderKey(h.startFen, h.moves);
+    if (idleKey !== key) {                                       // start once per position (unless the early ponder already did)
+      startIdle(h.startFen, h.moves, pos.myColor);
     } else {                                                     // then poll (the watchdog ticks drive this)
       api.runtime.sendMessage({ type: 'aggroIdleStatus' }).then((r) => {
-        if (idleKey !== pos.fen || !r) return;
+        if (idleKey !== key || !r) return;
         idlePondering = !!r.pondering; idleFound = r.found || 0;
         if (ui) ui.setEval(r.evalLine || '');
       }).catch(() => {});
@@ -597,7 +709,33 @@
 
   function schedule(ms, reason = 'event') {
     clearTimeout(debounceTimer);
+    stableSeq++;                                                 // a stable check still waiting for its second read is outdated
     debounceTimer = setTimeout(() => check(reason), ms);
+  }
+
+  // Board mutations (2.0.0): a short debounce, then a STABLE READ: the board is read twice, one animation frame + 20 ms
+  // apart, and check() only runs when both reads agree. The tracker treats "more pieces than before" as a new game, so a
+  // read taken while chess.com is half-way through an update (piece removed, not re-added yet) followed by a full read
+  // could clear the hash and restart the recorder; the second read rules that out. A short debounce alone would not.
+  // boardDebounceMs 250 = the 1.8.0 timing (the stability check stays).
+  const nextFrame = () => new Promise((r) => {                   // rAF does not fire in a hidden tab: a timeout backs it up
+    let done = false; const go = () => { if (!done) { done = true; r(); } };
+    try { requestAnimationFrame(go); } catch (e) { /* no rAF */ }
+    setTimeout(go, 100);
+  });
+  function scheduleStable(ms, reason) {
+    clearTimeout(debounceTimer);
+    const seq = ++stableSeq;
+    debounceTimer = setTimeout(async () => {
+      const a = boardSignature();
+      await nextFrame();
+      await sleep(STABLE_GAP_MS);
+      if (seq !== stableSeq) return;                             // a newer mutation (or schedule) took over
+      const b = boardSignature();
+      if (a === b || unstableRun >= UNSTABLE_MAX) { unstableRun = 0; check(reason); return; }
+      unstableReads++; unstableRun++;
+      scheduleStable(cfg.boardDebounceMs, 'unstable');
+    }, ms);
   }
 
   // Watchdog: re-reads the board on a timer, independent of any DOM event.
@@ -614,7 +752,7 @@
     board = b;
     observer = null;
     if (!b) return;
-    observer = new MutationObserver(() => schedule(250, 'mutation'));
+    observer = new MutationObserver(() => scheduleStable(cfg.boardDebounceMs, 'mutation'));
     observer.observe(b, {
       childList: true, subtree: true,
       attributes: true, attributeFilter: ['class'],
@@ -656,7 +794,7 @@
       page: location.hostname + location.pathname,
       allowedPage: isAllowedPage(), allowedEntries: allowed ? allowed.length : null,
       settings: cfg,
-      state: { busy, busyForMs: busy ? Date.now() - busySince : 0, attempts, dragDisabled, lastMode, atStart, ownMove, watchdogTimerRunning: !!watchdogTimer },
+      state: { busy, busyForMs: busy ? Date.now() - busySince : 0, attempts, dragDisabled, lastMode, atStart, ownMove, watchdogTimerRunning: !!watchdogTimer, unstableReads },
       history: (() => { const i = tracker.info(); return { length: i.plies, halfmove: i.halfmove, fullmove: i.fullmove, repetitionCount: i.repetitionCount, historyResets: i.resets, startFen: i.startFen }; })(),
       recording: { positionsSeen: rec.plyCount() },
       clock: { lastClock, myClockNow: board ? readMyClock(board.classList.contains('flipped') ? 'b' : 'w') : null },

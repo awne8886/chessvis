@@ -72,9 +72,11 @@
   // ---------------- Delays ----------------
 
   // Pre-move delay in ms. Engine time runs in parallel, so the real wait is max(delay, engine time).
+  // info.fastReply (2.0.0): the quick range without a quick category (a ponder hit with ponderHitFast), so the
+  // category-based status text and the recorder's flags are not affected.
   function delayFor(cfg, info = {}) {
-    const { legalCount = 30, category = null } = info;
-    if (category && cfg.quickReplies) return rand(cfg.quickMinDelay, Math.max(cfg.quickMinDelay, cfg.quickMaxDelay));
+    const { legalCount = 30, category = null, fastReply = false } = info;
+    if ((category || fastReply) && cfg.quickReplies) return rand(cfg.quickMinDelay, Math.max(cfg.quickMinDelay, cfg.quickMaxDelay));
     const lo = cfg.minDelay, hi = Math.max(cfg.minDelay, cfg.maxDelay);
     if (!cfg.humanize || cfg.delayStyle === 'uniform') return rand(lo, hi);
     // Natural: right-skewed (log-normal) around a typical value, longer in complex positions.

@@ -53,6 +53,14 @@
     sfPonderHashMb: 16,       // hash table of each ponder worker in MB (the main worker keeps 32)
     sfThreads: 1,             // search threads of the MAIN worker; above 1 only with the threaded build and only if the browser allows SharedArrayBuffer
 
+    // --- 2.0.0: speed (both engines unless noted) ---
+    earlyPonder: true,        // start pondering the moment our move is decided, not when the board shows it (false = 1.8.0)
+    boardDebounceMs: 80,      // wait after a board change before the stable-read check (250 = the 1.8.0 timing)
+    ponderUntilMove: true,    // keep pondering (deepening the likely replies) until the opponent moves, up to ponderMaxMs (false = the *PonderMs budget, 1.8.0)
+    ponderMaxMs: 8000,        // ceiling of a ponder job with ponderUntilMove
+    ponderHitFast: true,      // a ponder hit is answered with the quick delay and the faster hand (false = 1.8.0: normal delay)
+    sfSearchMode: 'delay',    // Stockfish full search: 'depth' (1.8.0: go depth N) | 'delay' (search through the human-like pause, depth = minimum) | 'clock'
+
     // --- game recording and saving ---
     saveWithSacrifices: false,       // save a finished game when its counted sacrifices reach the threshold
     saveSacrificeThreshold: 3,
@@ -84,6 +92,7 @@
     quickMaxDelay: [40, 1500, 10],
     quickThinkMs: [100, 2000, 50],
     watchdogMs: [200, 5000, 100],
+    boardDebounceMs: [0, 300, 10],
     aggroPonderMs: [200, 5000, 100],
     aggroPonderWorkers: [1, 3, 1],
     aggroPonderHashMb: [4, 64, 4],
@@ -91,6 +100,7 @@
     sfPonderWorkers: [1, 3, 1],
     sfPonderHashMb: [4, 64, 4],
     sfThreads: [1, 4, 1],
+    ponderMaxMs: [1000, 30000, 500],
     saveSacrificeThreshold: [1, 20, 1],
     maxSavedGames: [5, 200, 1],
     brilliantWaitSec: [1, 15, 1],
@@ -100,6 +110,7 @@
     engine: ['aggro', 'stockfish'],
     delayStyle: ['natural', 'uniform'],
     inputMode: ['click', 'drag', 'mixed'],
+    sfSearchMode: ['depth', 'delay', 'clock'],
   };
 
   // Returns a cleaned copy of `obj`: unknown keys dropped, numbers clamped, enums checked.
@@ -252,8 +263,8 @@
   // addRunning / removeRunning are used by the pool. 'late' = planned, no finished reply yet (whether or not it is
   // running); decide() also says in `running` whether a worker was on that very move when the opponent played it.
   CV.createPonderState = function () {
-    const counters = { attempts: 0, hits: 0, misses: 0, late: 0, skipped: 0 };
-    let entry = null;
+    const counters = { attempts: 0, hits: 0, misses: 0, late: 0, skipped: 0, lastLeadMs: null, avgLeadMs: null, leadSamples: 0 };
+    let entry = null, leadSum = 0;
     const sameBase = (e, startFen, moves) => Array.isArray(moves) && startFen === e.startFen && moves.length === e.base.length + 1 &&
       e.base.every((m, i) => moves[i] === m);
     const syncRunning = (e) => { e.running = e.runningSet.size ? [...e.runningSet].pop() : null; };   // old field: the latest started one
@@ -262,32 +273,42 @@
       get: () => entry,
       begin(startFen, base, planned) {
         counters.attempts++;
-        entry = { startFen, base: base.slice(), planned: new Set(planned), results: {}, running: null, runningSet: new Set(), counted: new Set() };
+        entry = { startFen, base: base.slice(), planned: new Set(planned), results: {}, running: null, runningSet: new Set(), runningMeta: new Map(), counted: new Set(), beganAt: Date.now() };
         return entry;
       },
       skip() { counters.skipped++; },
-      setRunning(uci) { if (entry) { entry.runningSet.clear(); if (uci) entry.runningSet.add(uci); syncRunning(entry); } },
-      addRunning(uci) { if (entry && uci) { entry.runningSet.add(uci); syncRunning(entry); } },
-      removeRunning(uci) { if (entry) { entry.runningSet.delete(uci); syncRunning(entry); } },
+      setRunning(uci) { if (entry) { entry.runningSet.clear(); entry.runningMeta.clear(); if (uci) entry.runningSet.add(uci); syncRunning(entry); } },
+      // meta (2.0.0, optional): { startedAt, ms } of that reply search; decide() hands it back as runningMeta (CV.lateWaitMs)
+      addRunning(uci, meta) { if (entry && uci) { entry.runningSet.add(uci); if (meta) entry.runningMeta.set(uci, { startedAt: meta.startedAt, ms: meta.ms }); else entry.runningMeta.delete(uci); syncRunning(entry); } },
+      removeRunning(uci) { if (entry) { entry.runningSet.delete(uci); entry.runningMeta.delete(uci); syncRunning(entry); } },
       runningMoves: () => (entry ? [...entry.runningSet] : []),
-      // Stores the reply found for one opponent move. False if the entry is gone or the answer is empty.
+      // Stores the reply found for one opponent move. False if the entry is gone or the answer is empty, or (2.0.0) when a
+      // DEEPER reply is already stored for that move (a seed from the main search's PV, or an earlier deepening pass, is never
+      // replaced by a shallower search; equal or greater depth replaces it as before).
       addResult(oppUci, r) {
         if (!entry || !entry.planned.has(oppUci) || !r || !r.uci) return false;
+        const old = entry.results[oppUci];
+        if (old && old.depth > (r.depth || 0)) return false;
         entry.results[oppUci] = { uci: r.uci, san: r.san || null, depth: r.depth || 0, sacrifice: !!r.sacrifice, ms: r.ms || 0 };
         return true;
       },
       found: () => (entry ? Object.keys(entry.results).length : 0),
       decide(startFen, moves) {
-        if (!entry) return { decision: 'none', result: null, running: false };
-        let decision = 'miss', result = null, running = false;
+        if (!entry) return { decision: 'none', result: null, running: false, runningMeta: null };
+        let decision = 'miss', result = null, running = false, runningMeta = null;
         if (sameBase(entry, startFen, moves)) {
           const opp = moves[moves.length - 1];
           if (entry.results[opp]) { decision = 'hit'; result = entry.results[opp]; }
-          else if (entry.planned.has(opp)) { decision = 'late'; running = entry.runningSet.has(opp); }
+          else if (entry.planned.has(opp)) { decision = 'late'; running = entry.runningSet.has(opp); runningMeta = (running && entry.runningMeta.get(opp)) || null; }
         }
         const key = String(startFen) + '|' + (Array.isArray(moves) ? moves.join(' ') : '');
-        if (!entry.counted.has(key)) { entry.counted.add(key); counters[decision === 'hit' ? 'hits' : decision === 'late' ? 'late' : 'misses']++; }
-        return { decision, result, running };
+        let leadMs = null;
+        if (decision !== 'miss') leadMs = Date.now() - entry.beganAt;   // 2.0.0: how long before the opponent's move the job began (early ponder makes it longer)
+        if (!entry.counted.has(key)) {
+          entry.counted.add(key); counters[decision === 'hit' ? 'hits' : decision === 'late' ? 'late' : 'misses']++;
+          if (leadMs !== null) { counters.lastLeadMs = leadMs; leadSum += leadMs; counters.leadSamples++; counters.avgLeadMs = Math.round(leadSum / counters.leadSamples); }
+        }
+        return { decision, result, running, runningMeta, leadMs };
       },
       // Drops the entry (new game, takeback, setting off, engine switch, miss...). True if there was one.
       invalidate() { const had = !!entry; entry = null; return had; },
@@ -367,6 +388,130 @@
   CV.sfRankFromScan = function (legal, scores) {
     return legal.filter((u) => scores.get(u) !== null)
       .sort((x, y) => (scores.has(x) ? scores.get(x) : Infinity) - (scores.has(y) ? scores.get(y) : Infinity));
+  };
+
+  // ---- 2.0.0: delay-matched search (pure; content.js and background.js) ----
+  // The bot waits max(human-like delay, engine time) anyway, so the full search may use the pause: the page draws the delay
+  // BEFORE asking the engine and sends softMs = delay - SF_DELAY_MARGIN_MS - time already spent on this move. The margin
+  // covers the message round trip and the engine's answer to `stop`, so the move is not later than in 1.8.0.
+  CV.SF_DELAY_MARGIN_MS = 40;
+  // AggroChess uses the same pause (CV.aggroBudget). false = the 1.8.0 AggroChess budget (thinkMs / the clock budget only).
+  CV.AGGRO_DELAY_MATCH = true;
+  CV.SF_DELAY_HARD_MIN_MS = 3000;       // hard cap of a delay-matched search without a user / clock cap: max(this, 3 x softMs)
+
+  // Should a delay-matched Stockfish search be stopped now? Yes once the soft budget is used AND the minimum depth is
+  // complete, or whatever the depth once the hard cap is reached. depthDone = depth of the latest exact MultiPV-1 line.
+  CV.sfShouldStop = function ({ elapsedMs, softMs, depthDone, minDepth, hardMs }) {
+    const e = Number(elapsedMs) || 0, soft = Math.max(0, Number(softMs) || 0), d = Number(depthDone) || 0;
+    const min = Math.max(1, Number(minDepth) || 1), hard = Number(hardMs) > 0 ? Number(hardMs) : Infinity;
+    return (e >= soft && d >= min) || e >= hard;
+  };
+
+  // Hard cap of a delay-matched search: the cap the page sent (sfMaxMs, already combined with the clock cap when
+  // sfUseClock is on, see CV.sfSearchCap) when there is one, else max(SF_DELAY_HARD_MIN_MS, 3 x softMs).
+  CV.sfHardMs = function (softMs, capMs) {
+    const cap = Math.max(0, Math.round(Number(capMs)) || 0);
+    if (cap > 0) return cap;
+    return Math.max(CV.SF_DELAY_HARD_MIN_MS, 3 * Math.max(0, Math.round(Number(softMs)) || 0));
+  };
+
+  // AggroChess think budget. thinkMs = the fixed budget, softMs = the delay-matched budget from the page (0 = none),
+  // clock = { soft, hard } from clock.js or null. Without a clock: { ms: max(thinkMs, softMs) }; with a clock:
+  // { soft: max(clock soft, min(softMs, hard)), hard } - never above hard, so the clock rules stay intact.
+  CV.AGGRO_BUDGET_MAX_MS = 60000;
+  // spentMs (T10): time a quick look already used on this move when it turned out not obvious; it is taken off the think
+  // time (floor 100 ms, or the clock soft when that is lower) so quick look + full think stay within the configured budget.
+  CV.AGGRO_BUDGET_FLOOR_MS = 100;
+  CV.aggroBudget = function ({ thinkMs, softMs, clock, spentMs }) {
+    const max = CV.AGGRO_BUDGET_MAX_MS, floor = CV.AGGRO_BUDGET_FLOOR_MS;
+    const extra = Math.max(0, Math.round(Number(softMs)) || 0);
+    const spent = Math.max(0, Math.round(Number(spentMs)) || 0);
+    if (clock && Number(clock.hard) > 0 && Number(clock.soft) > 0) {
+      let hard = Math.min(max, Math.round(clock.hard));
+      let soft = Math.min(hard, Math.round(clock.soft));
+      if (spent) { const s0 = Math.max(Math.min(floor, soft), soft - spent); hard = Math.max(s0, hard - spent); soft = s0; }
+      soft = Math.max(soft, Math.min(extra, hard));
+      return { soft, hard };
+    }
+    let think = Math.max(floor, Math.min(max, Math.round(Number(thinkMs)) || 1000));
+    if (spent) think = Math.max(floor, think - spent);
+    return { ms: Math.min(max, Math.max(think, extra)) };
+  };
+
+  // The principal variation of an `info ... pv m1 m2 ...` line as an array ([] when there is none).
+  CV.sfParsePv = function (line) {
+    const m = / pv ((?:\S+ ?)+)$/.exec(String(line || '').trim());
+    return m ? m[1].trim().split(/\s+/) : [];
+  };
+
+  // ---- 2.0.0: deepening passes while the opponent thinks (pure; background.js) ----
+  CV.PONDER_OVERRUN_MS = 70;            // a search can overrun its ms a little (seen: +50 ms); never start one that could end late
+  CV.PONDER_MIN_SLICE_MS = 80;          // no search shorter than this is worth using as a reply
+  CV.PONDER_DEEPEN_MAX_SLICE_MS = 4000; // longest slice of a deepening pass
+  // The reply searches of one pass: [{ uci, ms }], most likely opponent move first; [] = stop.
+  //   pass 1    = the 1.8.0 reply queue: every ranked move, firstSlice each (the caller still clamps each slice to the deadline)
+  //   pass k>=2 = the top K = min(ranked, max(2, 2 x workers)) moves again, slice min(4000, firstSlice x 2^(k-1))
+  // Stops when the time left (leftMs, minus the overrun allowance) cannot fit PONDER_MIN_SLICE_MS, and, with a depth cap
+  // (Stockfish 'depth' mode: every search is `go depth N ...`), after pass 1 once every top-K result already has depth >= N.
+  CV.ponderDeepenPlan = function ({ ranked, results, pass, workers, firstSlice, leftMs, depthCap }) {
+    const list = Array.isArray(ranked) ? ranked : [];
+    const room = leftMs === undefined || leftMs === null ? Infinity : Number(leftMs) - CV.PONDER_OVERRUN_MS;
+    if (!list.length || !(room >= CV.PONDER_MIN_SLICE_MS)) return [];
+    const first = Math.max(CV.PONDER_MIN_SLICE_MS, Number(firstSlice) || CV.PONDER_MIN_SLICE_MS);
+    const k = Math.max(1, Math.floor(Number(pass)) || 1);
+    if (k === 1) return list.map((uci) => ({ uci, ms: first }));
+    const top = list.slice(0, Math.min(list.length, Math.max(2, 2 * Math.max(1, Math.floor(Number(workers)) || 1))));
+    const cap = Number(depthCap) || 0;
+    if (cap > 0 && top.every((u) => results && results[u] && results[u].depth >= cap)) return [];
+    const ms = Math.min(CV.PONDER_DEEPEN_MAX_SLICE_MS, first * Math.pow(2, k - 1), room);
+    return ms >= CV.PONDER_MIN_SLICE_MS ? top.map((uci) => ({ uci, ms })) : [];
+  };
+
+  // ---- 2.0.0: AggroChess `late` with the move's reply search almost done (pure; background.js) ----
+  // meta = { startedAt, ms } of the running reply search, mainBudgetMs = the think budget a normal search would get.
+  // Returns how long to wait for that search (ms, >= 0), or null = do not wait (think from scratch as in 1.8.0). Waiting is
+  // only worth it when the search ends (with its overrun allowance) within min(400, half the main budget).
+  CV.LATE_WAIT_MAX_MS = 400;
+  CV.lateWaitMs = function (meta, now, mainBudgetMs) {
+    if (!meta || !Number.isFinite(Number(meta.startedAt)) || !(Number(meta.ms) > 0)) return null;
+    const remaining = Number(meta.startedAt) + Number(meta.ms) + CV.PONDER_OVERRUN_MS - Number(now);
+    const limit = Math.min(CV.LATE_WAIT_MAX_MS, 0.5 * Math.max(0, Number(mainBudgetMs) || 0));
+    return remaining <= limit ? Math.max(0, Math.round(remaining)) : null;
+  };
+
+  // ---- 2.0.0: seeding the ponder table from the main search's principal variation (pure; background.js) ----
+  // lastMainPv = { startFen, moves, pv, depth, ponder } of the last main Stockfish search: `moves` led to the position we
+  // searched, pv[0] is the move we played, pv[1] the opponent's expected reply, pv[2] our answer to it. A reply from a
+  // PV at depth d is worth a depth d - 2 search of the position after pv[1].
+  CV.SF_PARTIAL_MIN_DEPTH = 8;          // shallower ponder replies are not used (also the harvest minimum in background.js)
+  const pvFollows = (lmp, startFen, moves) => !!lmp && Array.isArray(lmp.pv) && lmp.pv.length >= 1 && Array.isArray(lmp.moves) &&
+    Array.isArray(moves) && startFen === lmp.startFen && moves.length === lmp.moves.length + 1 &&
+    lmp.moves.every((m, i) => moves[i] === m) && moves[moves.length - 1] === lmp.pv[0];
+  // { opp, reply, depth } for an instant ponder result, or null: other start / other move played / PV too short / too shallow.
+  CV.pvSeed = function (lmp, startFen, moves) {
+    if (!pvFollows(lmp, startFen, moves) || lmp.pv.length < 3) return null;
+    const depth = (Number(lmp.depth) || 0) - 2;
+    if (depth < CV.SF_PARTIAL_MIN_DEPTH) return null;
+    return { opp: lmp.pv[1], reply: lmp.pv[2], depth };
+  };
+  // The opponent move the main search expects (pv[1], else the `ponder` token of its bestmove), or null.
+  CV.pvPredict = function (lmp, startFen, moves) {
+    if (!pvFollows(lmp, startFen, moves)) return null;
+    return lmp.pv[1] || lmp.ponder || null;
+  };
+  // `list` with `first` moved to the front (when it is in the list).
+  CV.moveFirst = function (list, first) {
+    return first && list.includes(first) ? [first, ...list.filter((u) => u !== first)] : list.slice();
+  };
+
+  // The `go` command of Stockfish's own time manager ('clock' mode, 2.0.0) from { wtime, btime, winc, binc } in ms, or null
+  // when the clocks are not usable.
+  CV.sfClockGo = function (c) {
+    if (!c) return null;
+    const n = (v) => Math.max(0, Math.round(Number(v)) || 0);
+    const w = n(c.wtime), b = n(c.btime);
+    if (!(w > 0) || !(b > 0)) return null;
+    return 'go wtime ' + w + ' btime ' + b + ' winc ' + n(c.winc) + ' binc ' + n(c.binc);
   };
 
   // ---- allowed pages (allowed-pages.txt) ----

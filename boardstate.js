@@ -81,6 +81,15 @@
     return { lastMover, ep, lastTo };
   }
 
+  // ---------- board signature (2.0.0, stable reads) ----------
+  // A string that changes when any piece or any last-move highlight changes, and only then. Two reads with the same
+  // signature a frame apart mean chess.com has finished updating the board. Highlights are sorted, so their DOM order
+  // does not matter.
+  function signature(grid, highlights) {
+    const hl = (highlights || []).map(([f, r]) => f + '' + r).sort().join(',');
+    return gridToPlacement(grid) + '|' + hl;
+  }
+
   // ---------- castling rights (inferred from the page) ----------
   const freshRights = () => ({ K: true, Q: true, k: true, q: true });
   const castleString = (r) => ['K', 'Q', 'k', 'q'].filter((k) => r[k]).join('') || '-';
@@ -258,7 +267,7 @@
 
   CV.boardstate = {
     START_PLACEMENT, START_FEN, gridToPlacement, placementToGrid, boardToPlacement, countPieces, assembleFen,
-    analyzeHighlights, freshRights, castleString, rightsFromString, updateRights, buildPosition, createTracker, obsFromFen,
+    analyzeHighlights, signature, freshRights, castleString, rightsFromString, updateRights, buildPosition, createTracker, obsFromFen,
   };
   if (typeof module !== 'undefined' && module.exports) module.exports = CV.boardstate;
 })(typeof window !== 'undefined' ? window : globalThis);

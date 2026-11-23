@@ -188,7 +188,10 @@ details[open] summary .arrow { transform: rotate(90deg); }
       el('div', { class: 'group' },
         toggle('aggroUseClock', 'Use the game clock'),
         toggle('aggroPonder', 'Ponder on opponent\u2019s time'),
+        toggle('earlyPonder', 'Ponder as soon as the move is chosen'),
         slider('aggroPonderMs', 'Ponder time', fmtMs),
+        toggle('ponderUntilMove', 'Keep pondering until the opponent moves'),
+        slider('ponderMaxMs', 'Ponder at most', fmtS),
         slider('aggroPonderWorkers', 'Ponder workers', fmtInt),
         slider('aggroPonderHashMb', 'Ponder hash', (v) => v + ' MB'),
         toggle('aggroShowEval', 'Show evaluation'),
@@ -200,13 +203,17 @@ details[open] summary .arrow { transform: rotate(90deg); }
     const sfDet = el('details', {},
       el('summary', {}, el('span', {}, el('span', { class: 'arrow' }, '\u25b8'), 'Stockfish options')),
       el('div', { class: 'group' },
+        seg('sfSearchMode', 'Search', [['depth', 'Depth'], ['delay', 'Delay'], ['clock', 'Clock']], 'tight'),
         toggle('sfUseClock', 'Use the game clock'),
         toggle('sfPonder', 'Ponder on opponent\u2019s time'),
+        toggle('earlyPonder', 'Ponder as soon as the move is chosen'),
         slider('sfPonderMs', 'Ponder time', fmtMs),
+        toggle('ponderUntilMove', 'Keep pondering until the opponent moves'),
+        slider('ponderMaxMs', 'Ponder at most', fmtS),
         slider('sfPonderWorkers', 'Ponder workers', fmtInt),
         slider('sfPonderHashMb', 'Ponder hash', (v) => v + ' MB'),
         slider('sfThreads', 'Search threads', fmtInt),
-        el('p', { class: 'note' }, 'Clock: caps the search time from your chess.com clock (never more than a quarter of what is left). Ponder: extra Stockfish workers rank the opponent\u2019s moves and prepare replies while they think; a prepared reply is used only if the opponent plays that move. Each ponder worker costs about 40 MB plus its hash and is capped by your CPU count. Pondering is off while Imperfection is above 0. Threads above 1 need the threaded engine and a browser that allows SharedArrayBuffer; otherwise it stays at 1 (see Copy debug info).')));
+        el('p', { class: 'note' }, 'Search: Depth = stop at Search depth (old behaviour). Delay = keep searching through the human-like pause and stop when it is used up (Search depth is then the minimum), so moves come at the same speed but are deeper. Clock = Stockfish\u2019s own time manager from both chess.com clocks (falls back to Delay when your clock cannot be read; untested on the real site). Clock: caps the search time from your chess.com clock (never more than a quarter of what is left). Ponder: extra Stockfish workers rank the opponent\u2019s moves and prepare replies while they think; a prepared reply is used only if the opponent plays that move. Each ponder worker costs about 40 MB plus its hash and is capped by your CPU count. Pondering is off while Imperfection is above 0. Threads above 1 need the threaded engine and a browser that allows SharedArrayBuffer; otherwise it stays at 1 (see Copy debug info).')));
 
     // ---- Game saving ----
     const gmsg = el('p', { class: 'msg', 'aria-live': 'polite' });
@@ -311,7 +318,8 @@ details[open] summary .arrow { transform: rotate(90deg); }
         slider('quickMinDelay', 'Quick min delay', fmtMs),
         slider('quickMaxDelay', 'Quick max delay', fmtMs),
         slider('quickThinkMs', 'Quick think time', fmtMs),
-        el('p', { class: 'note' }, 'Quick think time is the AggroChess budget for obvious moves. Stockfish searches to depth 8 or less instead.')),
+        toggle('ponderHitFast', 'Fast reply on ponder hit'),
+        el('p', { class: 'note' }, 'Quick think time is the AggroChess budget for obvious moves. Stockfish searches to depth 8 or less instead. Fast reply on ponder hit: a reply prepared while the opponent thought is played with the quick delay and the faster hand.')),
 
       aggroDet, sfDet,
 
@@ -319,7 +327,8 @@ details[open] summary .arrow { transform: rotate(90deg); }
         el('summary', {}, el('span', {}, el('span', { class: 'arrow' }, '\u25b8'), 'Watchdog')),
         el('div', { class: 'group' },
           slider('watchdogMs', 'Re-read board every', fmtMs),
-          el('p', { class: 'note' }, 'Re-checks the board on a timer so a missed update can\u2019t leave it waiting. Lower = faster recovery, slightly more CPU.'))),
+          slider('boardDebounceMs', 'Read board after a change', fmtMs),
+          el('p', { class: 'note' }, 'Re-checks the board on a timer so a missed update can\u2019t leave it waiting. Lower = faster recovery, slightly more CPU. After a change on the board it waits this long, then reads the board twice a frame apart and only goes on when both reads agree (250 ms = the old timing).'))),
 
       gameDet,
 
