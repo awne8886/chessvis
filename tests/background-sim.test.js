@@ -255,4 +255,32 @@ test('C2 AggroChess: think(pause) on the main worker when the pause is at least 
   assert.strictEqual(bg.get('aggroThinking'), 0);
 });
 
+// ---- 2.0.2 B1: the relaxed-SIMD Stockfish build ----
+test('B1: the relaxed-SIMD build is used where the probe validates, for the main and the ponder workers', async () => {
+  const bg = makeBackground({ stepMs: 2, wasm: { relaxed: true } });
+  await analyzeSf(bg, [], { sfSearchMode: 'depth' });
+  assert.strictEqual(bg.get('sfActive'), 'engine/stockfish-19-lite-single-rsimd.js');
+  const main = bg.workers.find((w) => w.kind === 'sf' && w.init);
+  assert.strictEqual(main.init.loader, 'stockfish-19-lite-single-rsimd.js');
+  assert.ok(/sf-worker\.js#.*rsimd\.wasm/.test(decodeURIComponent(main.url)), main.url);
+  await bg.send({ type: 'aggroIdle', engine: 'stockfish', startFen: START, moves: ['e2e4'], ponder: true, ponderMs: 300, ponderWorkers: 1, ponderHashMb: 16, depth: 6, myColor: 'w', ponderUntilMove: false, sfSearchMode: 'depth' });
+  await sleep(100);
+  assert.ok(bg.workers.filter((w) => w.kind === 'sf' && w.init).every((w) => w.init.loader === 'stockfish-19-lite-single-rsimd.js'));
+  const dbg = await bg.send({ type: 'aggroDebug' });
+  assert.strictEqual(dbg.stockfish.relaxedSimd.probe, true);
+});
+
+test('B1: no relaxed SIMD -> the plain build; a relaxed build that fails to start -> the plain build for good', async () => {
+  const bg = makeBackground({ stepMs: 2, wasm: { relaxed: false } });
+  await analyzeSf(bg, [], { sfSearchMode: 'depth' });
+  assert.strictEqual(bg.get('sfActive'), 'engine/stockfish-19-lite-single.js');
+  assert.strictEqual(bg.workers.find((w) => w.kind === 'sf' && w.init).init.loader, 'stockfish-19-lite-single.js');
+  const bg2 = makeBackground({ stepMs: 2, wasm: { relaxed: true, failRsimd: true } });
+  const r = await analyzeSf(bg2, [], { sfSearchMode: 'depth' });
+  assert.ok(r && r.uci, 'still plays');
+  assert.strictEqual(bg2.get('sfActive'), 'engine/stockfish-19-lite-single.js');
+  assert.ok(/relaxed SIMD build failed/.test(bg2.get('sfDbg.rsimdFailed')));
+  assert.strictEqual(JSON.stringify(bg2.get('sfCandidates()')), JSON.stringify(['engine/stockfish-19-lite-single.js']));
+});
+
 run();

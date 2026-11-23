@@ -2,12 +2,18 @@
 //
 //   node tests/bench-engines.js [--aggro a.wasm,b.wasm] [--rounds 3] [--only sig|speed|start] [--sig12] [--json]
 //   node tests/bench-engines.js --diff a.wasm b.wasm [--step 0.1]
+//   node tests/bench-engines.js --stockfish [engine/a.js,engine/b.js] [--rounds 3] [--only sig|speed]
 //
 // Per build: the bench signature at depth 8 (and 12 with --sig12; docs/OPUS_PROMPT_2.0.2.md §3), nodes per second at
 // think(1000), the average depth reached by think(100 / 300 / 1000) on the 9 bench positions that are not book moves
 // (empty hash, a fresh game for each), and the start-up costs (instantiate, the first search of a fresh instance, the
 // worker warm-up of engine/aggro-worker.js and the first search after it). Builds are interleaved round by round and
 // the median of the rounds is reported (the machine is noisy: about +-15% run to run).
+//
+// --stockfish: the Stockfish.js loaders as UCI processes (child_process, like tests/bench-delay-mode.js): the depth-14
+// signature (Hash 32, per position ucinewgame + go depth 14, nodes of the last info line), nodes per second at
+// go movetime 1000, the time from start to the first readyok, and the depth of a delay-mode search stopped at 300 / 800 ms
+// (empty hash). Default: engine/stockfish-19-lite-single.js (+ the -rsimd build when it exists).
 //
 // --diff runs one scripted battery of calls (positions, think / think_clock / think_depth / analyze, book, SEE, ponder
 // move, failures, game status) on two builds with a FAKE clock (every js_now call advances it by --step ms) and the
@@ -123,7 +129,102 @@ function startup(file) {
   return { instMs, firstMs, warmMs, afterWarmMs };
 }
 
+// ---------- Stockfish ----------
+function sfEngine(file) {
+  const { spawn } = require('child_process');
+  const pathMod = require('path');
+  const t0 = performance.now();
+  const p = spawn(process.execPath, [pathMod.isAbsolute(file) ? file : pathMod.join(__dirname, '..', file)], { stdio: ['pipe', 'pipe', 'ignore'] });
+  let buf = '', waiters = [];
+  const listeners = new Set();
+  p.stdout.on('data', (d) => {
+    buf += d;
+    let i;
+    while ((i = buf.indexOf('\n')) >= 0) {
+      const line = buf.slice(0, i).trim(); buf = buf.slice(i + 1);
+      for (const fn of listeners) fn(line);
+      waiters = waiters.filter((w) => { if (w.test(line)) { w.resolve(line); return false; } return true; });
+    }
+  });
+  const send = (x) => p.stdin.write(x + '\n');
+  const until = (re) => new Promise((resolve) => waiters.push({ test: (l) => re.test(l), resolve }));
+  return { t0, send, until, on: (fn) => { listeners.add(fn); return () => listeners.delete(fn); }, quit() { try { send('quit'); } catch (e) { /* ignore */ } setTimeout(() => p.kill(), 200); } };
+}
+async function sfGo(e, fen, go, stopMs) {
+  e.send('position fen ' + fen);
+  let last = null;
+  const off = e.on((l) => { if (l.startsWith('info depth') && / pv /.test(l) && !/bound/.test(l)) last = l; });
+  const done = e.until(/^bestmove/);
+  const t0 = performance.now();
+  e.send(go);
+  const timer = stopMs ? setTimeout(() => e.send('stop'), stopMs) : null;
+  const line = await done;
+  clearTimeout(timer); off();
+  return { ms: performance.now() - t0, best: line.split(' ')[1], depth: +((/ depth (\d+)/.exec(last || '') || [0, 0])[1]), nodes: +((/ nodes (\d+)/.exec(last || '') || [0, 0])[1]) };
+}
+async function sfStart(file) {
+  const e = sfEngine(file);
+  e.send('uci'); await e.until(/^uciok/);
+  e.send('setoption name Hash value 32'); e.send('isready'); await e.until(/^readyok/);
+  e.startMs = performance.now() - e.t0;
+  return e;
+}
+async function sfSignature(file, depth) {
+  const e = await sfStart(file);
+  let nodes = 0; const moves = [];
+  for (const f of BENCH_FENS) {
+    e.send('ucinewgame'); e.send('isready'); await e.until(/^readyok/);
+    const r = await sfGo(e, f, 'go depth ' + depth);
+    nodes += r.nodes; moves.push(r.best);
+  }
+  e.quit();
+  return { nodes, moves };
+}
+async function sfSpeed(file) {
+  const e = await sfStart(file);
+  const knps = [], d300 = [], d800 = [];
+  for (const f of BENCH_FENS) {
+    e.send('ucinewgame'); e.send('isready'); await e.until(/^readyok/);
+    const r = await sfGo(e, f, 'go movetime 1000');
+    knps.push(r.nodes / r.ms);
+    for (const [ms, out] of [[300, d300], [800, d800]]) {
+      e.send('ucinewgame'); e.send('isready'); await e.until(/^readyok/);
+      out.push((await sfGo(e, f, 'go depth 64', ms)).depth);
+    }
+  }
+  e.quit();
+  const avg = (a) => a.reduce((x, y) => x + y, 0) / a.length;
+  return { knps: median(knps), d300: avg(d300), d800: avg(d800), startMs: e.startMs };
+}
+async function mainStockfish() {
+  const fs = require('fs');
+  const def = ['engine/stockfish-19-lite-single.js'];
+  if (fs.existsSync(require('path').join(__dirname, '..', 'engine/stockfish-19-lite-single-rsimd.js'))) def.push('engine/stockfish-19-lite-single-rsimd.js');
+  const list = args[args.indexOf('--stockfish') + 1];
+  const files = list && !list.startsWith('--') ? list.split(',') : def;
+  const rounds = Math.max(1, Number(opt('--rounds', 3)));
+  const only = opt('--only', null);
+  const table = {};
+  for (const f of files) table[f] = { speed: [] };
+  if (!only || only === 'sig') for (const f of files) table[f].sig14 = await sfSignature(f, 14);
+  if (!only || only === 'speed') for (let r = 0; r < rounds; r++) for (const f of files) table[f].speed.push(await sfSpeed(f));
+  for (const f of files) {
+    const t = table[f], row = {};
+    if (t.sig14) row.sig14 = t.sig14.nodes + ' ' + t.sig14.moves.join(' ');
+    if (t.speed.length) {
+      row.knps = Math.round(median(t.speed.map((x) => x.knps)));
+      row.knpsRange = Math.round(Math.min(...t.speed.map((x) => x.knps))) + '-' + Math.round(Math.max(...t.speed.map((x) => x.knps)));
+      row['depth@300'] = +median(t.speed.map((x) => x.d300)).toFixed(2);
+      row['depth@800'] = +median(t.speed.map((x) => x.d800)).toFixed(2);
+      row.startMs = Math.round(median(t.speed.map((x) => x.startMs)));
+    }
+    if (has('--json')) console.log(JSON.stringify({ [f]: row }));
+    else { console.log(f); for (const [k, v] of Object.entries(row)) console.log('  ' + k.padEnd(12) + v); }
+  }
+}
+
 function main() {
+  if (has('--stockfish')) { mainStockfish().catch((e) => { console.error(e); process.exit(1); }); return; }
   if (has('--diff')) {
     const i = args.indexOf('--diff');
     process.exit(diff(args[i + 1], args[i + 2], Number(opt('--step', 0.1))) ? 1 : 0);

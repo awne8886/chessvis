@@ -34,7 +34,12 @@ function makeBackground(opts = {}) {
     terminate() { this.dead = true; if (this.search) { clearTimeout(this.search.timer); clearTimeout(this.search.mt); } }
     handle(m) { if (this.kind === 'sf') this.sf(m); else this.aggro(m); }
     sf(m) {
-      if (typeof m !== 'string') return;                    // sfinit (not used: no WebAssembly / fetch here)
+      if (m && m.type === 'sfinit') {                       // 2.0.2: only with opts.wasm (a fake WebAssembly); which loader it was given
+        this.init = m;
+        if (opts.wasm && opts.wasm.failRsimd && /rsimd/.test(m.loader)) setTimeout(() => this.onerror && this.onerror({ message: 'fake: relaxed SIMD build failed' }), 1);
+        return;
+      }
+      if (typeof m !== 'string') return;
       log.push({ w: this.id, cmd: m });
       if (m === 'uci') { ['option name Threads type spin default 1 min 1 max 1', 'option name Hash type spin default 16 min 1 max 1024', 'option name MultiPV type spin default 1 min 1 max 256', 'uciok'].forEach((l) => this.emit(l)); }
       else if (m === 'isready') this.emit('readyok');
@@ -92,7 +97,14 @@ function makeBackground(opts = {}) {
     }
   }
   let handler = null;
+  // opts.wasm (2.0.2): a fake WebAssembly + fetch, so the Stockfish build choice (relaxed SIMD probe, shared module) runs;
+  // { relaxed: validate() answer for the relaxed probe, failRsimd: the relaxed build's worker fails to start }
+  const fakeWasm = opts.wasm ? {
+    WebAssembly: { validate: (b) => (b.length === 37 ? !!opts.wasm.relaxed : true), compileStreaming: async () => ({ fake: 'module' }), compile: async () => ({ fake: 'module' }), Module: function Module() {} },
+    fetch: async () => ({ arrayBuffer: async () => new ArrayBuffer(8) }),
+  } : {};
   const ctx = vm.createContext({
+    ...fakeWasm,
     console: opts.quiet === false ? console : { log() {}, warn() {}, error() {} },
     setTimeout, clearTimeout, setInterval, clearInterval,
     navigator: { hardwareConcurrency: opts.cores || 4 },

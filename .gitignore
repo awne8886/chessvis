@@ -1,0 +1,2 @@
+# build work directories (tools/build-*.sh)
+.build/

@@ -35,6 +35,18 @@ engine/stockfish-19-lite-single.wasm  - the engine itself (lite NNUE net, single
                               https://github.com/nmrugg/stockfish.js/releases/tag/v19.0.1 (same file names).
                               engine/stockfish-19-asm.js is byte-identical to bin/stockfish-19-asm.js of that package
                               (sha256 c07dad9a00a89f4b1dcba3971d58d8078715556eac0212368e4aab510e1e27c9).
+                              2.0.2: both files are reproduced byte for byte from source by tools/build-stockfish.sh
+                              (stockfish.js v19.0.1, emsdk 6.0.9, `node build.js --lite --single-threaded --no-split`).
+engine/stockfish-19-lite-single-rsimd.js    - 2.0.2: the same engine (Stockfish.js 19.0.1, lite net, single thread, GPL-3.0)
+engine/stockfish-19-lite-single-rsimd.wasm    built with WebAssembly relaxed SIMD; used when the browser validates a relaxed
+                              SIMD probe module, else the files above. Built by tools/build-stockfish.sh from
+                              https://github.com/nmrugg/stockfish.js tag v19.0.1 (commit 0d5dd7944f88c817c07a26bc4fb1905d5f9c46d6)
+                              with emsdk 6.0.9 and terser 5.51.2; the only change is a 6-line switch in
+                              src/emscripten/wasm-makefile.mk (RELAXED_SIMD=yes adds -mrelaxed-simd at compile and link
+                              time, written for ChessVision, GPL-3.0). The relaxed dot product it enables is Stockfish's own
+                              code (src/nnue/simd.h, GPL-3.0). No lichess / AGPL code is used.
+                              engine/stockfish-19-lite-single-rsimd.js   sha256 0212ceb41bfd67782f72f8e7ae2afc0cb4ee99856a3c41bd3ba2df4461a5501a
+                              engine/stockfish-19-lite-single-rsimd.wasm sha256 744ae23293592254667b4b4fe2d5eae17319945ee06c51e364792b524880e6e7
                               Multi-thread builds are NOT used (they need SharedArrayBuffer / cross-origin isolation).
 
 Maia-3 (added in 1.3.0)
