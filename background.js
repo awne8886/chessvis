@@ -511,6 +511,8 @@ const PONDER_SLICE_MIN_MS = 120, PONDER_SLICE_MAX_MS = 600;
 const ponder = CV.createPonderState();
 let idleToken = 0, idleInfo = { pondering: false, evalLine: null };
 // 2.0.0 debug: passes of the latest ponder job, and the depth of the reply used on each recent hit (newest last)
+// AggroChess reply searches in flight (2.0.0, `late` wait): opponent move -> { promise, w, token } of the think request
+const aggroRunning = new Map();
 const ponderDbg = { lastPasses: 0, hitDepths: [], harvestUpgrades: 0, lateWaits: 0, lateWaitHits: 0 };
 const noteHitDepth = (d) => { ponderDbg.hitDepths.push(d || 0); if (ponderDbg.hitDepths.length > 20) ponderDbg.hitDepths.shift(); };
 
@@ -718,7 +720,11 @@ async function runIdleJob(msg, token) {
           if (res.depth < d || /^mate/.test(String(res.score))) break;   // cut by the clock, or a forced mate: deeper adds nothing
         }
       } else {
-        const r = await req(w, { type: 'think', ...posFor(msg.startFen, [...msg.moves, c.u]), ms: c.ms }, c.ms);
+        const p = req(w, { type: 'think', ...posFor(msg.startFen, [...msg.moves, c.u]), ms: c.ms }, c.ms);
+        const run = { promise: p, w, token };
+        aggroRunning.set(c.u, run);                           // a real search may wait for exactly this one (`late`, CV.lateWaitMs)
+        let r;
+        try { r = await p; } finally { if (aggroRunning.get(c.u) === run) aggroRunning.delete(c.u); }
         if (token !== idleToken) return;
         const res = aggroResult(r);
         if (res) ponder.addResult(c.u, { ...res, ms: c.ms });
@@ -791,10 +797,29 @@ async function analyzeAggroNow(msg) {
   try {
     // 1) an answer already found while pondering wins; anything else stops the ponder worker at once
     const hist = typeof msg.startFen === 'string' && Array.isArray(msg.moves);
+    // the think budget (pure, CV.aggroBudget): a fixed budget, or the clock budget (soft/hard) when the page sent one; 2.0.0:
+    // stretched to the human-like pause (msg.softMs) when that is longer, never above the clock's hard limit. T10: a quick
+    // look that turned out not obvious already used msg.spentMs of the think time.
+    const b = CV.aggroBudget({ thinkMs: msg.ms, softMs: msg.softMs, spentMs: msg.spentMs, clock: Number(msg.hard) > 0 && Number(msg.soft) > 0 ? { soft: msg.soft, hard: msg.hard } : null });
     if (!msg.ponder) ponderCancel();
     else {
       const d = ponder.decide(hist ? msg.startFen : null, hist ? msg.moves : null);
       if (d.decision === 'hit') { ponderStop(); const e = d.result; noteHitDepth(e.depth); return { uci: e.uci, best: e.uci, san: e.san, sacrifice: e.sacrifice, depth: e.depth, ponderHit: true }; }
+      // 2.0.0 `late`: a ponder worker is on exactly this move and almost done. Wait for it (bounded) instead of thinking from
+      // scratch; the other ponder workers are killed at once. This is the only case where a real search waits for pondering.
+      const opp = hist ? msg.moves[msg.moves.length - 1] : null;
+      const run = d.decision === 'late' && d.running && ponderKind === 'aggro' ? aggroRunning.get(opp) : null;
+      const wait = run && run.token === idleToken ? CV.lateWaitMs(d.runningMeta, Date.now(), b.hard ? b.soft : b.ms) : null;
+      if (wait !== null) {
+        ponderDbg.lateWaits++;
+        idleToken++; idleInfo.pondering = false;              // the job stops taking work; only this worker keeps running
+        for (const x of ponderActive) if (x !== run.w) x.kill();
+        ponderActive = ponderActive.filter((x) => x === run.w);
+        const r = await Promise.race([run.promise.catch(() => null), new Promise((res) => setTimeout(() => res(null), wait + 100))]);
+        run.w.kill(); ponderActive = ponderActive.filter((x) => x !== run.w); ponder.setRunning(null);
+        const res = aggroResult(r);
+        if (res) { ponderDbg.lateWaitHits++; ponderCancel(); noteHitDepth(res.depth); return { ...res, ponderHit: true, late: true }; }
+      }
       ponderCancel();                                          // miss, late or no entry yet: the ponder workers never delay a real think
     }
     const h = aggroGet();
@@ -802,10 +827,8 @@ async function analyzeAggroNow(msg) {
     // 2) older requests' results would be stale
     for (const [id, p] of h.pending) { if (p.think) { h.pending.delete(id); clearTimeout(p.timer); p.resolve({ type: 'bestmove', uci: null }); } }
     const warn = msg.verify ? await aggroVerifyPosition(h, msg) : null;
-    // 3) think: a fixed budget, or the clock budget (soft/hard) when the page sent one; 2.0.0: stretched to the human-like
-    //    pause (msg.softMs) when that is longer, never above the clock's hard limit (CV.aggroBudget, pure)
+    // 3) think with the budget computed above
     const pos = aggroPosition(msg);
-    const b = CV.aggroBudget({ thinkMs: msg.ms, softMs: msg.softMs, clock: Number(msg.hard) > 0 && Number(msg.soft) > 0 ? { soft: msg.soft, hard: msg.hard } : null });
     const req = b.hard ? { type: 'think', ...pos, soft: b.soft, hard: b.hard, ms: b.hard } : { type: 'think', ...pos, ms: b.ms };
     const reqMs = b.hard ? req.hard : req.ms;
     aggroDbg.lastBudget = b;

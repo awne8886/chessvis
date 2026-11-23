@@ -126,4 +126,31 @@ test('AggroChess: delay-matched budget and the predicted reply first', async () 
   assert.ok(bg.get('ponder.get().results')[predicted], 'its reply is ready after one slice');
 });
 
+test('T8: AggroChess late with the reply almost done -> wait for it, other ponder workers killed', async () => {
+  const bg = makeBackground({});
+  const moves = ['e2e4'];
+  const predicted = best(CV.replayUci(START, moves).pos);
+  await bg.send({ type: 'aggroIdle', startFen: START, moves, ponder: true, showEval: false, ponderMs: 1500, ponderWorkers: 2, ponderHashMb: 32, myColor: 'w', ponderUntilMove: false });
+  await sleep(150);                                      // the predicted reply (250 ms slice) is half done
+  const t0 = Date.now();
+  const r = await bg.send({ type: 'analyze', engine: 'aggro', fen: START, startFen: START, moves: [...moves, predicted], ms: 1000, ponder: true });
+  const ms = Date.now() - t0;
+  assert.strictEqual(r.ponderHit, true);
+  assert.strictEqual(r.late, true);
+  assert.ok(ms < 400, 'waited only for the rest of the slice: ' + ms);
+  assert.strictEqual(bg.get('ponderDbg.lateWaitHits'), 1);
+  assert.strictEqual(bg.get('ponderActive.length'), 0);
+});
+
+test('T8: late with too much left -> no wait, normal think', async () => {
+  const bg = makeBackground({});
+  const moves = ['e2e4'];
+  const predicted = best(CV.replayUci(START, moves).pos);
+  await bg.send({ type: 'aggroIdle', startFen: START, moves, ponder: true, showEval: false, ponderMs: 3600, ponderWorkers: 1, ponderHashMb: 32, myColor: 'w', ponderUntilMove: false });
+  await sleep(50);                                       // slice 600 ms, 550 + 70 left > 400
+  const r = await bg.send({ type: 'analyze', engine: 'aggro', fen: START, startFen: START, moves: [...moves, predicted], ms: 300, ponder: true });
+  assert.ok(!r.ponderHit);
+  assert.strictEqual(bg.get('ponderDbg.lateWaits'), 0);
+});
+
 run();

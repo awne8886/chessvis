@@ -273,13 +273,14 @@
       get: () => entry,
       begin(startFen, base, planned) {
         counters.attempts++;
-        entry = { startFen, base: base.slice(), planned: new Set(planned), results: {}, running: null, runningSet: new Set(), counted: new Set(), beganAt: Date.now() };
+        entry = { startFen, base: base.slice(), planned: new Set(planned), results: {}, running: null, runningSet: new Set(), runningMeta: new Map(), counted: new Set(), beganAt: Date.now() };
         return entry;
       },
       skip() { counters.skipped++; },
-      setRunning(uci) { if (entry) { entry.runningSet.clear(); if (uci) entry.runningSet.add(uci); syncRunning(entry); } },
-      addRunning(uci) { if (entry && uci) { entry.runningSet.add(uci); syncRunning(entry); } },
-      removeRunning(uci) { if (entry) { entry.runningSet.delete(uci); syncRunning(entry); } },
+      setRunning(uci) { if (entry) { entry.runningSet.clear(); entry.runningMeta.clear(); if (uci) entry.runningSet.add(uci); syncRunning(entry); } },
+      // meta (2.0.0, optional): { startedAt, ms } of that reply search; decide() hands it back as runningMeta (CV.lateWaitMs)
+      addRunning(uci, meta) { if (entry && uci) { entry.runningSet.add(uci); if (meta) entry.runningMeta.set(uci, { startedAt: meta.startedAt, ms: meta.ms }); else entry.runningMeta.delete(uci); syncRunning(entry); } },
+      removeRunning(uci) { if (entry) { entry.runningSet.delete(uci); entry.runningMeta.delete(uci); syncRunning(entry); } },
       runningMoves: () => (entry ? [...entry.runningSet] : []),
       // Stores the reply found for one opponent move. False if the entry is gone or the answer is empty, or (2.0.0) when a
       // DEEPER reply is already stored for that move (a seed from the main search's PV, or an earlier deepening pass, is never
@@ -293,12 +294,12 @@
       },
       found: () => (entry ? Object.keys(entry.results).length : 0),
       decide(startFen, moves) {
-        if (!entry) return { decision: 'none', result: null, running: false };
-        let decision = 'miss', result = null, running = false;
+        if (!entry) return { decision: 'none', result: null, running: false, runningMeta: null };
+        let decision = 'miss', result = null, running = false, runningMeta = null;
         if (sameBase(entry, startFen, moves)) {
           const opp = moves[moves.length - 1];
           if (entry.results[opp]) { decision = 'hit'; result = entry.results[opp]; }
-          else if (entry.planned.has(opp)) { decision = 'late'; running = entry.runningSet.has(opp); }
+          else if (entry.planned.has(opp)) { decision = 'late'; running = entry.runningSet.has(opp); runningMeta = (running && entry.runningMeta.get(opp)) || null; }
         }
         const key = String(startFen) + '|' + (Array.isArray(moves) ? moves.join(' ') : '');
         let leadMs = null;
@@ -307,7 +308,7 @@
           entry.counted.add(key); counters[decision === 'hit' ? 'hits' : decision === 'late' ? 'late' : 'misses']++;
           if (leadMs !== null) { counters.lastLeadMs = leadMs; leadSum += leadMs; counters.leadSamples++; counters.avgLeadMs = Math.round(leadSum / counters.leadSamples); }
         }
-        return { decision, result, running, leadMs };
+        return { decision, result, running, runningMeta, leadMs };
       },
       // Drops the entry (new game, takeback, setting off, engine switch, miss...). True if there was one.
       invalidate() { const had = !!entry; entry = null; return had; },
@@ -458,6 +459,18 @@
     if (cap > 0 && top.every((u) => results && results[u] && results[u].depth >= cap)) return [];
     const ms = Math.min(CV.PONDER_DEEPEN_MAX_SLICE_MS, first * Math.pow(2, k - 1), room);
     return ms >= CV.PONDER_MIN_SLICE_MS ? top.map((uci) => ({ uci, ms })) : [];
+  };
+
+  // ---- 2.0.0: AggroChess `late` with the move's reply search almost done (pure; background.js) ----
+  // meta = { startedAt, ms } of the running reply search, mainBudgetMs = the think budget a normal search would get.
+  // Returns how long to wait for that search (ms, >= 0), or null = do not wait (think from scratch as in 1.8.0). Waiting is
+  // only worth it when the search ends (with its overrun allowance) within min(400, half the main budget).
+  CV.LATE_WAIT_MAX_MS = 400;
+  CV.lateWaitMs = function (meta, now, mainBudgetMs) {
+    if (!meta || !Number.isFinite(Number(meta.startedAt)) || !(Number(meta.ms) > 0)) return null;
+    const remaining = Number(meta.startedAt) + Number(meta.ms) + CV.PONDER_OVERRUN_MS - Number(now);
+    const limit = Math.min(CV.LATE_WAIT_MAX_MS, 0.5 * Math.max(0, Number(mainBudgetMs) || 0));
+    return remaining <= limit ? Math.max(0, Math.round(remaining)) : null;
   };
 
   // ---- 2.0.0: seeding the ponder table from the main search's principal variation (pure; background.js) ----

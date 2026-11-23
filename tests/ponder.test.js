@@ -138,4 +138,29 @@ test('ponderDeepenPlan: depth cap stops deepening once every top result has dept
   assert.strictEqual(CV.ponderDeepenPlan({ ranked: R, results, pass: 2, workers: 1, firstSlice: 250, leftMs: 5000, depthCap: 0 }).length, 2, 'no cap: keeps going');
 });
 
+// ---- T8: AggroChess late wait ----
+test('decide() returns runningMeta for a running move', () => {
+  const p = CV.createPonderState();
+  p.begin(START, ['e2e4'], ['e7e5', 'c7c5']);
+  p.addRunning('e7e5', { startedAt: 1000, ms: 250 });
+  p.addRunning('c7c5');
+  const d = p.decide(START, ['e2e4', 'e7e5']);
+  assert.strictEqual(d.decision, 'late');
+  assert.deepStrictEqual(d.runningMeta, { startedAt: 1000, ms: 250 });
+  assert.strictEqual(p.decide(START, ['e2e4', 'c7c5']).runningMeta, null, 'running without meta');
+  p.removeRunning('e7e5');
+  assert.strictEqual(p.decide(START, ['e2e4', 'e7e5']).runningMeta, null, 'no longer running');
+});
+test('lateWaitMs: wait only when the search ends within min(400, half the main budget)', () => {
+  const meta = { startedAt: 0, ms: 250 };                     // ends at 250 + 70 (overrun allowance) = 320
+  assert.strictEqual(CV.lateWaitMs(meta, 200, 1000), 120);
+  assert.strictEqual(CV.lateWaitMs(meta, 0, 1000), 320);
+  assert.strictEqual(CV.lateWaitMs(meta, 0, 600), null, 'limit 300 < 320');
+  assert.strictEqual(CV.lateWaitMs({ startedAt: 0, ms: 600 }, 0, 5000), null, 'limit 400 < 670');
+  assert.strictEqual(CV.lateWaitMs({ startedAt: 0, ms: 600 }, 300, 5000), 370);
+  assert.strictEqual(CV.lateWaitMs(meta, 500, 1000), 0, 'already overdue: no extra wait');
+  assert.strictEqual(CV.lateWaitMs(null, 0, 1000), null);
+  assert.strictEqual(CV.lateWaitMs({ startedAt: 0 }, 0, 1000), null);
+});
+
 run();
