@@ -55,6 +55,8 @@ function aggro(file, opts = {}) {
     see: (m) => ex.move_see(write(m)),
     book: (m) => ex.is_book_move(write(m)),
     lastInfo: () => (typeof ex.last_info === 'function' ? read(ex.last_info()) : null),
+    nnRaw: () => ex.nn_eval_raw(),                                        // 2.0.3 builds
+    selftest: (games, plies, seed) => ex.nnue_selftest(games, plies, seed),
     status: () => [ex.game_status(), ex.in_check(), ex.side_to_move()].join(','),
   };
 }

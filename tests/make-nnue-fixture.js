@@ -1,10 +1,11 @@
-// Tool (not a test, 2.0.3): writes tests/fixtures/nnue-eval.txt for tests/engine-signature.test.js: positions from
+// Tool (not a test, 2.0.3): writes tests/fixtures/nnue-eval.txt for tests/net512.test.js: positions from
 // random games played through the engine (both sides to move, kings on both halves of the board, castled and not), each
 // with the raw network output computed OUTSIDE the engine by `pack eval` (bullet's own feature mapping on the quantised
 // network bullet saved). Run it whenever the network changes:
 //
 //   node tests/make-nnue-fixture.js <engine.wasm> <quantised.bin> [--games 40]
-// (pack is built by `cargo build --release` in engine-src/aggrochess/bullet)
+// (any AggroChess build: it only plays random moves and writes FENs; pack is built by `cargo build --release` in
+// engine-src/aggrochess/bullet)
 'use strict';
 const fs = require('fs');
 const path = require('path');

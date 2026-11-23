@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
-# ChessVision 2.0.3: how engine-src/aggrochess/aggro-768x3hm-512.nnue (the AggroChess network) is made. Not part of
-# the extension build: the network file is committed, and tools/build-aggrochess.sh builds the engine with it.
+# ChessVision 2.0.3: how engine-src/aggrochess/aggro-768x3hm-512.nnue (an experimental AggroChess network, NOT shipped:
+# it lost to 4.6.1's network, see engine-src/aggrochess/README.md) is made. Not part of the extension build: the network
+# file is committed, and tools/build-aggrochess.sh --net512 --out DIR builds an engine with it.
 #
 #   1. Self-play data: AggroChess 4.6.1 (native build of the upstream tag, with its own network) plays itself from
 #      random openings with the personality off: `aggro_chess datagen <prefix> <threads> <positions> <nodes> <seed>`
@@ -18,7 +19,10 @@
 #                                 [--superbatches K] [--batches B] [--lr X] [--wdl X] [--skip-datagen]
 # Defaults: --work .build/net, --threads 4, --positions 6000000, --nodes 3000, --seed 1001, --superbatches 40,
 # --batches = one pass over the data per superbatch (positions / 16384), --lr 0.001, --wdl 0.3.
-# 2.0.3's network: the defaults except --positions (see engine-src/aggrochess/README.md for the numbers used).
+# 2.0.3's network: two datagen runs of 4 threads at 3000 nodes (seeds 1001 and 2002, stopped after 3.4 and 3.3 million
+# positions), then --skip-datagen --superbatches 24 (engine-src/aggrochess/README.md has the numbers).
+# Then: copy the network to engine-src/aggrochess/, set OUT_SCALE in src/nnue512.rs, build with --net512, regenerate
+# tests/fixtures/nnue-eval.txt (tests/make-nnue-fixture.js), and play tests/match-aggro.js against engine/.
 set -euo pipefail
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
 WORK=$ROOT/.build/net THREADS=4 POSITIONS=6000000 NODES=3000 SEED=1001 SB=40 BATCHES= LR=0.001 WDL=0.3 SKIP=0
@@ -54,6 +58,6 @@ N=$(( $(stat -c %s "$WORK/train.bf") / 32 ))
 "$BIN/train" "$WORK/train.bf" "$WORK/checkpoints" "$SB" "$BATCHES" "$THREADS" "$LR" "$WDL" aggro-768x3hm-512
 Q=$(ls -d "$WORK"/checkpoints/aggro-768x3hm-512-"$SB" | head -1)/quantised.bin
 "$BIN/pack" "$Q" "$WORK/aggro-768x3hm-512.nnue"
-"$BIN/pack" loss "$Q" "$WORK/valid.bf" "$WDL"
+"$BIN/pack" loss "$Q" "$WORK/valid.bf" "$WDL" "$ROOT/engine-src/aggrochess/aggro.nnue"
 "$BIN/pack" calibrate "$Q" "$ROOT/engine-src/aggrochess/aggro.nnue" "$WORK/valid.bf" 100000
-echo "network: $WORK/aggro-768x3hm-512.nnue (copy it to engine-src/aggrochess/, set OUT_SCALE in src/nnue.rs)"
+echo "network: $WORK/aggro-768x3hm-512.nnue (copy it to engine-src/aggrochess/, set OUT_SCALE in src/nnue512.rs)"

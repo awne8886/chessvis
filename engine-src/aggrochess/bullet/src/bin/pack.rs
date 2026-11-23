@@ -146,15 +146,17 @@ fn calibrate(a: &[String]) {
 
 /// `pack loss <quantised.bin> <valid.bf> [wdl]`: the training loss (sigmoid(output / 400) against
 /// wdl x result + (1 - wdl) x sigmoid(score / 400), squared error) of the quantised network on held-out positions
-/// (bullet's CPU backend does not compute a validation loss itself).
+/// (bullet's CPU backend does not compute a validation loss itself). With 4.6.1's aggro.nnue as a fourth argument, also
+/// that network's loss on the same positions (its raw output, the unit it was trained in), for comparison.
 fn loss(a: &[String]) {
-    use bullet_lib::game::inputs::{ChessBucketsMirrored, SparseInputType};
-    let nets = load_nets(&a[0], "");
+    use bullet_lib::game::inputs::{Chess768, ChessBucketsMirrored, SparseInputType};
+    let old_path = a.get(3).map(String::as_str).unwrap_or("");
+    let nets = load_nets(&a[0], old_path);
     let data = std::fs::read(&a[1]).expect("valid.bf");
     let wdl: f64 = a.get(2).map(|s| s.parse().unwrap()).unwrap_or(0.3);
     let inputs = ChessBucketsMirrored::new(train::BUCKET_LAYOUT);
     let sig = |x: f64| 1.0 / (1.0 + (-x / 400.0).exp());
-    let (mut sum, mut n) = (0f64, 0f64);
+    let (mut sum, mut sum_old, mut n) = (0f64, 0f64, 0f64);
     for rec in data.chunks_exact(32) {
         // SAFETY: a bulletformat record is a plain 32-byte repr(C) ChessBoard
         let board: bulletformat::ChessBoard = unsafe { std::mem::transmute::<[u8; 32], _>(rec.try_into().unwrap()) };
@@ -163,9 +165,18 @@ fn loss(a: &[String]) {
         let out = raw_eval(&nets.new, train::HL, &board, &f) as f64;
         let target = wdl * f64::from(board.result) / 2.0 + (1.0 - wdl) * sig(f64::from(board.score));
         sum += (sig(out) - target).powi(2);
+        if !old_path.is_empty() {
+            let mut fo = Vec::with_capacity(32);
+            Chess768.map_features(&board, |s, n| fo.push((s, n)));
+            sum_old += (sig(raw_eval(&nets.old, 256, &board, &fo) as f64) - target).powi(2);
+        }
         n += 1.0;
     }
-    println!("positions {n}, loss {:.6}", sum / n);
+    if old_path.is_empty() {
+        println!("positions {n}, loss {:.6}", sum / n);
+    } else {
+        println!("positions {n}, loss {:.6} (4.6.1's network: {:.6})", sum / n, sum_old / n);
+    }
 }
 
 fn main() {

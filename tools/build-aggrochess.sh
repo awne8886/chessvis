@@ -5,6 +5,9 @@
 #   tools/build-aggrochess.sh --out DIR        build both into DIR instead of engine/
 #   tools/build-aggrochess.sh --upstream-diff  also write engine-src/aggrochess/upstream.diff (needs git + network):
 #                                              every change against the AggroChess 4.6.1 sources it was made from
+#   tools/build-aggrochess.sh --net512 --out DIR   the 2.0.3 experiment (cargo feature net512: the (768 x 3 king
+#                                              buckets -> 512) x 2 network, src/nnue512.rs); not shipped, so --out is
+#                                              required (engine-src/aggrochess/README.md, "The 2.0.3 network")
 #
 # Pinned tools (a different version gives a different binary, maybe a different speed, but must not change a search;
 # check with: node tests/bench-engines.js --diff OLD.wasm NEW.wasm and node tests/engine-signature.test.js):
@@ -27,13 +30,16 @@ ROOT=$(cd "$(dirname "$0")/.." && pwd)
 CRATE=$ROOT/engine-src/aggrochess
 OUT=$ROOT/engine
 UPSTREAM_DIFF=0
+FEATURES=
 while [ $# -gt 0 ]; do
   case "$1" in
     --out) OUT=$(mkdir -p "$2" && cd "$2" && pwd); shift 2 ;;
     --upstream-diff) UPSTREAM_DIFF=1; shift ;;
+    --net512) FEATURES=net512; shift ;;
     *) echo "unknown option $1" >&2; exit 2 ;;
   esac
 done
+if [ -n "$FEATURES" ] && [ "$OUT" = "$ROOT/engine" ]; then echo "--net512 needs --out DIR (it is not shipped)" >&2; exit 2; fi
 
 if ! rustup run "$RUST_TOOLCHAIN" rustc -V >/dev/null 2>&1; then
   rustup toolchain install "$RUST_TOOLCHAIN" --profile minimal --target wasm32-unknown-unknown
@@ -62,7 +68,7 @@ fi
 
 build() {   # $1 = output name, $2 = extra RUSTFLAGS, $3 = target dir
   (cd "$CRATE" && RUSTFLAGS="$2 $REMAP" CARGO_TARGET_DIR="$CRATE/$3" \
-    cargo "+$RUST_TOOLCHAIN" build --release --locked --target wasm32-unknown-unknown)
+    cargo "+$RUST_TOOLCHAIN" build --release --locked --target wasm32-unknown-unknown ${FEATURES:+--features $FEATURES})
   local wasm="$CRATE/$3/wasm32-unknown-unknown/release/aggrochess_web.wasm"
   if [ "${WASM_OPT:-1}" = "1" ]; then
     local opt="$BINARYEN/wasm-opt"
@@ -74,8 +80,8 @@ build() {   # $1 = output name, $2 = extra RUSTFLAGS, $3 = target dir
   fi
 }
 
-build aggrochess.wasm "" target
-build aggrochess-simd.wasm "-C target-feature=+simd128" target-simd
+build aggrochess.wasm "" target${FEATURES:+-$FEATURES}
+build aggrochess-simd.wasm "-C target-feature=+simd128" target-simd${FEATURES:+-$FEATURES}
 
 if [ "$UPSTREAM_DIFF" = "1" ]; then
   TMP=$(mktemp -d)
