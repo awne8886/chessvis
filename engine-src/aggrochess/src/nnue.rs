@@ -113,6 +113,11 @@ impl Default for Accumulator {
 
 #[inline(always)]
 fn add(acc: &mut [i16; H], w: &[i16]) {
+    #[cfg(all(target_arch = "wasm32", target_feature = "simd128"))]
+    {
+        return wasm_simd::add(acc, w);
+    }
+    #[allow(unreachable_code)]
     for (a, b) in acc.iter_mut().zip(w) {
         *a = a.wrapping_add(*b);
     }
@@ -298,6 +303,11 @@ fn update(out: &mut [i16; H], src: &[i16; H], a0: &[i16], s0: &[i16], a1: Option
             return unsafe { update_avx2(out, src, a0, s0, a1, s1) };
         }
     }
+    #[cfg(all(target_arch = "wasm32", target_feature = "simd128"))]
+    {
+        return wasm_simd::update(out, src, a0, s0, a1, s1);
+    }
+    #[allow(unreachable_code)]
     update_body(out, src, a0, s0, a1, s1)
 }
 
@@ -316,7 +326,97 @@ fn screlu_dot(acc: &[i16; H], w: &[i16]) -> i64 {
             return unsafe { screlu_dot_avx2(acc, w) };
         }
     }
+    #[cfg(all(target_arch = "wasm32", target_feature = "simd128"))]
+    {
+        return wasm_simd::screlu_dot(acc, w);
+    }
+    #[allow(unreachable_code)]
     screlu_dot_body(acc, w)
+}
+
+/// Explicit WebAssembly SIMD (ChessVision 2.0.2) for the simd128 build. Bit-exact with the scalar code:
+/// - the accumulator updates are wrapping i16 adds / subs, as in `update_body` / `add`;
+/// - `screlu_dot`: v = clamp(acc, 0, QA), vw = v * w (wrapping i16, as `wrapping_mul`), then v * vw summed as i32 with
+///   `i32x4.dot_i16x8_s` (pairs of exact i32 products). Each lane of each of the two accumulators sums 32 products of
+///   at most 255 * 32767 in magnitude (< 2^23), so no i32 sum can overflow and the i64 total is the scalar one.
+#[cfg(all(target_arch = "wasm32", target_feature = "simd128"))]
+mod wasm_simd {
+    use super::{H, QA};
+    use core::arch::wasm32::*;
+
+    #[inline(always)]
+    fn ld(p: &[i16], i: usize) -> v128 {
+        debug_assert!(i + 8 <= p.len());
+        // SAFETY: i + 8 <= p.len() for every caller (slices of H = 256 values, i a multiple of 8 below H);
+        // wasm loads have no alignment requirement
+        unsafe { v128_load(p.as_ptr().add(i) as *const v128) }
+    }
+
+    #[inline(always)]
+    fn st(p: &mut [i16], i: usize, v: v128) {
+        debug_assert!(i + 8 <= p.len());
+        // SAFETY: as in ld
+        unsafe { v128_store(p.as_mut_ptr().add(i) as *mut v128, v) }
+    }
+
+    #[inline(always)]
+    pub(super) fn add(acc: &mut [i16; H], w: &[i16]) {
+        let w = &w[..H];
+        for i in (0..H).step_by(8) {
+            let v = i16x8_add(ld(acc, i), ld(w, i));
+            st(acc, i, v);
+        }
+    }
+
+    #[inline(always)]
+    pub(super) fn update(out: &mut [i16; H], src: &[i16; H], a0: &[i16], s0: &[i16], a1: Option<&[i16]>, s1: Option<&[i16]>) {
+        let (a0, s0) = (&a0[..H], &s0[..H]);
+        match (a1, s1) {
+            (None, None) => {
+                for i in (0..H).step_by(8) {
+                    st(out, i, i16x8_sub(i16x8_add(ld(src, i), ld(a0, i)), ld(s0, i)));
+                }
+            }
+            (None, Some(s1)) => {
+                let s1 = &s1[..H];
+                for i in (0..H).step_by(8) {
+                    st(out, i, i16x8_sub(i16x8_sub(i16x8_add(ld(src, i), ld(a0, i)), ld(s0, i)), ld(s1, i)));
+                }
+            }
+            (Some(a1), Some(s1)) => {
+                let (a1, s1) = (&a1[..H], &s1[..H]);
+                for i in (0..H).step_by(8) {
+                    let v = i16x8_add(i16x8_add(ld(src, i), ld(a0, i)), ld(a1, i));
+                    st(out, i, i16x8_sub(i16x8_sub(v, ld(s0, i)), ld(s1, i)));
+                }
+            }
+            (Some(a1), None) => {
+                let a1 = &a1[..H];
+                for i in (0..H).step_by(8) {
+                    st(out, i, i16x8_sub(i16x8_add(i16x8_add(ld(src, i), ld(a0, i)), ld(a1, i)), ld(s0, i)));
+                }
+            }
+        }
+    }
+
+    #[inline(always)]
+    pub(super) fn screlu_dot(acc: &[i16; H], w: &[i16]) -> i64 {
+        let w = &w[..H];
+        let zero = i16x8_splat(0);
+        let qa = i16x8_splat(QA as i16);
+        let mut sum0 = i32x4_splat(0);
+        let mut sum1 = i32x4_splat(0);
+        for i in (0..H).step_by(16) {
+            let v0 = i16x8_min(i16x8_max(ld(acc, i), zero), qa);
+            let v1 = i16x8_min(i16x8_max(ld(acc, i + 8), zero), qa);
+            sum0 = i32x4_add(sum0, i32x4_dot_i16x8(v0, i16x8_mul(v0, ld(w, i))));
+            sum1 = i32x4_add(sum1, i32x4_dot_i16x8(v1, i16x8_mul(v1, ld(w, i + 8))));
+        }
+        let lanes = |s: v128| {
+            i32x4_extract_lane::<0>(s) as i64 + i32x4_extract_lane::<1>(s) as i64 + i32x4_extract_lane::<2>(s) as i64 + i32x4_extract_lane::<3>(s) as i64
+        };
+        lanes(sum0) + lanes(sum1)
+    }
 }
 
 #[inline(always)]
