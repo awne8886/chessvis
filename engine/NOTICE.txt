@@ -15,8 +15,8 @@ engine/aggrochess-simd.wasm - the same engine built with simd128 (chosen when We
                               the SIMD build with RUSTFLAGS="-C target-feature=+simd128"). The build is byte-reproducible.
                               Dependencies (crates.io, compiled in): cozy-chess 0.3.4 and cozy-chess-types 0.2.2 (MIT),
                               polyglot-book-rs 0.1.0 (MIT OR Apache-2.0).
-                              engine/aggrochess.wasm      sha256 fc2d7c3a51b3c400629fb094166e2372a3c9cb83bf4f7e39d2fb42eb4e2d35ed
-                              engine/aggrochess-simd.wasm sha256 44512251598a347193f2ba3c86ea2e4cc6ba93cb54a27febc13af58b5353435e
+                              engine/aggrochess.wasm      sha256 7207bed530c6aac1dc2d6b591fe9c899f9978e1f81fc977598a981c073df967a
+                              engine/aggrochess-simd.wasm sha256 bf5d7821d6f02576d99229f847e434b33dd5025264c1410235bd75aec2b9053d
 
 Stockfish.js 19, WebAssembly lite single-thread build (added in 1.6.0)
 engine/stockfish-19-lite-single.js    - loader/worker, Stockfish.js 19 (c) 2026 Chess.com, LLC, GPL-3.0

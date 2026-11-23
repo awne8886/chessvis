@@ -477,6 +477,7 @@ const AGGRO_THINK_MARGIN_MS = 4000;       // ... plus this, before the worker is
 const AGGRO_QUICK_REQ_MS = 3000;          // timeout for the cheap requests (position, ponderMove, clear)
 const AGGRO_EVAL_MS = 300;                // budget of the idle evaluation line (inside the ponder time)
 const AGGRO_HARD_MAX_MS = 60000;          // upper bound for any search budget that arrives in a message
+const AGGRO_STOP_TIMEOUT_MS = 150;        // 2.0.2: an interruptible worker must answer a stop within this long, else it is terminated
 
 // Creates one worker. Returns { ready, request(msg, timeoutMs), kill(), dead }.
 // `ready` rejects on a worker 'error' message before 'ready', on worker.onerror and after AGGRO_START_TIMEOUT_MS.
@@ -485,10 +486,19 @@ function spawnAggroWorker(label, ttMb) {
   // (history keys after an opponent move) whose replies it searched in its last job, so the next job can give the line
   // that was played to the worker whose hash holds it.
   const h = { kind: 'aggro', label, ttMb: ttMb || null, steps: false, worker: null, dead: false, pending: new Map(), seq: 0,
-    gen: typeof ponderGen === 'number' ? ponderGen : 0, isReady: false, searched: new Set() };
+    gen: typeof ponderGen === 'number' ? ponderGen : 0, isReady: false, searched: new Set(), interruptible: false, idleWaiters: [] };
   if (label === 'ponder') ponderDbg.aggroSpawns++;
+  // waiters for a set of requests to be answered (stopAll)
+  const notifyIdle = () => {
+    if (!h.idleWaiters.length) return;
+    const done = h.idleWaiters.filter((w) => w.ids.every((id) => !h.pending.has(id)));
+    if (!done.length) return;
+    h.idleWaiters = h.idleWaiters.filter((w) => !done.includes(w));
+    for (const w of done) w.resolve(true);
+  };
   const failAll = (why) => {
     for (const [id, p] of h.pending) { h.pending.delete(id); clearTimeout(p.timer); p.reject(new Error(why)); }
+    notifyIdle();
   };
   h.ready = new Promise((resolve, reject) => {
     let settled = false;
@@ -498,13 +508,14 @@ function spawnAggroWorker(label, ttMb) {
     try { h.worker = new Worker(api.runtime.getURL(AGGRO_WORKER)); } catch (e) { fail('could not create worker: ' + ((e && e.message) || e)); return; }
     h.worker.onmessage = (e) => {
       const m = e.data || {};
-      if (m.type === 'ready') { h.how = m.how || null; h.warmMs = m.warmMs; h.steps = !!m.steps; h.isReady = true; aggroDbg.workerStarts++; aggroDbg.lastStart = { label, how: h.how, warmMs: h.warmMs }; settle(resolve); return; }
+      if (m.type === 'ready') { h.how = m.how || null; h.warmMs = m.warmMs; h.steps = !!m.steps; h.isReady = true; h.interruptible = !!m.interruptible; aggroDbg.workerStarts++; aggroDbg.lastStart = { label, how: h.how, warmMs: h.warmMs, interruptible: h.interruptible }; settle(resolve); return; }
       if (m.type === 'error' && !settled) { fail(m.message || 'worker error'); return; }
       const p = h.pending.get(m.id);
       if (m.type === 'error') console.error('[ChessVision] AggroChess (' + label + ') error', m.message);
       if (!p) return;
       h.pending.delete(m.id); clearTimeout(p.timer);
       if (m.type === 'error') p.reject(new Error(m.message || 'worker error')); else p.resolve(m);
+      notifyIdle();
     };
     h.worker.onerror = (e) => fail('worker error: ' + ((e && e.message) || 'unknown'));
     // First message: the compiled module (or null: the worker loads the file itself). If the Module cannot be cloned,
@@ -521,13 +532,31 @@ function spawnAggroWorker(label, ttMb) {
   });
   h.ready.catch(() => {});      // a start failure is reported by whoever awaits ready; never an unhandled rejection
   // Posts a message and resolves with the worker's reply. Rejects on timeout or when the worker fails.
-  h.request = (msg, timeoutMs) => new Promise((resolve, reject) => {
-    if (h.dead) { reject(new Error('worker was terminated')); return; }
-    const id = ++h.seq;
-    const timer = setTimeout(() => { h.pending.delete(id); reject(new Error('no answer within ' + timeoutMs + ' ms')); }, timeoutMs);
-    h.pending.set(id, { resolve, reject, timer, think: msg.type === 'think' });
-    try { h.worker.postMessage({ ...msg, id }); } catch (e) { h.pending.delete(id); clearTimeout(timer); reject(e); }
-  });
+  h.request = (msg, timeoutMs) => {
+    let id = null;
+    const pr = new Promise((resolve, reject) => {
+      if (h.dead) { reject(new Error('worker was terminated')); return; }
+      id = ++h.seq;
+      const timer = setTimeout(() => { h.pending.delete(id); reject(new Error('no answer within ' + timeoutMs + ' ms')); notifyIdle(); }, timeoutMs);
+      h.pending.set(id, { resolve, reject, timer, think: msg.type === 'think', search: msg.type === 'think' || msg.type === 'analyze' });
+      try { h.worker.postMessage({ ...msg, id }); } catch (e) { h.pending.delete(id); clearTimeout(timer); reject(e); }
+    });
+    pr.id = id;                       // 2.0.2: for { type: 'stop', id }
+    return pr;
+  };
+  // 2.0.2 (A7): end the search(es) in flight (interruptible workers only, JSPI): each answers with its best move so far.
+  h.stop = (id) => { try { if (!h.dead) h.worker.postMessage({ type: 'stop', id }); } catch (e) { /* ignore */ } };
+  // stop every request in flight and wait until they are answered (later requests do not count); false after capMs
+  h.stopAll = (capMs) => {
+    const ids = [...h.pending.keys()];
+    for (const [id, p] of h.pending) if (p.search) h.stop(id);
+    if (!ids.length) return Promise.resolve(true);
+    return new Promise((resolve) => {
+      const w = { ids, resolve: (v) => { clearTimeout(t); resolve(v); } };
+      const t = setTimeout(() => { h.idleWaiters = h.idleWaiters.filter((x) => x !== w); resolve(false); }, capMs);
+      h.idleWaiters.push(w);
+    });
+  };
   h.kill = () => {
     if (h.dead) return;
     h.dead = true;
@@ -650,7 +679,11 @@ const ponderDbg = { lastPasses: 0, hitDepths: [], harvestUpgrades: 0, lateWaits:
   aggroSpawns: 0, aggroRecycled: 0, aggroKilled: 0, jobs: 0, claimCold: 0, claimWarmLine: 0,
   // 2.0.2 (C2): ponder-hit top-ups started / whose result was deeper and used / that changed the move; the last 20 as
   // [depth of the prepared reply, depth played, depth the top-up reached]
-  topUps: 0, topUpUsed: 0, hitChanged: 0, topUpDepths: [] };
+  topUps: 0, topUpUsed: 0, hitChanged: 0, topUpDepths: [],
+  // 2.0.2 (A7): interruptible AggroChess workers: stops sent, answered in time / terminated, the last 20 stop times (ms);
+  // late searches stopped and their move used
+  stops: 0, stopsOk: 0, stopsFailed: 0, stopMs: [], lateStops: 0, lateStopHits: 0, claimStopping: 0 };
+const noteStopMs = (ms, ok) => { ponderDbg.stops++; ponderDbg[ok ? 'stopsOk' : 'stopsFailed']++; ponderDbg.stopMs.push(ms); if (ponderDbg.stopMs.length > 20) ponderDbg.stopMs.shift(); };
 const noteHitDepth = (d) => { ponderDbg.hitDepths.push(d || 0); if (ponderDbg.hitDepths.length > 20) ponderDbg.hitDepths.shift(); };
 
 // The job's ceiling (ms): the *PonderMs budget (1.8.0), or with ponderUntilMove (2.0.0) max(budget, ponderMaxMs): the job
@@ -748,6 +781,15 @@ function ponderClaim(n, prefer) {
   }
   const got = [];
   while (got.length < n && ponderSpares.length) got.push(ponderSpares.shift());
+  // 2.0.2 (A7): an AggroChess worker that is being stopped is free again in a few ms (its search ends at the next poll,
+  // and the worker runs requests one after the other): take it rather than start a cold one
+  while (got.length < n) {
+    const i = ponderCancelling.findIndex((w) => w.kind === 'aggro' && ponderKind === 'aggro' && !w.dead && w.ttMb === ponderHashMb);
+    if (i < 0) break;
+    const w = ponderCancelling.splice(i, 1)[0];
+    w.claimedWhileStopping = true; ponderDbg.claimStopping++;
+    got.push(w);
+  }
   while (got.length < n) got.push(ponderSpawn());
   for (const w of got) {
     if (w.gen !== ponderGen) w.newGame(ponderGen);       // a new game began since this worker last searched (sf: ucinewgame, aggro: clear)
@@ -762,13 +804,32 @@ function ponderClaim(n, prefer) {
 // CV.AGGRO_PONDER_RECYCLE = false: every job worker is terminated (2.0.0); ponderTopUp makes warm replacements.
 function aggroRelease(w) {
   ponderActive = ponderActive.filter((x) => x !== w);
-  if (w.dead) return;
+  if (w.dead || ponderCancelling.includes(w)) return;
   ponderSpares = ponderSpares.filter((x) => !x.dead && x !== w);
-  const keep = CV.AGGRO_PONDER_RECYCLE && !w.busy() && ponderWanted && ponderKind === 'aggro' && w.ttMb === ponderHashMb &&
-    ponderActive.length + ponderSpares.length + ponderCancelling.length < ponderCap;
+  const wanted = CV.AGGRO_PONDER_RECYCLE && ponderWanted && ponderKind === 'aggro' && w.ttMb === ponderHashMb;
+  // 2.0.2 (A7): a busy worker that can be interrupted (JSPI) is stopped and kept, like a Stockfish worker
+  if (wanted && w.busy() && w.interruptible && CV.AGGRO_INTERRUPT) { aggroStopRelease(w); return; }
+  const keep = wanted && !w.busy() && ponderActive.length + ponderSpares.length + ponderCancelling.length < ponderCap;
   if (!keep) { w.kill(); ponderDbg.aggroKilled++; return; }
   ponderSpares.push(w);
   ponderDbg.aggroRecycled++;
+}
+// stop + wait for the answer (at most AGGRO_STOP_TIMEOUT_MS, then terminate); counted in ponderCancelling meanwhile
+async function aggroStopRelease(w) {
+  ponderCancelling.push(w);
+  const t0 = Date.now();
+  let ok = false;
+  try { ok = await w.stopAll(AGGRO_STOP_TIMEOUT_MS); } catch (e) { ok = false; }
+  ponderCancelling = ponderCancelling.filter((x) => x !== w);
+  if (w.claimedWhileStopping) {                          // a new job has it already
+    w.claimedWhileStopping = false;
+    noteStopMs(Date.now() - t0, ok);
+    if (!ok && !w.dead) { w.kill(); ponderDbg.aggroKilled++; }   // its old search did not stop: the job goes on without it
+    return;
+  }
+  noteStopMs(Date.now() - t0, ok);
+  if (!ok || w.dead) { w.kill(); ponderDbg.aggroKilled++; ponderTopUp(); return; }
+  aggroRelease(w);
 }
 function ponderDrop(w) {          // a job worker is finished: Stockfish workers are stopped and recycled, AggroChess ones recycled when idle (aggroRelease)
   if (w.kind === 'sf') { sfRelease(w); return; }
@@ -956,6 +1017,20 @@ function aggroIdle(msg) {
   return { state: 'started' };
 }
 
+// 2.0.2 (C2): think(pause) on the main worker when the pause is at least the time the prepared reply was searched with
+// (e.ms). Returns the topUp handle for the page, or null.
+function aggroHitTopUp(msg, e, t0) {
+  const left = hitLeftMs(msg, t0);
+  const plan = left > 0 ? CV.hitTopUp({ engine: 'aggro', storedDepth: e.depth, storedMs: e.ms, hitSoftMs: left }) : null;
+  if (!plan || !plan.search) return null;
+  return startHitTopUp('aggro', e, plan.ms, async () => {
+    const h = aggroGet();
+    await h.ready;
+    const r = await h.request({ type: 'think', ...aggroPosition(msg), ms: plan.ms }, plan.ms * AGGRO_THINK_FACTOR + AGGRO_THINK_MARGIN_MS);
+    return aggroResult(r);
+  });
+}
+
 // The real request. Never throws: failures come back as { error } .
 async function analyzeAggro(msg) {
   aggroThinking++;                     // while a real search runs, no spare ponder worker is made (see ponderTopUp)
@@ -976,17 +1051,8 @@ async function analyzeAggroNow(msg) {
       if (d.decision === 'hit') {
         ponderStop(); const e = d.result; noteHitDepth(e.depth);
         const res = { uci: e.uci, best: e.uci, san: e.san, sacrifice: e.sacrifice, depth: e.depth, ponderHit: true };
-        // 2.0.2 (C2): think(pause) on the main worker when the pause is at least the slice the reply was searched with
-        const left = hitLeftMs(msg, t0);
-        const plan = left > 0 ? CV.hitTopUp({ engine: 'aggro', storedDepth: e.depth, storedMs: e.ms, hitSoftMs: left }) : null;
-        if (plan && plan.search) {
-          res.topUp = startHitTopUp('aggro', e, plan.ms, async () => {
-            const h = aggroGet();
-            await h.ready;
-            const r = await h.request({ type: 'think', ...aggroPosition(msg), ms: plan.ms }, plan.ms * AGGRO_THINK_FACTOR + AGGRO_THINK_MARGIN_MS);
-            return aggroResult(r);
-          });
-        }
+        const topUp = aggroHitTopUp(msg, e, t0);
+        if (topUp) res.topUp = topUp;
         return res;
       }
       // 2.0.0 `late`: a ponder worker is on exactly this move and almost done. Wait for it (bounded) instead of thinking from
@@ -1002,13 +1068,31 @@ async function analyzeAggroNow(msg) {
         aggroRelease(run.w); ponder.setRunning(null);         // answered: kept; still searching: terminated
         const res = aggroResult(r);
         if (res) { ponderDbg.lateWaitHits++; ponderCancel(); noteHitDepth(res.depth); return { ...res, ponderHit: true, late: true }; }
+      } else if (run && run.token === idleToken && run.w.interruptible && CV.AGGRO_INTERRUPT && run.promise.id) {
+        // 2.0.2 (A7): the reply search on this move is far from done, but it can be stopped (JSPI): its move so far (the
+        // last completed depth) is used when deep enough, and deepened through the hit pause like a hit (C2).
+        ponderDbg.lateStops++;
+        idleToken++; idleInfo.pondering = false;
+        for (const x of ponderActive.filter((y) => y !== run.w)) aggroRelease(x);
+        const startedAt = d.runningMeta ? d.runningMeta.startedAt : null;
+        run.w.stop(run.promise.id);
+        const r = await Promise.race([run.promise.catch(() => null), new Promise((res) => setTimeout(() => res(null), AGGRO_STOP_TIMEOUT_MS))]);
+        aggroRelease(run.w); ponder.setRunning(null);
+        const res = aggroResult(r);
+        if (res && res.depth >= CV.AGGRO_PARTIAL_MIN_DEPTH) {
+          ponderDbg.lateStopHits++; ponderCancel(); noteHitDepth(res.depth);
+          const out = { ...res, ponderHit: true, late: true, partial: true };
+          const topUp = aggroHitTopUp(msg, { ...res, ms: startedAt ? Date.now() - startedAt : 0 }, t0);
+          if (topUp) out.topUp = topUp;
+          return out;
+        }
       }
       ponderCancel();                                          // miss, late or no entry yet: the ponder workers never delay a real think
     }
     const h = aggroGet();
     await h.ready;
     // 2) older requests' results would be stale
-    for (const [id, p] of h.pending) { if (p.think) { h.pending.delete(id); clearTimeout(p.timer); p.resolve({ type: 'bestmove', uci: null }); } }
+    for (const [id, p] of h.pending) { if (p.think) { h.pending.delete(id); clearTimeout(p.timer); p.resolve({ type: 'bestmove', uci: null }); if (h.interruptible && CV.AGGRO_INTERRUPT) h.stop(id); } }
     const warn = msg.verify ? await aggroVerifyPosition(h, msg) : null;
     // 3) think with the budget computed above
     const pos = aggroPosition(msg);
@@ -1300,6 +1384,8 @@ api.runtime.onMessage.addListener((msg) => {
   if (msg && msg.type === 'aggroDebug') {
     return Promise.resolve({ ponder: { ...ponder.counters, passes: ponderDbg.lastPasses, hitDepths: ponderDbg.hitDepths.slice(), harvestUpgrades: ponderDbg.harvestUpgrades, lateWaits: ponderDbg.lateWaits, lateWaitHits: ponderDbg.lateWaitHits,
       hitTopUp: { started: ponderDbg.topUps, used: ponderDbg.topUpUsed, changed: ponderDbg.hitChanged, depths: ponderDbg.topUpDepths.slice() },
+      interrupt: { enabled: !!CV.AGGRO_INTERRUPT, mainInterruptible: !!(aggroMain && aggroMain.interruptible), stops: ponderDbg.stops, ok: ponderDbg.stopsOk, failed: ponderDbg.stopsFailed,
+        stopMs: ponderDbg.stopMs.slice(), lateStops: ponderDbg.lateStops, lateStopHits: ponderDbg.lateStopHits, claimedWhileStopping: ponderDbg.claimStopping },
       aggroWorkers: { jobs: ponderDbg.jobs, spawns: ponderDbg.aggroSpawns, respawnsPerMove: ponderDbg.jobs ? +(ponderDbg.aggroSpawns / ponderDbg.jobs).toFixed(2) : null, recycled: ponderDbg.aggroRecycled, killed: ponderDbg.aggroKilled, coldClaims: ponderDbg.claimCold, warmLineFirst: ponderDbg.claimWarmLine, recycle: !!CV.AGGRO_PONDER_RECYCLE } },
       verify: { checks: aggroDbg.verifyChecks, warnings: aggroDbg.verifyWarnings, last: aggroDbg.lastVerify },
       aggroWorkerAlive: !!(aggroMain && !aggroMain.dead), aggroRestarts: aggroDbg.restarts, aggroFailure: aggroFailure ? aggroFailure.message : null,

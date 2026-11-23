@@ -9,18 +9,43 @@
 //! `Duration::from_micros(((now - start).max(0.0) * 1000.0) as u64)` and `seed()` combines two random numbers exactly as
 //! that build does, so the rebuilt engine searches the same tree and picks the same book moves.
 
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 #[link(wasm_import_module = "env")]
 extern "C" {
     fn js_now() -> f64;
     fn js_random() -> f64;
+    /// ChessVision 2.0.2: "should the search stop?" (non-zero = yes). The page answers 0 unless a `stop` arrived; with
+    /// JSPI it is a WebAssembly.Suspending import, so the worker's event loop runs (and can receive `stop`) meanwhile.
+    fn js_poll() -> i32;
 }
+
+/// The latest js_now() value and the time of the next js_poll() (f64 bits), so polling needs no clock read of its own.
+static LAST_NOW: AtomicU64 = AtomicU64::new(0);
+static NEXT_POLL: AtomicU64 = AtomicU64::new(0);
+/// js_poll() is called at most this often (ms of the page's clock).
+pub const POLL_EVERY_MS: f64 = 8.0;
 
 #[inline]
 fn now_ms() -> f64 {
     // SAFETY: a plain import without arguments or memory access
-    unsafe { js_now() }
+    let t = unsafe { js_now() };
+    LAST_NOW.store(t.to_bits(), Ordering::Relaxed);
+    t
+}
+
+/// Called right after a clock read (the search's time check): asks the page whether to stop, at most every
+/// POLL_EVERY_MS. True = stop now.
+#[inline]
+pub fn poll_stop() -> bool {
+    let now = f64::from_bits(LAST_NOW.load(Ordering::Relaxed));
+    if now < f64::from_bits(NEXT_POLL.load(Ordering::Relaxed)) {
+        return false;
+    }
+    NEXT_POLL.store((now + POLL_EVERY_MS).to_bits(), Ordering::Relaxed);
+    // SAFETY: a plain import without arguments or memory access
+    unsafe { js_poll() != 0 }
 }
 
 /// A float in [0, 1) from JavaScript.

@@ -87,6 +87,55 @@ test('CV.AGGRO_PONDER_RECYCLE = false restores 2.0.0: every job worker is termin
   assert.strictEqual(bg.get('ponderDbg.aggroRecycled'), 0);
 });
 
+// ---- 2.0.2 A7: interruptible workers (JSPI) ----
+test('A7: busy interruptible workers are stopped and recycled with their hash, not terminated', async () => {
+  const bg = makeBackground({ aggroStartMs: 5, aggroInterruptible: true });
+  await bg.send(idle(['e2e4'], { ponderMs: 3600 }));             // 600 ms reply slices
+  await sleep(250);
+  const busy = bg.get('ponderActive.filter((w) => w.busy()).map((w) => w.worker.id)');
+  assert.ok(busy.length >= 1);
+  const created = aggroWorkers(bg).length;
+  await bg.send(idle(['e2e4', 'e7e5', 'g1f3']));
+  await sleep(60);
+  for (const id of busy) assert.ok(!bg.workers[id].dead, 'worker ' + id + ' kept');
+  assert.strictEqual(aggroWorkers(bg).length, created, 'no new worker');
+  assert.ok(bg.get('ponderDbg.stopsOk') >= busy.length && bg.get('ponderDbg.stopsFailed') === 0);
+  assert.ok(bg.get('ponderDbg.stopMs').every((ms) => ms < 150));
+});
+
+test('A7: a worker that does not answer the stop within 150 ms is terminated', async () => {
+  const bg = makeBackground({ aggroStartMs: 5, aggroInterruptible: true, aggroIgnoreStop: true });
+  await bg.send(idle(['e2e4'], { ponderMs: 3600 }));
+  await sleep(250);
+  const busy = bg.get('ponderActive.filter((w) => [...w.pending.values()].some((p) => p.think)).map((w) => w.worker.id)');   // a 600 ms think that ignores the stop
+  assert.ok(busy.length >= 1);
+  await bg.send(idle(['e2e4', 'e7e5', 'g1f3']));
+  await sleep(220);
+  for (const id of busy) assert.ok(bg.workers[id].dead, 'worker ' + id + ' terminated');
+  assert.ok(bg.get('ponderDbg.stopsFailed') >= 1);
+});
+
+test('A7: late, far from done -> the reply search is stopped and its move so far played (depth >= 8)', async () => {
+  const bg = makeBackground({ aggroStartMs: 5, aggroInterruptible: true });
+  const moves = ['e2e4'];
+  const predicted = best(CV.replayUci(START, moves).pos);
+  await bg.send(idle(moves, { ponderMs: 3600, ponderWorkers: 1 }));   // the predicted move first, 600 ms slice
+  await sleep(150);
+  const t0 = Date.now();
+  const r = await bg.send({ type: 'analyze', engine: 'aggro', fen: START, startFen: START, moves: [...moves, predicted], ms: 1000, ponder: true });
+  assert.ok(r.ponderHit && r.partial && r.late, JSON.stringify(r));
+  assert.ok(r.depth >= 8 && r.depth < 60, 'depth so far: ' + r.depth);
+  assert.ok(Date.now() - t0 < 100, 'no wait for the slice: ' + (Date.now() - t0));
+  assert.strictEqual(bg.get('ponderDbg.lateStopHits'), 1);
+  // the same with CV.AGGRO_INTERRUPT = false: no stop, a normal search (as 2.0.0: the slice was not almost done)
+  const bg2 = makeBackground({ aggroStartMs: 5, aggroInterruptible: true });
+  bg2.get('CV.AGGRO_INTERRUPT = false');
+  await bg2.send(idle(moves, { ponderMs: 3600, ponderWorkers: 1 }));
+  await sleep(150);
+  const r2 = await bg2.send({ type: 'analyze', engine: 'aggro', fen: START, startFen: START, moves: [...moves, predicted], ms: 200, ponder: true });
+  assert.ok(!r2.ponderHit && bg2.get('ponderDbg.lateStops') === 0);
+});
+
 // A short game against the fake engine: our search, early ponder, the opponent's think (alternately longer and shorter
 // than the 600 ms job), the opponent's move (mostly the predicted one: hits). Reports, per move, how many ponder workers
 // were created and how many workers a job got that were still starting (cold).
@@ -94,8 +143,8 @@ test('CV.AGGRO_PONDER_RECYCLE = false restores 2.0.0: every job worker is termin
 // 2.0.2 1 spawn + 1 cold per move (the cold ones are the workers that were busy when the opponent moved; 2.0.0 already
 // warmed replacements when a job ended). ponderUntilMove: the workers are always busy when the opponent moves, so
 // they are terminated as before: 2 spawns + 2 cold per move in both (A7, interruptible workers, is what helps there).
-async function game(recycle, untilMove) {
-  const bg = makeBackground({ aggroStartMs: 45 });
+async function game(recycle, untilMove, interruptible) {
+  const bg = makeBackground({ aggroStartMs: 45, aggroInterruptible: !!interruptible });
   bg.get('CV.AGGRO_PONDER_RECYCLE = ' + recycle);
   let moves = [];
   for (let i = 0; i < 8; i++) {
@@ -119,12 +168,18 @@ test('measured: fewer respawns and cold workers per move (simulation, 8 moves, 2
       rows.push({ untilMove, recycle, ...d, spawnsPerMove: +(d.spawns / d.jobs).toFixed(2), coldPerMove: +(d.cold / d.jobs).toFixed(2) });
     }
   }
+  for (const untilMove of [false, true]) {                      // 2.0.2 A7: interruptible workers (JSPI)
+    const d = await game(true, untilMove, true);
+    rows.push({ untilMove, recycle: 'interruptible', ...d, spawnsPerMove: +(d.spawns / d.jobs).toFixed(2), coldPerMove: +(d.cold / d.jobs).toFixed(2) });
+  }
   if (process.env.SHOW) console.table(rows);
   const [oldEnd, newEnd, oldUntil, newUntil] = rows;
   assert.ok(newEnd.spawnsPerMove < oldEnd.spawnsPerMove, 'job ends before the opponent moves: fewer respawns');
   assert.ok(newEnd.recycled > 0 && oldEnd.recycled === 0);
   assert.ok(newEnd.coldPerMove <= oldEnd.coldPerMove, 'never more cold workers');
   assert.ok(newUntil.spawnsPerMove <= oldUntil.spawnsPerMove && newUntil.coldPerMove <= oldUntil.coldPerMove, 'until-move: never worse');
+  const intUntil = rows[5];
+  assert.ok(intUntil.spawnsPerMove < oldUntil.spawnsPerMove && intUntil.coldPerMove < oldUntil.coldPerMove, 'interruptible: until-move workers are kept');
 });
 
 run();

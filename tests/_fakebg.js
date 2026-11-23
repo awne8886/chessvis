@@ -80,7 +80,12 @@ function makeBackground(opts = {}) {
     aggro(m) {
       const posOf = (x) => CV.replayUci(x.fen || CV.STANDARD_START_FEN, x.moves || []).pos;
       this.msgs.push(m.type);                                // 2.0.2: what this AggroChess worker was asked, in order
-      if (m.type === 'init') { setTimeout(() => this.emit({ type: 'ready', how: 'module', warmMs: 1, steps: true }), opts.aggroStartMs || 0); return; }
+      if (m.type === 'init') { setTimeout(() => this.emit({ type: 'ready', how: 'module', warmMs: 1, steps: true, interruptible: !!opts.aggroInterruptible }), opts.aggroStartMs || 0); return; }
+      if (m.type === 'stop') {                              // 2.0.2: an interruptible worker answers a running think at once
+        const t = this.running && this.running.get(m.id);
+        if (opts.aggroInterruptible && !opts.aggroIgnoreStop && t) { clearTimeout(t.timer); this.running.delete(m.id); setTimeout(() => t.answer(true), 3); }
+        return;
+      }
       if (m.type === 'ponderMove') { this.emit({ type: 'ponderMove', id: m.id, uci: best(posOf(m)) || 'none' }); return; }
       if (m.type === 'clear') { this.emit({ type: 'cleared', id: m.id }); return; }
       if (m.type === 'analyze') {
@@ -92,7 +97,11 @@ function makeBackground(opts = {}) {
         const ms = m.soft || m.ms;
         const b = best(posOf(m));
         this.thinks = (this.thinks || 0) + 1;
-        setTimeout(() => this.emit({ type: 'bestmove', id: m.id, uci: b, san: b, score: '0', depth: Math.max(1, Math.floor(ms / 10)), sacrifice: false }), ms);
+        const t0 = Date.now();
+        const answer = (stopped) => this.emit({ type: 'bestmove', id: m.id, uci: b, san: b, score: '0', depth: Math.max(1, Math.floor((stopped ? Date.now() - t0 : ms) / 10)), sacrifice: false, stopped });
+        this.running = this.running || new Map();
+        const t = { answer, timer: setTimeout(() => { this.running.delete(m.id); answer(false); }, ms) };
+        this.running.set(m.id, t);
       }
     }
   }

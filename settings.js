@@ -482,6 +482,11 @@
   // The watchdog's board read goes through the stable read (two reads a frame + 20 ms apart must agree), like a
   // mutation's. false = 2.0.0: the watchdog reads the board directly (content.js).
   CV.WATCHDOG_STABLE_READ = true;
+  // 2.0.2 (A7): AggroChess workers that report `interruptible` (JSPI in the browser and a 2.0.2 engine) are stopped
+  // instead of terminated: a cancelled job's busy worker is stopped and recycled like a Stockfish one, and a `late`
+  // reply search far from done is stopped and its move used from this depth on. false = 2.0.0 (terminate).
+  CV.AGGRO_INTERRUPT = true;
+  CV.AGGRO_PARTIAL_MIN_DEPTH = 8;
 
   // ---- 2.0.2: ponder hits never lose depth (pure; background.js) ----
   // A prepared reply is often shallower than what the main worker reaches in the pause a hit is played after anyway

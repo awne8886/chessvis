@@ -1319,6 +1319,15 @@ impl Searcher {
                     if self.start.elapsed() >= h {
                         self.stop.store(true, Ordering::Relaxed);
                     }
+                    // ChessVision 2.0.2: the page can stop the search (JSPI); uses the clock read just made. A stop
+                    // goes to the caller's flag, which every search started from this one watches, and the search
+                    // returns the best move of its last completed iteration.
+                    if crate::web_clock::poll_stop() {
+                        if let Some(p) = &self.parent_stop {
+                            p.store(true, Ordering::Relaxed);
+                        }
+                        self.stop.store(true, Ordering::Relaxed);
+                    }
                 }
                 if let Some(n) = self.node_limit {
                     if self.shared_nodes.load(Ordering::Relaxed) >= n {

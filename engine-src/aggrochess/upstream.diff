@@ -83,7 +83,23 @@
              if let Some(p) = &self.parent_stop {
                  if p.load(Ordering::Relaxed) {
                      self.stop.store(true, Ordering::Relaxed);
-@@ -2631,10 +2657,10 @@
+@@ -1293,6 +1319,15 @@
+                     if self.start.elapsed() >= h {
+                         self.stop.store(true, Ordering::Relaxed);
+                     }
++                    // ChessVision 2.0.2: the page can stop the search (JSPI); uses the clock read just made. A stop
++                    // goes to the caller's flag, which every search started from this one watches, and the search
++                    // returns the best move of its last completed iteration.
++                    if crate::web_clock::poll_stop() {
++                        if let Some(p) = &self.parent_stop {
++                            p.store(true, Ordering::Relaxed);
++                        }
++                        self.stop.store(true, Ordering::Relaxed);
++                    }
+                 }
+                 if let Some(n) = self.node_limit {
+                     if self.shared_nodes.load(Ordering::Relaxed) >= n {
+@@ -2631,10 +2666,10 @@
          let cap = (200.0 * 1.45f64.powi(skill)) as u64;
          limits.nodes = Some(limits.nodes.map_or(cap, |n| n.min(cap)));
          eval::NOISE.store((20 - skill) * 7, Ordering::Relaxed);
@@ -98,7 +114,7 @@
          eval::NOISE_SEED.store(seed, Ordering::Relaxed);
      } else {
          eval::NOISE.store(0, Ordering::Relaxed);
-@@ -2834,7 +2860,7 @@
+@@ -2834,7 +2869,7 @@
  
          let elapsed = start.elapsed();
          if print_info {
