@@ -5,7 +5,16 @@ const { load, runner } = require('./_load');
 const CV = load();
 const { test, run } = runner('settings');
 
-const NEW = { earlyPonder: true, boardDebounceMs: 80, sfSearchMode: 'delay', ponderHitFast: true, ponderUntilMove: true, ponderMaxMs: 8000 };
+const NEW = { earlyPonder: true, boardDebounceMs: 40, sfSearchMode: 'delay', ponderHitFast: true, ponderUntilMove: true, ponderMaxMs: 8000,
+  ponderHitTopUp: true, aggroPonder: true, sfPonder: true };      // 2.0.2: debounce 40 (was 80), top-up, pondering on
+
+test('2.0.2: ponderHitTopUp is a boolean setting that survives export / import; the 2.0.0 values stay reachable', () => {
+  assert.deepStrictEqual(CV.sanitize({ ponderHitTopUp: 0, aggroPonder: '', sfPonder: 1, boardDebounceMs: 80 }), { ponderHitTopUp: false, aggroPonder: false, sfPonder: true, boardDebounceMs: 80 });
+  const r = CV.importSettings(CV.exportSettings({ ...CV.DEFAULTS, ponderHitTopUp: false, aggroPonder: false, sfPonder: false, boardDebounceMs: 80 }));
+  assert.ok(r.ok && r.values.ponderHitTopUp === false && r.values.aggroPonder === false && r.values.sfPonder === false && r.values.boardDebounceMs === 80);
+  for (const k of ['AGGRO_PONDER_RECYCLE', 'WATCHDOG_STABLE_READ']) assert.strictEqual(CV[k], true, k);
+  assert.strictEqual(CV.AGGRO_SCAN_FLOOR_MS, 3);
+});
 
 test('new keys and their defaults', () => {
   for (const [k, v] of Object.entries(NEW)) assert.strictEqual(CV.DEFAULTS[k], v, k);

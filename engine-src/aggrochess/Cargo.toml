@@ -1,0 +1,20 @@
+[package]
+name = "aggrochess_web"
+version = "4.6.1"
+edition = "2021"
+description = "AggroChess 4.6.1 built for WebAssembly (wasm32-unknown-unknown), as shipped in ChessVision"
+license = "GPL-3.0"
+
+[lib]
+crate-type = ["cdylib"]
+path = "src/lib.rs"
+
+[dependencies]
+cozy-chess = "0.3"
+polyglot-book-rs = "0.1"
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+panic = "abort"

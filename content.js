@@ -6,7 +6,7 @@
   window.__chessvisionLoaded = true;
 
   const DEBUG = true;
-  const FALLBACK_VERSION = '2.0.0';
+  const FALLBACK_VERSION = '2.0.2';
   const VERSION = (() => { try { return api.runtime.getManifest().version || FALLBACK_VERSION; } catch (e) { return FALLBACK_VERSION; } })();
   const log = (...a) => DEBUG && console.log('[ChessVision]', ...a);
   const { FILES } = CV.chess;
@@ -31,6 +31,7 @@
   let busy = false, busySince = 0, playToken = 0, recheckPending = false;
   let lastHandledKey = null, attempts = 0;
   let unstableReads = 0, unstableRun = 0, stableSeq = 0;   // stable-read debounce (2.0.0): total / in a row / cancels an outdated check
+  let stableArmed = false;                       // 2.0.2: a stable read is scheduled or under way (the watchdog then skips its tick)
   let rights = BS.freshRights();
   const tracker = BS.createTracker();            // the one game-tracking mechanism (history, new game, takeback)
   const rec = CV.createRecorder();               // records every ply the tracker reports
@@ -409,9 +410,13 @@
   // AggroChess: the constant CV.AGGRO_DELAY_MATCH (false = 1.8.0).
   const delayMatched = () => (cfg.engine === 'stockfish' ? cfg.sfSearchMode !== 'depth' : !!CV.AGGRO_DELAY_MATCH);
 
+  // Is pondering on for the current engine? (the `ponder` flag of a request)
+  const ponderOn = () => sfPonderOn() || (cfg.engine === 'aggro' && cfg.aggroPonder);
+
   // quick = the cheap look for an obvious move (Stockfish depth <= 8, AggroChess quickThinkMs; no clock, no pause budget).
-  // plan / softMs: only for the full search (fullPlan, and the delay-matched budget).
-  function askEngine(pos, quick, plan, softMs) {
+  // plan / softMs: only for the full search (fullPlan, and the delay-matched budget). hitSoftMs (2.0.2): the engine time
+  // inside the pause a ponder hit would be played after (0 = no top-up).
+  function askEngine(pos, quick, plan, softMs, hitSoftMs) {
     const depth = quick ? Math.min(cfg.depth, 8) : cfg.depth;
     const ms = quick ? Math.min(cfg.thinkMs, cfg.quickThinkMs) : cfg.thinkMs;
     const h = histFor(pos);
@@ -420,10 +425,11 @@
     return api.runtime.sendMessage({
       type: 'analyze', fen: pos.fen, engine: cfg.engine, depth, ms,
       startFen: h ? h.startFen : null, moves: h ? h.moves : null,       // null = no reliable history: engines get the bare FEN
-      soft: p.soft, hard: p.hard, verify: cfg.engine === 'aggro' && cfg.aggroVerify, ponder: sfPonderOn() || (cfg.engine === 'aggro' && cfg.aggroPonder), sfThreads: cfg.engine === 'stockfish' ? cfg.sfThreads : undefined,
+      soft: p.soft, hard: p.hard, verify: cfg.engine === 'aggro' && cfg.aggroVerify, ponder: ponderOn(), sfThreads: cfg.engine === 'stockfish' ? cfg.sfThreads : undefined,
       imperfection: !quick && cfg.engine === 'stockfish' && hum() ? cfg.imperfection : 0,
       sfMaxMs: p.sfCap,
       sfSearchMode: quick ? 'depth' : (p.searchMode || cfg.sfSearchMode), softMs: quick ? 0 : (softMs || 0), uciClock: quick ? undefined : p.uciClock, spentMs: quick ? 0 : (p.spentMs || 0),
+      hitSoftMs: quick ? 0 : (hitSoftMs || 0),
     });
   }
 
@@ -453,18 +459,28 @@
       const byUci = (u) => legal.find((m) => m.uci === u);
       const engineName = cfg.engine === 'stockfish' ? 'Stockfish' : 'AggroChess';
 
-      let uci = null, category = null, sacrifice = false, ponderHit = false;
+      let uci = null, category = null, sacrifice = false, ponderHit = false, topUp = null;
       // 2.0.0: the human-like delay of a normal move is drawn BEFORE the full search, so the engine can search through it
       // (delay-matched search). The move timing is unchanged: the wait is still max(delay, engine time).
       let plannedDelay = null;
+      let hitDelay = null;                                  // 2.0.2 (C2): the pause a ponder hit gets, drawn with plannedDelay
       let quickSpent = 0;                                   // T10: AggroChess quick look that turned out not obvious
       const fullSearch = () => {
         const plan = fullPlan(pos);
         if (quickSpent && cfg.engine === 'aggro') plan.spentMs = quickSpent;
         plannedDelay = CV.human.delayFor(cfg, { legalCount: legal.length, category: null });
         if (lastClock) plannedDelay = CV.clock.delayCap(plannedDelay, lastClock.ms);       // the pause must not eat a short clock
-        const softMs = delayMatched() ? Math.max(0, Math.round(plannedDelay - CV.SF_DELAY_MARGIN_MS - (Date.now() - t0))) : 0;
-        return askEngine(pos, false, plan, softMs);
+        // 2.0.2 (C2): a ponder hit is played after the fast-reply pause (ponderHitFast) or the normal one; drawing it now lets
+        // the background search on through it (ponderHitTopUp). The pause itself is the one it always was.
+        hitDelay = null;
+        if (cfg.ponderHitTopUp && ponderOn()) {
+          hitDelay = cfg.ponderHitFast && cfg.quickReplies ? CV.human.delayFor(cfg, { legalCount: legal.length, category: null, fastReply: true }) : plannedDelay;
+          if (lastClock) hitDelay = CV.clock.delayCap(hitDelay, lastClock.ms);
+        }
+        const spent = Date.now() - t0;
+        const softMs = delayMatched() ? Math.max(0, Math.round(plannedDelay - CV.SF_DELAY_MARGIN_MS - spent)) : 0;
+        const hitSoftMs = hitDelay === null ? 0 : Math.max(0, Math.round(hitDelay - CV.SF_DELAY_MARGIN_MS - spent));
+        return askEngine(pos, false, plan, softMs, hitSoftMs);
       };
 
       if (cfg.quickReplies && cfg.quickOnlyMove && legal.length === 1) {
@@ -495,6 +511,7 @@
         uci = res && res.uci;
         sacrifice = !!(res && res.sacrifice);
         ponderHit = !!(res && res.ponderHit);
+        topUp = ponderHit && res.topUp && !category ? res.topUp : null;     // 2.0.2: uci is provisional, the final move comes before the click
         if (res && res.imperfect && uci !== res.best) log('imperfection: played', uci, 'instead of', res.best);
       }
 
@@ -509,16 +526,23 @@
       // cursor, chess.com's animation and the next board read. If the move is then discarded or does not register, the
       // next check() computes another key and restarts the job, and the background's decide() answers `miss` for any
       // position that does not extend this one (see sameBase in CV.createPonderState).
-      if (cfg.earlyPonder && idleWanted() && byUci(uci) && !document.hidden) {
-        const h = histFor(pos);
-        if (h) startIdle(h.startFen, [...h.moves, uci], pos.myColor);
-      }
+      const earlyPonder = () => {
+        if (cfg.earlyPonder && idleWanted() && byUci(uci) && !document.hidden) {
+          const h = histFor(pos);
+          if (h) startIdle(h.startFen, [...h.moves, uci], pos.myColor);
+        }
+      };
+      // 2.0.2 (C2): with a ponder-hit top-up the main worker is still searching: the final move is asked for now (it arrives
+      // within the pause) and pondering starts once it is known (a ponder job never runs beside a real search).
+      const finalP = topUp ? api.runtime.sendMessage({ type: 'hitTopUp', id: topUp.id }).catch(() => null) : null;
+      if (!topUp) earlyPonder();
 
       // Human-like pause. The engine already ran, so only the remainder is waited. A quick category has its own short
       // delay; otherwise the delay drawn before the full search is used.
       // 2.0.0: a ponder hit with ponderHitFast gets the quick range too (fastReply), without becoming a quick category.
       const fastReply = !category && ponderHit && cfg.ponderHitFast && cfg.quickReplies;
-      let delay = category || fastReply || plannedDelay === null ? CV.human.delayFor(cfg, { legalCount: legal.length, category, fastReply }) : plannedDelay;
+      let delay = fastReply && hitDelay !== null ? hitDelay                 // 2.0.2: the hit pause drawn before the search
+        : category || fastReply || plannedDelay === null ? CV.human.delayFor(cfg, { legalCount: legal.length, category, fastReply }) : plannedDelay;
       if (lastClock) delay = CV.clock.delayCap(delay, lastClock.ms);          // the pause must not eat a short clock
       const wait = Math.max(0, delay - (Date.now() - t0));
       fast = !!category || fastReply || !!(lastClock && lastClock.mode === 'low');     // low on time: the faster hand too (set before the glide below)
@@ -530,6 +554,18 @@
         [pts] = await Promise.all([aimMove(uci), wait ? sleep(wait) : null]);
       } else if (wait) await sleep(wait);
       if (token !== playToken || !cfg.enabled) return;
+      if (topUp) {
+        // never waits long: the top-up search ends with the pause (hitSoftMs = pause - margin - time spent)
+        const fin = await Promise.race([finalP, sleep(Math.max(150, (topUp.ms || 0) + 300))]);
+        if (token !== playToken || !cfg.enabled) return;
+        if (fin && fin.uci && fin.uci !== uci && byUci(fin.uci)) {
+          log('ponder hit deepened: depth', fin.before, '->', fin.depth, ', move', uci, '->', fin.uci);
+          uci = fin.uci; sacrifice = !!fin.sacrifice;
+          if (pts) pts = await aimMove(uci);               // the cursor was aimed at the provisional move: re-aim
+          if (token !== playToken || !cfg.enabled) return;
+        } else if (fin) log('ponder hit top-up: depth', fin.before, '->', fin.depth, fin.used ? '(same move)' : '(prepared reply kept)');
+        earlyPonder();
+      }
 
       const now = buildFen();
       if (!now || now.fen !== pos.fen) { log('position changed, discarding', uci); return; }
@@ -710,6 +746,7 @@
   function schedule(ms, reason = 'event') {
     clearTimeout(debounceTimer);
     stableSeq++;                                                 // a stable check still waiting for its second read is outdated
+    stableArmed = false;                                         // ... and this direct check replaces it
     debounceTimer = setTimeout(() => check(reason), ms);
   }
 
@@ -726,13 +763,14 @@
   function scheduleStable(ms, reason) {
     clearTimeout(debounceTimer);
     const seq = ++stableSeq;
+    stableArmed = true;
     debounceTimer = setTimeout(async () => {
       const a = boardSignature();
       await nextFrame();
       await sleep(STABLE_GAP_MS);
       if (seq !== stableSeq) return;                             // a newer mutation (or schedule) took over
       const b = boardSignature();
-      if (a === b || unstableRun >= UNSTABLE_MAX) { unstableRun = 0; check(reason); return; }
+      if (a === b || unstableRun >= UNSTABLE_MAX) { unstableRun = 0; stableArmed = false; check(reason); return; }
       unstableReads++; unstableRun++;
       scheduleStable(cfg.boardDebounceMs, 'unstable');
     }, ms);
@@ -740,9 +778,16 @@
 
   // Watchdog: re-reads the board on a timer, independent of any DOM event.
   // check() is idempotent, so this is cheap and recovers from any missed mutation.
+  // 2.0.2 (C4): the watchdog uses the stable read too (two reads a frame + 20 ms apart must agree): a tick that landed
+  // in the middle of a board update made of two DOM steps fed the tracker a half-updated board (a gap, then a ponder
+  // miss). When a stable read is already scheduled or running, the tick has nothing to add. CV.WATCHDOG_STABLE_READ =
+  // false: the 2.0.0 direct read.
   function startWatchdog() {
     clearInterval(watchdogTimer);
-    watchdogTimer = setInterval(() => check('watchdog'), cfg.watchdogMs);
+    watchdogTimer = setInterval(() => {
+      if (!CV.WATCHDOG_STABLE_READ) { check('watchdog'); return; }
+      if (!stableArmed) scheduleStable(0, 'watchdog');
+    }, cfg.watchdogMs);
   }
 
   function attach() {

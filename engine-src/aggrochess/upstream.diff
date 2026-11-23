@@ -1,0 +1,389 @@
+# Changes in engine-src/aggrochess against AggroChess 4d7692e955b677e7b3f6ec7a457598c2311685fe (tag v4.6.1, https://github.com/PhelRin/AggroChess).
+# src/lib.rs and src/web_clock.rs are new (the web wrapper); the nets are unchanged.
+--- a/src/search.rs
++++ b/src/search.rs
+@@ -14,13 +14,17 @@
+ use cozy_chess::{BitBoard, Board, Color, Move, Piece, Square};
+ use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU64, AtomicU8, AtomicUsize, Ordering};
+ use std::sync::{Arc, Mutex, RwLock};
+-use std::time::{Duration, Instant};
++use crate::web_clock::Instant; use std::time::Duration; // wasm: the clock comes from JavaScript
+ 
+ pub const MAX_PLY: usize = 128;
+ pub const INF: i32 = 32000;
+ pub const MATE: i32 = 30000;
+ pub const MATE_BOUND: i32 = MATE - 1000;
+ 
++/// The clock (and the stop flags) are looked at every this many nodes (a power of two). It was 1024; in WebAssembly the
++/// clock is a call into JavaScript and a search was seen to overrun its time by up to ~50 ms, so it is looked at more often.
++pub const CLOCK_POLL_NODES: u64 = 256;
++
+ pub static TT_SIZE_MB: AtomicUsize = AtomicUsize::new(128);
+ pub static NUM_THREADS: AtomicUsize = AtomicUsize::new(1);
+ /// Draw score penalty (centipawns) from the engine's point of view.
+@@ -69,6 +73,21 @@
+ 
+ const EVAL_NONE: i32 = -32001;
+ 
++/// ChessVision 2.0.2: a Vec of `n` values allocated already zeroed (alloc_zeroed: in WebAssembly fresh memory pages are
++/// zero, so nothing is written) instead of being filled value by value.
++/// SAFETY (caller): the all-zero bit pattern must be the value wanted for T (integers, atomics, plain structs of them).
++pub(crate) unsafe fn zeroed_vec<T>(n: usize) -> Vec<T> {
++    if n == 0 || std::mem::size_of::<T>() == 0 {
++        return Vec::new();
++    }
++    let layout = std::alloc::Layout::array::<T>(n).expect("table size");
++    let p = std::alloc::alloc_zeroed(layout) as *mut T;
++    if p.is_null() {
++        std::alloc::handle_alloc_error(layout);
++    }
++    Vec::from_raw_parts(p, n, n)
++}
++
+ fn pack_move(mv: Option<Move>) -> u64 {
+     match mv {
+         None => 0,
+@@ -107,10 +126,9 @@
+         let bytes = mb.max(1) * 1024 * 1024;
+         let entries = (bytes / std::mem::size_of::<TTEntry>()).max(2);
+         let buckets = (entries / 2).max(1);
+-        let mut v = Vec::with_capacity(buckets * 2);
+-        for _ in 0..buckets * 2 {
+-            v.push(TTEntry { key: AtomicU64::new(0), data: AtomicU64::new(0) });
+-        }
++        // ChessVision 2.0.2: allocated zeroed (two AtomicU64 0 = an empty entry) instead of 2 x 2^20 pushes for 32 MB
++        // SAFETY: an all-zero TTEntry is key 0, data 0, exactly what the pushes made
++        let v: Vec<TTEntry> = unsafe { zeroed_vec(buckets * 2) };
+         Self { entries: v, buckets, age: AtomicU8::new(0), mb }
+     }
+ 
+@@ -133,6 +151,14 @@
+ 
+     #[inline]
+     fn bucket(&self, hash: u64) -> usize {
++        // ChessVision 2.0.2: (hash * buckets) >> 64 without a u128 multiply (on wasm32 that is a call to __multi3).
++        // Exact for buckets < 2^32: with hash = H * 2^32 + L, hash * buckets = H*b*2^32 + L*b, and the low 32 bits of
++        // L*b can never carry into bit 64; H*b + ((L*b) >> 32) <= (2^32-1)^2 + 2^32 - 1 < 2^64.
++        let b = self.buckets as u64;
++        if b < (1u64 << 32) {
++            let hi = (hash >> 32) * b + (((hash & 0xffff_ffff) * b) >> 32);
++            return (hi >> 32) as usize * 2;
++        }
+         (((hash as u128) * (self.buckets as u128)) >> 64) as usize * 2
+     }
+ 
+@@ -1281,8 +1307,8 @@
+ 
+     #[inline]
+     fn check_time(&mut self) {
+-        if self.nodes & 1023 == 0 {
+-            self.shared_nodes.fetch_add(1024, Ordering::Relaxed);
++        if self.nodes & (CLOCK_POLL_NODES - 1) == 0 {
++            self.shared_nodes.fetch_add(CLOCK_POLL_NODES, Ordering::Relaxed);
+             if let Some(p) = &self.parent_stop {
+                 if p.load(Ordering::Relaxed) {
+                     self.stop.store(true, Ordering::Relaxed);
+@@ -1293,6 +1319,15 @@
+                     if self.start.elapsed() >= h {
+                         self.stop.store(true, Ordering::Relaxed);
+                     }
++                    // ChessVision 2.0.2: the page can stop the search (JSPI); uses the clock read just made. A stop
++                    // goes to the caller's flag, which every search started from this one watches, and the search
++                    // returns the best move of its last completed iteration.
++                    if crate::web_clock::poll_stop() {
++                        if let Some(p) = &self.parent_stop {
++                            p.store(true, Ordering::Relaxed);
++                        }
++                        self.stop.store(true, Ordering::Relaxed);
++                    }
+                 }
+                 if let Some(n) = self.node_limit {
+                     if self.shared_nodes.load(Ordering::Relaxed) >= n {
+@@ -2631,10 +2666,10 @@
+         let cap = (200.0 * 1.45f64.powi(skill)) as u64;
+         limits.nodes = Some(limits.nodes.map_or(cap, |n| n.min(cap)));
+         eval::NOISE.store((20 - skill) * 7, Ordering::Relaxed);
+-        let seed = std::time::SystemTime::now()
+-            .duration_since(std::time::UNIX_EPOCH)
+-            .map(|d| d.as_nanos() as u64)
+-            .unwrap_or(1);
++        // wasm: no system clock; the seed comes from JavaScript (this branch only runs with Skill < 20)
++        let seed = crate::web_clock::seed();
++        let seed = if seed == 0 { 1 } else { seed };
++
+         eval::NOISE_SEED.store(seed, Ordering::Relaxed);
+     } else {
+         eval::NOISE.store(0, Ordering::Relaxed);
+@@ -2834,7 +2869,7 @@
+ 
+         let elapsed = start.elapsed();
+         if print_info {
+-            let total_nodes = nodes.load(Ordering::Relaxed) + (s.nodes & 1023);
++            let total_nodes = nodes.load(Ordering::Relaxed) + (s.nodes & (CLOCK_POLL_NODES - 1));
+             let ms = elapsed.as_millis().max(1);
+             out!(
+                 "info depth {} seldepth {} score {} nodes {} nps {} hashfull {} time {} pv {}",
+--- a/src/nnue.rs
++++ b/src/nnue.rs
+@@ -18,7 +18,12 @@
+ const QA: i32 = 255;
+ const QB: i32 = 64;
+ 
+-static NET_BYTES: &[u8] = include_bytes!("../aggro.nnue");
++/// ChessVision 2.0.2: the nets are embedded 64-byte aligned, so their weights are read in place as i16 (zero-copy, see
++/// `i16s`) instead of being copied into vectors when the engine starts.
++#[repr(C, align(64))]
++struct Aligned<const N: usize>([u8; N]);
++static NET_DATA: Aligned<{ include_bytes!("../aggro.nnue").len() }> = Aligned(*include_bytes!("../aggro.nnue"));
++static NET_BYTES: &[u8] = &NET_DATA.0;
+ 
+ /// Output scale in percent. The net's evaluations come out larger than the classical
+ /// evaluation's (it learned from game results too), so they are scaled down to the classical
+@@ -26,9 +31,9 @@
+ pub static OUT_SCALE: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(67);
+ 
+ pub struct Net {
+-    ft_w: Vec<i16>,
+-    ft_b: Vec<i16>,
+-    out_w: Vec<i16>,
++    ft_w: &'static [i16],
++    ft_b: &'static [i16],
++    out_w: &'static [i16],
+     out_b: Vec<i32>,
+ }
+ 
+@@ -40,14 +45,15 @@
+ /// the main net, which counts the bishop, is far off. It is the main net trained further on
+ /// such endings; keeping that in a net of its own leaves the main net's judgement of every
+ /// other position exactly as it was.
+-static OCB_BYTES: &[u8] = include_bytes!("../aggro-ocb.nnue");
++static OCB_DATA: Aligned<{ include_bytes!("../aggro-ocb.nnue").len() }> = Aligned(*include_bytes!("../aggro-ocb.nnue"));
++static OCB_BYTES: &[u8] = &OCB_DATA.0;
+ static OCB: OnceLock<Net> = OnceLock::new();
+ pub static OCB_NET_ON: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
+ 
+ #[inline]
+ fn ocb_net() -> &'static Net {
+     OCB.get_or_init(|| match std::env::var("AGGRO_OCBNET") {
+-        Ok(f) => parse(&std::fs::read(f).expect("AGGRO_OCBNET file")),
++        Ok(f) => parse(Box::leak(std::fs::read(f).expect("AGGRO_OCBNET file").into_boxed_slice())),
+         Err(_) => parse(OCB_BYTES),
+     })
+ }
+@@ -67,13 +73,26 @@
+     a.evaluate_with(n, board)
+ }
+ 
+-fn parse(v: &[u8]) -> Net {
++/// Little-endian i16 values: read in place when the bytes are 2-aligned on a little-endian target (WebAssembly, x86),
++/// else copied once.
++fn i16s(v: &'static [u8]) -> &'static [i16] {
++    #[cfg(target_endian = "little")]
++    {
++        if v.as_ptr() as usize % std::mem::align_of::<i16>() == 0 {
++            // SAFETY: 2-aligned, 'static, len / 2 whole values, and i16 has no invalid bit patterns
++            return unsafe { std::slice::from_raw_parts(v.as_ptr() as *const i16, v.len() / 2) };
++        }
++    }
++    Box::leak(v.chunks_exact(2).map(|c| i16::from_le_bytes([c[0], c[1]])).collect::<Vec<_>>().into_boxed_slice())
++}
++
++fn parse(v: &'static [u8]) -> Net {
+     assert_eq!(&v[0..4], b"AGNN", "bad network file");
+     let h = u32::from_le_bytes(v[4..8].try_into().unwrap()) as usize;
+     assert_eq!(h, H, "network has a different hidden size");
+     let mut off = 8;
+-    let mut rd = |n: usize| -> Vec<i16> {
+-        let r = (0..n).map(|i| i16::from_le_bytes([v[off + 2 * i], v[off + 2 * i + 1]])).collect();
++    let mut rd = |n: usize| -> &'static [i16] {
++        let r = i16s(&v[off..off + 2 * n]);
+         off += 2 * n;
+         r
+     };
+@@ -87,7 +106,7 @@
+ #[inline]
+ pub fn net() -> &'static Net {
+     NET.get_or_init(|| match std::env::var("AGGRO_NET") {
+-        Ok(f) => parse(&std::fs::read(f).expect("AGGRO_NET file")),
++        Ok(f) => parse(Box::leak(std::fs::read(f).expect("AGGRO_NET file").into_boxed_slice())),
+         Err(_) => parse(NET_BYTES),
+     })
+ }
+@@ -113,6 +132,11 @@
+ 
+ #[inline(always)]
+ fn add(acc: &mut [i16; H], w: &[i16]) {
++    #[cfg(all(target_arch = "wasm32", target_feature = "simd128"))]
++    {
++        return wasm_simd::add(acc, w);
++    }
++    #[allow(unreachable_code)]
+     for (a, b) in acc.iter_mut().zip(w) {
+         *a = a.wrapping_add(*b);
+     }
+@@ -132,7 +156,7 @@
+ 
+     fn refresh_with(&mut self, n: &Net, board: &Board) {
+         for persp in 0..2 {
+-            self.v[persp].copy_from_slice(&n.ft_b);
++            self.v[persp].copy_from_slice(n.ft_b);
+         }
+         for color in [Color::White, Color::Black] {
+             for piece in Piece::ALL {
+@@ -298,6 +322,11 @@
+             return unsafe { update_avx2(out, src, a0, s0, a1, s1) };
+         }
+     }
++    #[cfg(all(target_arch = "wasm32", target_feature = "simd128"))]
++    {
++        return wasm_simd::update(out, src, a0, s0, a1, s1);
++    }
++    #[allow(unreachable_code)]
+     update_body(out, src, a0, s0, a1, s1)
+ }
+ 
+@@ -316,9 +345,99 @@
+             return unsafe { screlu_dot_avx2(acc, w) };
+         }
+     }
++    #[cfg(all(target_arch = "wasm32", target_feature = "simd128"))]
++    {
++        return wasm_simd::screlu_dot(acc, w);
++    }
++    #[allow(unreachable_code)]
+     screlu_dot_body(acc, w)
+ }
+ 
++/// Explicit WebAssembly SIMD (ChessVision 2.0.2) for the simd128 build. Bit-exact with the scalar code:
++/// - the accumulator updates are wrapping i16 adds / subs, as in `update_body` / `add`;
++/// - `screlu_dot`: v = clamp(acc, 0, QA), vw = v * w (wrapping i16, as `wrapping_mul`), then v * vw summed as i32 with
++///   `i32x4.dot_i16x8_s` (pairs of exact i32 products). Each lane of each of the two accumulators sums 32 products of
++///   at most 255 * 32767 in magnitude (< 2^23), so no i32 sum can overflow and the i64 total is the scalar one.
++#[cfg(all(target_arch = "wasm32", target_feature = "simd128"))]
++mod wasm_simd {
++    use super::{H, QA};
++    use core::arch::wasm32::*;
++
++    #[inline(always)]
++    fn ld(p: &[i16], i: usize) -> v128 {
++        debug_assert!(i + 8 <= p.len());
++        // SAFETY: i + 8 <= p.len() for every caller (slices of H = 256 values, i a multiple of 8 below H);
++        // wasm loads have no alignment requirement
++        unsafe { v128_load(p.as_ptr().add(i) as *const v128) }
++    }
++
++    #[inline(always)]
++    fn st(p: &mut [i16], i: usize, v: v128) {
++        debug_assert!(i + 8 <= p.len());
++        // SAFETY: as in ld
++        unsafe { v128_store(p.as_mut_ptr().add(i) as *mut v128, v) }
++    }
++
++    #[inline(always)]
++    pub(super) fn add(acc: &mut [i16; H], w: &[i16]) {
++        let w = &w[..H];
++        for i in (0..H).step_by(8) {
++            let v = i16x8_add(ld(acc, i), ld(w, i));
++            st(acc, i, v);
++        }
++    }
++
++    #[inline(always)]
++    pub(super) fn update(out: &mut [i16; H], src: &[i16; H], a0: &[i16], s0: &[i16], a1: Option<&[i16]>, s1: Option<&[i16]>) {
++        let (a0, s0) = (&a0[..H], &s0[..H]);
++        match (a1, s1) {
++            (None, None) => {
++                for i in (0..H).step_by(8) {
++                    st(out, i, i16x8_sub(i16x8_add(ld(src, i), ld(a0, i)), ld(s0, i)));
++                }
++            }
++            (None, Some(s1)) => {
++                let s1 = &s1[..H];
++                for i in (0..H).step_by(8) {
++                    st(out, i, i16x8_sub(i16x8_sub(i16x8_add(ld(src, i), ld(a0, i)), ld(s0, i)), ld(s1, i)));
++                }
++            }
++            (Some(a1), Some(s1)) => {
++                let (a1, s1) = (&a1[..H], &s1[..H]);
++                for i in (0..H).step_by(8) {
++                    let v = i16x8_add(i16x8_add(ld(src, i), ld(a0, i)), ld(a1, i));
++                    st(out, i, i16x8_sub(i16x8_sub(v, ld(s0, i)), ld(s1, i)));
++                }
++            }
++            (Some(a1), None) => {
++                let a1 = &a1[..H];
++                for i in (0..H).step_by(8) {
++                    st(out, i, i16x8_sub(i16x8_add(i16x8_add(ld(src, i), ld(a0, i)), ld(a1, i)), ld(s0, i)));
++                }
++            }
++        }
++    }
++
++    #[inline(always)]
++    pub(super) fn screlu_dot(acc: &[i16; H], w: &[i16]) -> i64 {
++        let w = &w[..H];
++        let zero = i16x8_splat(0);
++        let qa = i16x8_splat(QA as i16);
++        let mut sum0 = i32x4_splat(0);
++        let mut sum1 = i32x4_splat(0);
++        for i in (0..H).step_by(16) {
++            let v0 = i16x8_min(i16x8_max(ld(acc, i), zero), qa);
++            let v1 = i16x8_min(i16x8_max(ld(acc, i + 8), zero), qa);
++            sum0 = i32x4_add(sum0, i32x4_dot_i16x8(v0, i16x8_mul(v0, ld(w, i))));
++            sum1 = i32x4_add(sum1, i32x4_dot_i16x8(v1, i16x8_mul(v1, ld(w, i + 8))));
++        }
++        let lanes = |s: v128| {
++            i32x4_extract_lane::<0>(s) as i64 + i32x4_extract_lane::<1>(s) as i64 + i32x4_extract_lane::<2>(s) as i64 + i32x4_extract_lane::<3>(s) as i64
++        };
++        lanes(sum0) + lanes(sum1)
++    }
++}
++
+ #[inline(always)]
+ fn screlu_dot_body(acc: &[i16; H], w: &[i16]) -> i64 {
+     // (v * w) fits in i16 because |w| <= 127 and v <= 255; multiply by v again in i32
+--- a/src/book.rs
++++ b/src/book.rs
+@@ -13,7 +13,6 @@
+ use std::collections::HashMap;
+ use std::path::Path;
+ use std::sync::OnceLock;
+-use std::time::SystemTime;
+ 
+ pub struct Book {
+     pub book: Option<PolyglotBook>,
+@@ -477,10 +476,8 @@
+ }
+ 
+ fn seed() -> u64 {
+-    SystemTime::now()
+-        .duration_since(SystemTime::UNIX_EPOCH)
+-        .map(|d| d.as_nanos() as u64)
+-        .unwrap_or(88172645463325252)
++    // wasm: no system clock; two random numbers from JavaScript (see web_clock.rs)
++    crate::web_clock::seed()
+ }
+ 
+ impl Book {
+--- a/src/matesearch.rs
++++ b/src/matesearch.rs
+@@ -13,7 +13,7 @@
+ 
+ use cozy_chess::{Board, Move, Piece};
+ use std::sync::atomic::{AtomicBool, Ordering};
+-use std::time::Instant;
++use crate::web_clock::Instant; // wasm: the clock comes from JavaScript
+ 
+ const TT_BITS: u32 = 20;
+ 
+@@ -128,7 +128,9 @@
+ 
+ impl<'a> MateSearch<'a> {
+     pub fn new(deadline: Instant, stop: &'a AtomicBool) -> Self {
+-        MateSearch { tt: vec![Entry::default(); 1 << TT_BITS], nodes: 0, deadline, stop, aborted: false, node_limit: u64::MAX, goal: 0, threat_depth: 2, lite_threats: false }
++        // ChessVision 2.0.2: allocated zeroed (16 MB) instead of filled; Entry::default() is all zero
++        // SAFETY: Entry is plain integers; all-zero = Entry::default()
++        MateSearch { tt: unsafe { crate::search::zeroed_vec(1 << TT_BITS) }, nodes: 0, deadline, stop, aborted: false, node_limit: u64::MAX, goal: 0, threat_depth: 2, lite_threats: false }
+     }
+ 
+     fn idx(&self, key: u64) -> usize {

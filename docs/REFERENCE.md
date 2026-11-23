@@ -6,7 +6,7 @@ It adds a small control panel to the page where you change the engine, depth and
 
 > **Scope.** ChessVision only acts on pages listed in [`allowed-pages.txt`](#allowed-pages). The shipped list contains chess.com's computer-bot pages (`chess.com/play/computer`, `chess.com/game/computer`); everywhere else it stays paused. Please keep it to bot games: do not use it in games against other people, in rated play, or anywhere engine assistance is not allowed.
 
-- Version: 2.0.0
+- Version: 2.0.2
 - Platform: Firefox, Manifest V2
 - Site: the extension loads on `*://*.chess.com/*` and acts only on the pages in `allowed-pages.txt`
 - Permissions: `storage`, `clipboardWrite` (for the Export and Copy debug info buttons), and access to chess.com. No data collection.
@@ -69,16 +69,19 @@ The engine searches **while** the delay runs, so the real wait before a move is 
 
 ### AggroChess options (`aggro`)
 
-Shown in the panel only when the engine is AggroChess. All of it is off by default except the clock.
+Shown in the panel only when the engine is AggroChess. The clock and (since 2.0.2) pondering are on by default, the rest is off.
+
+**Pondering costs CPU and battery** (since 2.0.2 it is on by default): while the opponent thinks, each ponder worker keeps a CPU core busy, for the opponent's whole think with **Keep pondering until the opponent moves** (at most **Ponder at most**, 8 s), and holds about 50 MiB (AggroChess) or 58 MiB (Stockfish, 16 MB hash) while pondering is on. It stops when the tab is hidden. Switch it off with **Ponder on opponent's time** in the AggroChess and Stockfish options (`aggroPonder`, `sfPonder` off = 2.0.0), or keep it and switch **Keep pondering until the opponent moves** off to bound each job to **Ponder time**.
 
 | Control | Key | Range | Default | What it does |
 | --- | --- | --- | --- | --- |
 | Use the game clock | `aggroUseClock` | on/off | on | Reads **your** clock from the page and sizes the full search with AggroChess's `think_clock(soft, hard)` (milliseconds). `soft = min(Think time, remaining/40 + 0.8 x increment)`, `hard = min(remaining/8, 3 x Think time)`, floors of 100 ms; under 10 s left a much shorter budget is used (`soft = remaining/60`, `hard = remaining/15`, never above remaining/4) and the hand moves faster. The human-like pause is capped at 8% of the remaining time. If no clock can be read (or the option is off) the fixed Think time is used. Quick replies keep their small budget. The constants are named at the top of `clock.js`. |
-| Ponder on opponent's time | `aggroPonder` | on/off | off | While the opponent thinks, one to three extra AggroChess workers (**Ponder workers**, never the main one) share one queue of opponent moves and prepare replies for **many** possible opponent moves, not just one. First a very short search after every legal opponent move ranks them by how good they are for the opponent; then the most likely ones get a reply search each (120-600 ms), best first. Every reply found is kept. When the opponent moves, the reply found for exactly that move is played at once (usual human delay applies; status shows `ponder hit`), even if pondering is not finished. If that move's reply was not finished (or the move was not prepared) the ponder worker is terminated and a normal search runs; a real search never waits for it. The ponder time is a **ceiling**: the whole job (including the evaluation line) stops by then. Ponder workers are killed all at once when the opponent has moved and no prepared reply is used (a real search never waits for them), and warmed-up replacements are made while the main worker is idle, so the next job starts at once (only while pondering or the evaluation line is on). Entries are dropped on a new game, takeback, switching pondering off, switching engine and when the tab is hidden. Debug info counts attempts, hits, misses (move not prepared or other position), late (move planned, reply not finished yet) and skipped. The status shows `WFO · pondering N` / `WFO · pondered N` (N = replies found). |
+| Ponder on opponent's time | `aggroPonder` | on/off | on (2.0.2; off before) | While the opponent thinks, one to three extra AggroChess workers (**Ponder workers**, never the main one) share one queue of opponent moves and prepare replies for **many** possible opponent moves, not just one. First a very short search after every legal opponent move ranks them by how good they are for the opponent; then the most likely ones get a reply search each (120-600 ms), best first. Every reply found is kept. When the opponent moves, the reply found for exactly that move is played at once (usual human delay applies; status shows `ponder hit`), even if pondering is not finished. If that move's reply was not finished (or the move was not prepared) the ponder worker is terminated and a normal search runs; a real search never waits for it. The ponder time is a **ceiling**: the whole job (including the evaluation line) stops by then. Ponder workers are killed all at once when the opponent has moved and no prepared reply is used (a real search never waits for them), and warmed-up replacements are made while the main worker is idle, so the next job starts at once (only while pondering or the evaluation line is on). Entries are dropped on a new game, takeback, switching pondering off, switching engine and when the tab is hidden. Debug info counts attempts, hits, misses (move not prepared or other position), late (move planned, reply not finished yet) and skipped. The status shows `WFO · pondering N` / `WFO · pondered N` (N = replies found). |
 | Ponder time | `aggroPonderMs` | 200-5000 ms, step 100 | 1500 | Time budget of the pondering job: the ranking share and the reply slices (`budget / 6`, 120-600 ms) are sized from it. With **Keep pondering until the opponent moves** off, the job never runs past it (1.8.0). |
 | Ponder as soon as the move is chosen | `earlyPonder` | on/off | on | **2.0.0, shared by both engines.** The ponder job for the position after your move starts the moment the move is decided, before the human-like pause, the cursor and chess.com's animation, instead of when the board shows it (about 1-2 s more pondering per move). If the move is then dropped or does not register, the job is simply replaced. Off = 1.8.0. |
 | Keep pondering until the opponent moves | `ponderUntilMove` | on/off | on | **2.0.0, shared by both engines.** After the first pass over the likely opponent moves, the job keeps going: the top `max(2, 2 x workers)` moves are searched again with doubling slices (up to 4 s each), on the worker that searched them before (its hash still holds the tree), until the opponent moves or **Ponder at most**. Off = the **Ponder time** budget only (1.8.0). |
 | Ponder at most | `ponderMaxMs` | 1-30 s, step 0.5 s | 8 s | **2.0.0, shared.** Ceiling of a ponder job with **Keep pondering until the opponent moves**. |
+| Deepen a ponder hit during the pause | `ponderHitTopUp` | on/off | on | **2.0.2, shared by both engines.** A ponder hit is played after a pause (the quick one with **Fast reply on ponder hit**) that the page now draws before asking the engine. When the main worker can get deeper than the prepared reply within that pause (Stockfish: the depth recent main searches reached in that time is above the reply's depth; AggroChess: the pause is at least the time the reply was searched with), it searches the position meanwhile and the deeper result is played. The cursor starts towards the prepared move and turns to the final one if it changed (`background.ponder.hitTopUp.changed`). Measured with Stockfish (Node, `node tests/bench-delay-mode.js --only hit`): a prepared pass-1 reply has depth 10.0, the top-up reaches 15.6 / 15.5 / 16.9 in 60 / 150 / 260 ms. No time is added: the search ends 40 ms before the pause does. The next ponder job starts once the move is final. Off = 2.0.0 (the prepared reply as it is). |
 | Ponder workers | `aggroPonderWorkers` | 1-3 | 1 | How many ponder workers share the work. They pull opponent moves from one shared queue (a dynamic queue, not a fixed split), for the ranking pass and for the reply searches, so more of the opponent's moves get a reply inside the same ponder time. **Each worker costs about 50 MiB of memory** (about 28 MiB with an 8 MB hash, see below) and a CPU core while it works. The number actually used is capped at `max(1, navigator.hardwareConcurrency - 1)`, so the main worker and the page keep a core; if the browser does not report a CPU count, 1 is used. 1 behaves like 1.7.8. |
 | Ponder hash | `aggroPonderHashMb` | 4-64 MB, step 4 | 32 | Hash table of each **ponder** worker (the main worker keeps the engine's own 32 MB). 32 = unchanged. A smaller table lowers the memory per worker (a worker's memory is about 18 MiB plus the hash) so more workers fit on a phone; shallower replies are possible with a small table. Needs the engine build shipped in 1.7.9 (older builds ignore it). |
 | Show evaluation | `aggroShowEval` | on/off | off | One line while the opponent thinks, e.g. `Eval +0.42 (you) d11 · opp best Nf3 (book)`. AggroChess reports White's point of view; it is converted so **+ is good for you**. `(book)` means the predicted opponent move is in AggroChess's opening book (shown only when a prediction exists). Display only; dropped if the opponent moves first. Runs on the ponder worker (300 ms) before the ponder search. |
@@ -86,15 +89,15 @@ Shown in the panel only when the engine is AggroChess. All of it is off by defau
 
 ### Stockfish options (`stockfish`)
 
-Shown in the panel only when the engine is Stockfish. Pondering, the clock and threads are off (or 1) by default; since 2.0.0 the search mode is **Delay** (set **Search** to **Depth** for the 1.8.0 search). The shared ponder settings `earlyPonder`, `ponderUntilMove` and `ponderMaxMs` are described under AggroChess options and appear in both sections.
+Shown in the panel only when the engine is Stockfish. Pondering is on by default since 2.0.2 (its cost: see AggroChess options); the clock is off and threads are 1; since 2.0.0 the search mode is **Delay** (set **Search** to **Depth** for the 1.8.0 search). The shared ponder settings `earlyPonder`, `ponderUntilMove` and `ponderMaxMs` are described under AggroChess options and appear in both sections.
 
 | Control | Key | Range | Default | What it does |
 | --- | --- | --- | --- | --- |
 | Search | `sfSearchMode` | `depth`, `delay`, `clock` | `delay` | **2.0.0.** How the full search ends. **Depth** = `go depth N` (1.8.0). **Delay** = the search runs through the human-like pause: `go depth 64`, stopped from JavaScript once the pause budget (`softMs`) is used **and** Search depth is complete, or at a hard cap (**Stockfish max think time** if set, else `max(3 s, 3 x softMs)`, and the clock cap with **Use the game clock**). Search depth becomes a minimum; the move comes no later than before, but deeper (benchmark below). A soft budget of 0 searches like Depth. **Clock** = Stockfish's own time manager gets both chess.com clocks (`go wtime W btime B winc I binc I`); a timer stops it at the `clock.js` hard limit (never more than a quarter of what is left, and at most Stockfish max think time); if it answers before the pause is used, it keeps searching as in Delay. Your clock unreadable = Delay for that move; the opponent's clock unreadable = yours for both. **The clock selectors are unverified on the real site.** Quick looks always stay at depth 8 or less. |
 | Use the game clock | `sfUseClock` | on/off | off | Reads **your** clock from the page and caps the full search with a time budget (`soft`, the same rule as for AggroChess in `clock.js`: never more than a quarter of the remaining time, a short budget under 10 s). With **Stockfish max think time** also set, the smaller of the two is used. Depth still applies: the search ends at the depth or at the cap, whichever comes first. No clock readable = unchanged. Quick looks are not capped. |
-| Ponder on opponent's time | `sfPonder` | on/off | off | While the opponent thinks, 1-3 extra Stockfish workers (**never the main one**) rank the opponent's moves and prepare replies, see *Stockfish pondering* below. Off while **Imperfection** is above 0 (a prepared reply is always the best line). |
+| Ponder on opponent's time | `sfPonder` | on/off | on (2.0.2; off before) | While the opponent thinks, 1-3 extra Stockfish workers (**never the main one**) rank the opponent's moves and prepare replies, see *Stockfish pondering* below. Off while **Imperfection** is above 0 (a prepared reply is always the best line). |
 | Ponder time | `sfPonderMs` | 200-5000 ms, step 100 | 1500 | Budget of the pondering job: ranking and first-pass slices are sized from it; it is the ceiling of the whole job when **Keep pondering until the opponent moves** is off. |
-| Ponder as soon as the move is chosen / Keep pondering until the opponent moves / Ponder at most | `earlyPonder`, `ponderUntilMove`, `ponderMaxMs` | see AggroChess options | on / on / 8 s | Shared with AggroChess. In Delay / Clock mode the deepening passes have no depth cap (`go movetime`); in Depth mode they keep `go depth N` and stop once every top reply has depth N. |
+| Ponder as soon as the move is chosen / Keep pondering until the opponent moves / Ponder at most / Deepen a ponder hit during the pause | `earlyPonder`, `ponderUntilMove`, `ponderMaxMs`, `ponderHitTopUp` | see AggroChess options | on / on / 8 s / on | Shared with AggroChess. In Delay / Clock mode the deepening passes have no depth cap (`go movetime`); in Depth mode they keep `go depth N` and stop once every top reply has depth N. |
 | Ponder workers | `sfPonderWorkers` | 1-3 | 1 | Workers sharing the job; capped at `max(1, navigator.hardwareConcurrency - 1)` (unknown CPU count = 1). Measured in Node: **about 58 MiB per worker with a 16 MB hash** (42 MiB + the hash table; 74 MiB at 32 MB). |
 | Ponder hash | `sfPonderHashMb` | 4-64 MB, step 4 | 16 | Hash table of each ponder worker (the main worker keeps 32). |
 | Search threads | `sfThreads` | 1-4 | 1 | Threads of the **main** worker. Above 1 only if the threaded build (`engine/stockfish-19-lite.js`) can run: a runtime test (`SharedArrayBuffer`, `Atomics`, shared `WebAssembly.Memory`) must pass, the number is capped at `max(1, cores - 1)`, and any failure keeps the single-thread engine. **Not verified in Firefox** (see Not tested). |
@@ -179,7 +182,7 @@ Every `watchdogMs` milliseconds the extension re-reads the board and decides whe
 - Lower values recover faster and use a little more CPU. Higher values are lighter but can leave you waiting up to that long after a missed update.
 - The check is idempotent: when nothing changed it does nothing.
 - The 1-second board re-attach timer (it follows chess.com replacing the board element) is separate and fixed.
-- **Read board after a change** (`boardDebounceMs`, 0-300 ms, step 10, default 80; 2.0.0). A change on the board is not read at once: after this pause the board is read **twice**, one animation frame + 20 ms apart, and the move is processed only when both reads agree (otherwise it tries again, at most 10 times in a row, then goes on anyway). This matters because the tracker treats "more pieces than before" as a new game: a read taken while chess.com is half-way through an update followed by a full one could clear the engine hash and restart the recording. 250 = the 1.8.0 timing (the double read stays). Copy debug info counts `state.unstableReads`. The watchdog still reads directly (one read per tick); see *Not tested* for what that means.
+- **Read board after a change** (`boardDebounceMs`, 0-300 ms, step 10, default 40 since 2.0.2, 80 in 2.0.0). A change on the board is not read at once: after this pause the board is read **twice**, one animation frame + 20 ms apart, and the move is processed only when both reads agree (otherwise it tries again, at most 10 times in a row, then goes on anyway). This matters because the tracker treats "more pieces than before" as a new game: a read taken while chess.com is half-way through an update followed by a full one could clear the engine hash and restart the recording. 250 = the 1.8.0 timing (the double read stays). Copy debug info counts `state.unstableReads`. Since 2.0.2 the watchdog's read is a stable read too (constant `CV.WATCHDOG_STABLE_READ`, false = the 2.0.0 direct read). Measured in the jsdom harness (`tests/smoke-board.js`, 4 games x 8 moves per row): no history gap and no ponder miss at 80, 40 or 20 ms with one- and two-step board updates (15 and 30 ms apart); the median time from the bot's update to our first click (pause included) 375 / 296 / 316 ms (one step) and 405 / 355 / 325 ms (two steps). With the watchdog every 200 ms and two-step updates, the direct watchdog read gave 3 gaps and 3 ponder misses in 32 moves, the stable read none.
 
 Other recovery measures in the same area:
 
@@ -251,7 +254,7 @@ wc-chess-board DOM  --read-->  content.js  --sendMessage-->  background.js
 | `popup.html`, `popup.js` | Toolbar popup with the Auto-play switch. |
 | `LICENSE` | GNU GPL v3. |
 | `.github/workflows/tests.yml` | GitHub Action that syntax-checks the scripts and runs the unit tests on every push and pull request. |
-| `engine/` | Engine binaries and workers. `stockfish-19-lite-single.js` + `stockfish-19-lite-single.wasm` (Stockfish.js 19, WebAssembly, lite net, single thread; the file name is the constant `SF_FILE` at the top of the Stockfish section of `background.js`), `stockfish-19-asm.js` (asm.js fallback, used only if the wasm engine fails to start), `aggrochess.wasm` and `aggrochess-simd.wasm` (AggroChess 4.6.1; the same engine built without and with simd128), `aggro-worker.js` (all GPL-3.0), `aggrochess-4.6.1-chessvision.patch` (the changes to the AggroChess 4.6.1 web source behind the two binaries, see Development). Sources and licences: `engine/NOTICE.txt` (not updated for 1.7.9: it still describes the older AggroChess build). |
+| `engine/` | Engine binaries and workers. `stockfish-19-lite-single.js` + `stockfish-19-lite-single.wasm` (Stockfish.js 19, WebAssembly, lite net, single thread; the file name is the constant `SF_FILE` at the top of the Stockfish section of `background.js`), `stockfish-19-asm.js` (asm.js fallback, used only if the wasm engine fails to start), `aggrochess.wasm` and `aggrochess-simd.wasm` (AggroChess 4.6.1; the same engine built without and with simd128), `aggro-worker.js` (all GPL-3.0). The AggroChess source is in `engine-src/aggrochess/` (2.0.2, see Development). Sources, build commands and sha256 of the binaries: `engine/NOTICE.txt`. |
 | `chessvision-project-summary.md` | Project context for the next person or model; kept in the zip and updated with every change. |
 | `tests/` | Node unit tests, and `bench-aggro.js`, `bench-stockfish.js` + `bench-stockfish-sims.js` (benchmarks, not part of the test run). |
 
@@ -317,6 +320,10 @@ node tests/search-mode.test.js          # sfShouldStop truth table, hard cap, Ag
 node tests/boardstate-signature.test.js # BS.signature for the stable read
 node tests/settings.test.js             # 2.0.0 keys: sanitize, export / import round trip, the 1.8.0 values
 node tests/background-sim.test.js       # the real background.js with fake workers: delay / depth / clock mode, early ponder -> hit, discarded move -> miss, PV seed, deepening passes, late wait, main warm-up
+node tests/engine-signature.test.js     # 2.0.2: both AggroChess builds still search exactly like 4.6.1 (depth-8 bench signature); small budgets
+node tests/ponder-pool.test.js          # 2.0.2: recycled / interruptible AggroChess ponder workers (fake workers)
+node tests/aggro-worker.test.js         # 2.0.2: engine/aggro-worker.js with the real engine in a vm (queue, floor, stop of a queued request)
+node tests/sf-wrapper.test.js           # 2.0.2: both Stockfish builds start through sf-worker.js with a shared Module (real engines)
 for f in *.js engine/sf-worker.js engine/aggro-worker.js; do node --check "$f"; done
 ```
 
@@ -332,14 +339,20 @@ The older benchmark text below (`bench-stockfish.js`, `bench-aggro.js`) describe
 
 The benchmark (plain Node, `worker_threads`, a few minutes) reports instantiate time, the lazy-init cost of a cold first search, depth at 150 / 500 / 1500 ms on 5 fixed positions (cold first search vs warmed-up), depth with 1 / 2 / 3 concurrent instances, a check that a warmed-up instance answers exactly like a cold one, and how often the engine polls the clock. `--wasm engine/aggrochess-simd.wasm` measures the SIMD build.
 
-**Rebuilding the engine binaries** (not needed to use the extension). Source: AggroChess 4.6.1 web package (`source/`), plus `engine/aggrochess-4.6.1-chessvision.patch` (`patch -p0` style: apply the two hunks to `src/lib.rs` and `src/search.rs`). Then, with `opt-level = 3`, `lto = true` (fat), `codegen-units = 1`, `panic = "abort"` as in its `Cargo.toml`:
+**Rebuilding the engine binaries** (not needed to use the extension). Since 2.0.2 the AggroChess source is in the repository (`engine-src/aggrochess/`: AggroChess v4.6.1, the web wrapper and ChessVision's changes, see its README) and one command rebuilds both binaries with the pinned toolchain (Rust 1.100.0, `cargo --locked`, `opt-level = 3`, fat LTO, `codegen-units = 1`, `panic = "abort"`):
 
 ```
-cargo build --release --target wasm32-unknown-unknown                                   # engine/aggrochess.wasm
-RUSTFLAGS="-C target-feature=+simd128" cargo build --release --target wasm32-unknown-unknown   # engine/aggrochess-simd.wasm
+tools/build-aggrochess.sh                       # engine/aggrochess.wasm and engine/aggrochess-simd.wasm (+simd128)
+node tests/engine-signature.test.js             # the search must be unchanged (depth-8 signature, both builds)
+node tests/bench-engines.js --diff OLD NEW      # two builds answer identically under a deterministic clock
+node tests/bench-engines.js [--sig12]           # signature, nodes per second, depth at think(100/300/1000), start-up
+node tests/bench-engines.js --stockfish        # Stockfish: depth-14 signature, nodes per second, depth at soft 300/800, start ms
+tools/build-stockfish.sh                        # Stockfish 19 lite single, plain (reproduces the shipped files) + relaxed SIMD
+node tests/bench-ponder-rank.js                 # how often the AggroChess ranking pass puts the opponent's move in its top k
+node tests/bench-delay-mode.js --only hit       # depth of a Stockfish ponder hit with and without the top-up
+node tests/bench-jspi.js                        # headless Chromium (Playwright): JSPI polling overhead and stop latency
+NODE_PATH=.build/node_modules node tests/smoke-board.js   # jsdom page harness (npm install --no-save --prefix .build jsdom@31.0.1)
 ```
-
-Both were built with rustc 1.100 (conda-forge); the plain build reproduced the shipped 4.6.1 binary's size to within 136 bytes before the patch.
 
 **Continuous integration:** (not in this repository; the 1.8.0 notes describe it) `.github/workflows/tests.yml` runs `node --check` on every script, validates `manifest.json` and runs all `tests/*.test.js` on every push and pull request (Node 20). The browser-level checks below are not part of CI.
 
@@ -353,6 +366,56 @@ What has been checked, and what has not:
 - **Not tested on the live chess.com site.** Its markup and its handling of synthetic pointer events can differ from the mock, so drag and mixed input in particular should be treated as experimental. Click mode is the one carried over from 1.2.0.
 
 ## Changelog
+
+**2.0.2** (faster engines, workers and pondering. Only the version changes in `manifest.json`. Engine binaries changed for the first time since 1.7.9, under the 2.0.2 rules: reproducible builds (`tools/build-aggrochess.sh`, `tools/build-stockfish.sh`), sha256 of every binary in `engine/NOTICE.txt`, pure speed-ups keep the bench signatures bit-identical, the old builds stay as fallbacks. Every behaviour change has a setting or constant that restores 2.0.0: `ponderHitTopUp` off, `aggroPonder` / `sfPonder` off, `boardDebounceMs` 80, `CV.AGGRO_PONDER_RECYCLE`, `CV.AGGRO_INTERRUPT`, `CV.WATCHDOG_STABLE_READ` false, `CV.AGGRO_SCAN_FLOOR_MS` 20.)
+- **AggroChess source in the repository** (`engine-src/aggrochess/`): the 4.6.1 web package was not available, so its wrapper (`lib.rs`, `web_clock.rs`) was rebuilt from the shipped binaries on top of AggroChess v4.6.1 from GitHub. Accepted because it is indistinguishable from the 2.0.0 binaries: 145 scripted calls under a deterministic fake clock give identical answers and identical clock / random call counts (`node tests/bench-engines.js --diff`), and the bench signature is reproduced exactly (depth 12: 1 422 083 nodes, depth 8: 118 270). Byte-reproducible build (Rust 1.100.0, binaryen 132).
+- **Explicit WebAssembly SIMD for AggroChess's NNUE** (SIMD build; bit-exact): +27-30% nodes per second.
+- **TT index without a 128-bit multiply** (no `__multi3` call on wasm32; exact): speed within noise, kept.
+- **`wasm-opt -O3`** for both AggroChess builds: 11% smaller, the same search, speed within noise.
+- **Faster AggroChess start-up**: zeroed hash tables, nets read in place, warm-up with `think_depth(1)` (28 instead of 45 ms; 54 MiB less resident memory per fresh worker).
+- **Small budgets honoured**: new exports `analyze_floor` / `think_floor`; the ranking scans of an AggroChess ponder job take the 5-12 ms they ask for (they took 20 ms each), so the pass ranks every move inside its window (`CV.AGGRO_SCAN_FLOOR_MS`).
+- **Interruptible AggroChess (JSPI, feature-detected)**: the engine asks the page every 8 ms whether to stop; with `WebAssembly.Suspending` / `promising` the worker can receive `stop` meanwhile. A cancelled busy ponder worker is stopped (150 ms cap, then terminated) and recycled; a `late` reply search far from done is stopped and its move so far played (depth >= 8). Without JSPI (Firefox before ~153) nothing changes. *Not verified in Firefox.*
+- **Stockfish with relaxed SIMD** (`engine/stockfish-19-lite-single-rsimd.js/.wasm`): chosen when a relaxed-SIMD probe validates, else the plain build; identical depth-14 signature, ~+30% nodes per second. *Not verified in Firefox* (relaxed SIMD on by default since ~146 per caniuse).
+- **AggroChess ponder workers recycled** (`CV.AGGRO_PONDER_RECYCLE`): an idle worker keeps its hash instead of being terminated after every job; `clear` on a new game; the worker that searched the played line goes first.
+- **Ponder hits never lose depth** (`ponderHitTopUp`, default on): the hit pause is drawn before the search and the main worker deepens the prepared reply through it (Stockfish: when recent searches reached more than the reply's depth in that time; AggroChess: when the pause is at least the reply's slice). The cursor aims at the prepared move and turns if the move changes. The next ponder job starts once the move is final.
+- **Pondering on by default** (`aggroPonder`, `sfPonder`, 1 worker): see the cost note under AggroChess options.
+- **Stable read for the watchdog; board debounce 80 -> 40 ms** (`CV.WATCHDOG_STABLE_READ`, `boardDebounceMs`).
+- **Measured and not adopted**: an eval cache inside each search (the TT's stored eval already serves 28.9% of evaluation sites; the cache would catch 4.5% of the remaining calls; no measurable speed-up, gate +5%); an optional "peek" message during the stable read (a hit's answer is already immediate; the human pause dominates; cannot save the 15 ms the task asked for).
+
+**2.0.2, measured** (Node 22, x86-64 container, 4 cores, ±15% run to run; interleaved builds, medians of 3-6 rounds; Chromium = headless Chromium 157 through Playwright):
+
+| AggroChess (`node tests/bench-engines.js`) | 2.0.0 search (unchanged rebuild) | 2.0.2 |
+| --- | ---: | ---: |
+| bench signature, depth 8 / 12 (nodes) | 118 270 / 1 422 083 | identical, same moves |
+| SIMD build, k nodes per second (`think(1000)`, 9 positions) | 686 (597-712) | **873** (816-957) |
+| SIMD build, average depth at `think(100 / 300 / 1000)` | 12.22 / 14.67 / 17.78 | **12.67 / 15.33 / 18.67** |
+| plain build, k nodes per second | 542 | 553 |
+| binary size, SIMD / plain (bytes) | 2 070 888 / 2 069 099 | 1 836 746 / 1 841 645 |
+| first `think_depth(1)` of a fresh instance | 27.6 ms | 24.2 ms |
+| worker warm-up | 45 ms (`think(5)`) | 28 ms (`think_depth(1)`) |
+| resident memory after a warm-up | +59.7 MiB | +5.3 MiB |
+| one ranking scan asking for 12 ms | 20.2 ms | 12.1 ms |
+| ranking pass, budget 1500 ms: moves ranked in the window, opponent's move in the top 1 / 3 / 5 / 8 (80 positions, opponent AggroChess 150 ms) | 24.8 of 33.9; 44 / 68 / 73 / 75% | 33.5 of 33.9; **55 / 74 / 85 / 88%** |
+| interruptible (Chromium, JSPI): polling cost, stop latency | not interruptible | within noise (993 vs 976 k/s); median 5.6-6.3 ms, max 28-37 ms |
+
+| Stockfish (`node tests/bench-engines.js --stockfish`, `tests/bench-delay-mode.js --only hit`) | 2.0.0 (`stockfish-19-lite-single`) | 2.0.2 (relaxed SIMD) |
+| --- | ---: | ---: |
+| depth-14 signature (nodes; moves d5e6 d2d3 e1g1 c4d5 c3b5 e4e5 f5d3 b4b2 f4f5 d4d8) | 748 260 | identical |
+| k nodes per second (`go movetime 1000`), Node / Chromium | 537 (521-574) / 545 | **703** (630-745) / **776** |
+| average depth, delay search stopped at 300 / 800 ms | 17.1 / 20.1 | 17.7 / 20.7 |
+| start to the first `readyok` | 150 ms | 140 ms |
+| depth played on a ponder hit with a pass-1 reply (10 positions) | 10.0 | 15.6 / 15.5 / 16.9 (top-up of 60 / 150 / 260 ms) |
+
+| Pondering (simulations with fake engines: `tests/ponder-pool.test.js`, `tests/smoke-board.js`) | 2.0.0 | 2.0.2 |
+| --- | ---: | ---: |
+| AggroChess ponder workers started per move (2 workers, job ends before the opponent moves / until the opponent moves) | 2 / 2 | 1 / 2; with JSPI 0.25 / 0.25 |
+| AggroChess jobs that got a still-starting worker, per move (same) | 1 / 2 | 1 / 2; with JSPI 0.25 / 0.25 |
+| watchdog every 200 ms, two-step board updates: tracker gaps / ponder misses in 32 moves | 3 / 3 | 0 / 0 |
+| bot update -> our first click, median (pause included; one-step updates, 3 x 8 moves), Stockfish / AggroChess | 331 / 378 ms | 319 / 370 ms |
+| early-ponder lead (job start -> opponent's move), Stockfish / AggroChess | 1686 / 1730 ms | 1627 / 1697 ms (a top-up delays the job's start) |
+| Stockfish hits that were deepened (top-up) | - | 7 of 21 hits |
+
+*Not verified:* everything in real Firefox and on chess.com: JSPI and relaxed SIMD in Firefox (`background.stockfish.relaxedSimd`, `background.ponder.interrupt.mainInterruptible` in Copy debug info), the speed on a phone, the hit rate against real bots (the 88% of 1.8.0 was not re-measured: the fake engines answer every move in time), the extra round trip and the re-aimed cursor of a top-up on the real site, chess.com's real board-update pattern for the 40 ms debounce.
 
 **2.0.0** (speed and engine strength. Only the version changes in `manifest.json`: no permission, CSP, COOP/COEP or engine binary change. Every behaviour change has a setting or constant that restores 1.8.0: `earlyPonder` off, `boardDebounceMs` 250, `sfSearchMode` `depth`, `ponderHitFast` off, `ponderUntilMove` off, `CV.AGGRO_DELAY_MATCH = false`.)
 - **Early ponder** (`earlyPonder`, default on). The idle key is the move history (`CV.ponderKey`), so the ponder job for the position after your move starts as soon as the move is decided. The ponder state records when each job began and the lead time when the opponent moves (`background.ponder.lastLeadMs` / `avgLeadMs`). *Verified:* unit tests, background simulation (hit; a discarded move gives `miss`), jsdom smoke run (lead ~0.5 s -> ~1.15 s on the mock). *Not verified:* real chess.com.

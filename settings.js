@@ -38,7 +38,7 @@
 
     // --- AggroChess options (shown only when the engine is AggroChess) ---
     aggroUseClock: true,      // size the search from my chess.com clock (think_clock) when a clock can be read
-    aggroPonder: false,       // think on the opponent's time with a second, killable worker
+    aggroPonder: true,        // think on the opponent's time with a second, killable worker (2.0.2: on by default; false = 2.0.0)
     aggroPonderMs: 1500,      // ms of pondering per opponent move
     aggroPonderHashMb: 32,    // hash table of each ponder worker in MB (32 = the engine's own size; lower fits more workers on a phone)
     aggroPonderWorkers: 1,    // ponder workers working through the opponent's moves together (~50 MiB each; capped by the CPU count)
@@ -47,7 +47,7 @@
 
     // --- Stockfish options (shown only when the engine is Stockfish) ---
     sfUseClock: false,        // cap the search with a budget sized from my chess.com clock (never more than a quarter of what is left)
-    sfPonder: false,          // think on the opponent's time with extra Stockfish workers (never the main one)
+    sfPonder: true,           // think on the opponent's time with extra Stockfish workers, never the main one (2.0.2: on by default; false = 2.0.0)
     sfPonderMs: 1500,         // ms of pondering per opponent move (a ceiling)
     sfPonderWorkers: 1,       // ponder workers sharing the opponent's moves (capped by the CPU count; each costs wasm memory + its hash)
     sfPonderHashMb: 16,       // hash table of each ponder worker in MB (the main worker keeps 32)
@@ -55,10 +55,11 @@
 
     // --- 2.0.0: speed (both engines unless noted) ---
     earlyPonder: true,        // start pondering the moment our move is decided, not when the board shows it (false = 1.8.0)
-    boardDebounceMs: 80,      // wait after a board change before the stable-read check (250 = the 1.8.0 timing)
+    boardDebounceMs: 40,      // wait after a board change before the stable-read check (2.0.2: 40; 80 = 2.0.0, 250 = the 1.8.0 timing)
     ponderUntilMove: true,    // keep pondering (deepening the likely replies) until the opponent moves, up to ponderMaxMs (false = the *PonderMs budget, 1.8.0)
     ponderMaxMs: 8000,        // ceiling of a ponder job with ponderUntilMove
     ponderHitFast: true,      // a ponder hit is answered with the quick delay and the faster hand (false = 1.8.0: normal delay)
+    ponderHitTopUp: true,     // 2.0.2: on a ponder hit the main worker searches on through that pause when it can go deeper than the prepared reply (false = 2.0.0)
     sfSearchMode: 'delay',    // Stockfish full search: 'depth' (1.8.0: go depth N) | 'delay' (search through the human-like pause, depth = minimum) | 'clock'
 
     // --- game recording and saving ---
@@ -465,6 +466,55 @@
     if (cap > 0 && top.every((u) => results && results[u] && results[u].depth >= cap)) return [];
     const ms = Math.min(CV.PONDER_DEEPEN_MAX_SLICE_MS, first * Math.pow(2, k - 1), room);
     return ms >= CV.PONDER_MIN_SLICE_MS ? top.map((uci) => ({ uci, ms })) : [];
+  };
+
+  // ---- 2.0.2: AggroChess ponder workers ----
+  // A ponder worker whose job ended or was cancelled while it had no request in flight goes back to the spares with its
+  // hash (busy ones are terminated: a wasm think cannot be interrupted); a new game sends it `clear` before its next
+  // job. false = 2.0.0: every AggroChess ponder worker is terminated when its job ends or is cancelled.
+  CV.AGGRO_PONDER_RECYCLE = true;
+  // The ranking pass of an AggroChess ponder job asks for 5-12 ms per opponent move; the engine's analyze() never
+  // searched less than 20 ms, so a pass over 30 moves took >= 600 ms and ran out of its window (budget x 0.35) before the
+  // last moves. 2.0.2 engines take a floor with the request (analyze_floor). 20 = 2.0.0.
+  // Measured (tests/bench-ponder-rank.js, 80 positions, opponent AggroChess 150 ms, budget 1500): moves ranked in the
+  // window 24.8 -> 33.5 of 33.9; opponent's move in the top 1 / 3 / 5 / 8: 44 / 68 / 73 / 75% -> 55 / 74 / 85 / 88%.
+  CV.AGGRO_SCAN_FLOOR_MS = 3;
+  // The watchdog's board read goes through the stable read (two reads a frame + 20 ms apart must agree), like a
+  // mutation's. false = 2.0.0: the watchdog reads the board directly (content.js).
+  CV.WATCHDOG_STABLE_READ = true;
+  // 2.0.2 (A7): AggroChess workers that report `interruptible` (JSPI in the browser and a 2.0.2 engine) are stopped
+  // instead of terminated: a cancelled job's busy worker is stopped and recycled like a Stockfish one, and a `late`
+  // reply search far from done is stopped and its move used from this depth on. false = 2.0.0 (terminate).
+  CV.AGGRO_INTERRUPT = true;
+  CV.AGGRO_PARTIAL_MIN_DEPTH = 8;
+
+  // ---- 2.0.2: ponder hits never lose depth (pure; background.js) ----
+  // A prepared reply is often shallower than what the main worker reaches in the pause a hit is played after anyway
+  // (Stockfish pass-1 replies: go depth N movetime slice, depth <= 10; PV seeds: depth - 2). The page draws that pause up
+  // front and sends hitSoftMs = pause - SF_DELAY_MARGIN_MS - time spent; on a hit the background searches the position
+  // on the main worker within hitSoftMs when that is expected to go deeper, and plays the deeper of the two results.
+  CV.HIT_TOPUP_MIN_MS = 30;             // shorter than this, the main worker adds nothing (a fresh search, message round trips)
+  // { search, ms, reason }. engine 'sf': search when expectedDepth (CV.expectedDepth of the recent main searches; null =
+  // not known yet) is above storedDepth. engine 'aggro': search when hitSoftMs is at least storedMs, the slice the stored
+  // reply was searched with (its depth is not comparable across budgets; 0 / unknown = search).
+  CV.hitTopUp = function ({ engine, storedDepth, storedMs, hitSoftMs, expectedDepth }) {
+    const ms = Math.max(0, Math.round(Number(hitSoftMs)) || 0);
+    if (ms < CV.HIT_TOPUP_MIN_MS) return { search: false, ms, reason: 'no time' };
+    if (engine === 'aggro') {
+      const slice = Math.max(0, Number(storedMs) || 0);
+      return slice > ms ? { search: false, ms, reason: 'slice longer' } : { search: true, ms, reason: 'pause >= slice' };
+    }
+    if (expectedDepth === null || expectedDepth === undefined) return { search: true, ms, reason: 'no model yet' };
+    return Number(expectedDepth) > (Number(storedDepth) || 0) ? { search: true, ms, reason: 'deeper expected' } : { search: false, ms, reason: 'not deeper' };
+  };
+  // The depth a main search is expected to complete within ms: for each recent search (samples = [[[depth, ms], ...], ...],
+  // the time each depth was completed at), the deepest depth done by ms; the median over the searches. null = no samples.
+  CV.expectedDepth = function (samples, ms) {
+    const list = (Array.isArray(samples) ? samples : []).filter((s) => Array.isArray(s) && s.length);
+    if (!list.length) return null;
+    const reach = list.map((s) => s.reduce((d, [depth, t]) => (t <= ms && depth > d ? depth : d), 0)).sort((a, b) => a - b);
+    const n = reach.length;
+    return n % 2 ? reach[(n - 1) / 2] : (reach[n / 2 - 1] + reach[n / 2]) / 2;
   };
 
   // ---- 2.0.0: AggroChess `late` with the move's reply search almost done (pure; background.js) ----

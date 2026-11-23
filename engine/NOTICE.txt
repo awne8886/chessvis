@@ -2,8 +2,22 @@ Third-party components in engine/ and how they are licensed.
 This file records sources and licences as understood by the project author. It is not legal advice.
 
 engine/stockfish-19-asm.js  - Stockfish, GPL-3.0 (https://stockfishchess.org). Since 1.6.0 only the fallback engine.
-engine/aggrochess.wasm      - AggroChess 4.5.1, GPL-3.0 (https://github.com/PhelRin/AggroChess)
-engine/aggro-worker.js      - worker wrapper supplied with AggroChess, GPL-3.0
+engine/aggro-worker.js      - worker wrapper supplied with AggroChess, GPL-3.0 (changed by ChessVision)
+
+AggroChess 4.6.1, GPL-3.0, (c) Rinarto Gibson (https://github.com/PhelRin/AggroChess)
+engine/aggrochess.wasm      - plain WebAssembly build
+engine/aggrochess-simd.wasm - the same engine built with simd128 (chosen when WebAssembly.validate accepts SIMD)
+                              Source: engine-src/aggrochess/ in this repository (not loaded at runtime) = AggroChess
+                              v4.6.1 (commit 4d7692e955b677e7b3f6ec7a457598c2311685fe, tag v4.6.1) + the web wrapper
+                              (src/lib.rs, src/web_clock.rs; reconstructed in 2.0.2 from the 2.0.0 binaries, see
+                              engine-src/aggrochess/README.md) + ChessVision's changes (engine-src/aggrochess/upstream.diff).
+                              Build: tools/build-aggrochess.sh (Rust 1.100.0, cargo --locked, wasm32-unknown-unknown;
+                              the SIMD build with RUSTFLAGS="-C target-feature=+simd128"; then wasm-opt -O3 from binaryen
+                              version_132, Apache-2.0, a build tool only). The build is byte-reproducible.
+                              Dependencies (crates.io, compiled in): cozy-chess 0.3.4 and cozy-chess-types 0.2.2 (MIT),
+                              polyglot-book-rs 0.1.0 (MIT OR Apache-2.0).
+                              engine/aggrochess.wasm      sha256 7207bed530c6aac1dc2d6b591fe9c899f9978e1f81fc977598a981c073df967a
+                              engine/aggrochess-simd.wasm sha256 bf5d7821d6f02576d99229f847e434b33dd5025264c1410235bd75aec2b9053d
 
 Stockfish.js 19, WebAssembly lite single-thread build (added in 1.6.0)
 engine/stockfish-19-lite-single.js    - loader/worker, Stockfish.js 19 (c) 2026 Chess.com, LLC, GPL-3.0
@@ -22,9 +36,21 @@ engine/stockfish-19-lite-single.wasm  - the engine itself (lite NNUE net, single
                               https://github.com/nmrugg/stockfish.js/releases/tag/v19.0.1 (same file names).
                               engine/stockfish-19-asm.js is byte-identical to bin/stockfish-19-asm.js of that package
                               (sha256 c07dad9a00a89f4b1dcba3971d58d8078715556eac0212368e4aab510e1e27c9).
+                              2.0.2: both files are reproduced byte for byte from source by tools/build-stockfish.sh
+                              (stockfish.js v19.0.1, emsdk 6.0.9, `node build.js --lite --single-threaded --no-split`).
+engine/stockfish-19-lite-single-rsimd.js    - 2.0.2: the same engine (Stockfish.js 19.0.1, lite net, single thread, GPL-3.0)
+engine/stockfish-19-lite-single-rsimd.wasm    built with WebAssembly relaxed SIMD; used when the browser validates a relaxed
+                              SIMD probe module, else the files above. Built by tools/build-stockfish.sh from
+                              https://github.com/nmrugg/stockfish.js tag v19.0.1 (commit 0d5dd7944f88c817c07a26bc4fb1905d5f9c46d6)
+                              with emsdk 6.0.9 and terser 5.51.2; the only change is a 6-line switch in
+                              src/emscripten/wasm-makefile.mk (RELAXED_SIMD=yes adds -mrelaxed-simd at compile and link
+                              time, written for ChessVision, GPL-3.0). The relaxed dot product it enables is Stockfish's own
+                              code (src/nnue/simd.h, GPL-3.0). No lichess / AGPL code is used.
+                              engine/stockfish-19-lite-single-rsimd.js   sha256 0212ceb41bfd67782f72f8e7ae2afc0cb4ee99856a3c41bd3ba2df4461a5501a
+                              engine/stockfish-19-lite-single-rsimd.wasm sha256 744ae23293592254667b4b4fe2d5eae17319945ee06c51e364792b524880e6e7
                               Multi-thread builds are NOT used (they need SharedArrayBuffer / cross-origin isolation).
 
-Maia-3 (added in 1.3.0)
+Maia-3 (added in 1.3.0; REMOVED in 1.7.8 - none of the files below is shipped any more, the entries are kept for the record)
 engine/maia3-23m.fp16.onnx  - Maia-3 23M network weights, exported to ONNX (fp16).
                               Model: Maia-3 by the CSSLab (University of Toronto), AGPL-3.0
                               (https://github.com/CSSLab/maia3 - its LICENSE file is the GNU AGPL v3;
@@ -39,7 +65,7 @@ maia.js                     - JavaScript port of the Maia-3 board tokenizer, mov
                               The file is distributed here under the project's licence terms for ported
                               AGPL-3.0 code; keep this attribution.
 
-engine/ort.wasm.min.js, engine/ort-wasm-simd-threaded.mjs, engine/ort-wasm-simd-threaded.wasm
+engine/ort.wasm.min.js, engine/ort-wasm-simd-threaded.mjs, engine/ort-wasm-simd-threaded.wasm   (REMOVED in 1.7.8 with Maia-3)
                             - onnxruntime-web 1.31.1, MIT (https://github.com/microsoft/onnxruntime,
                               Copyright (c) Microsoft Corporation). All three files must come from the
                               same version.

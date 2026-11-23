@@ -1,10 +1,10 @@
 # ChessVision
 
-ChessVision is a Firefox extension (Manifest V2, version 2.0.0) that plays chess against the **computer bots** on chess.com by itself. It reads the board from the page, asks a chess engine that runs locally inside the extension for a move, and plays that move with synthetic pointer events. No server is involved: both engines are WebAssembly binaries that ship in `engine/`.
+ChessVision is a Firefox extension (Manifest V2, version 2.0.2) that plays chess against the **computer bots** on chess.com by itself. It reads the board from the page, asks a chess engine that runs locally inside the extension for a move, and plays that move with synthetic pointer events. No server is involved: both engines are WebAssembly binaries that ship in `engine/`.
 
 > **Scope.** ChessVision only acts on pages listed in [`allowed-pages.txt`](allowed-pages.txt) and is meant for bot games. Do not use it against people, in rated play, or anywhere engine help is not allowed.
 
-This README explains **how the extension is built and why**: every file, the path a move takes from the board to the engine and back, and the tricks that make it fast. The complete settings table, troubleshooting guide and changelog are in [`docs/REFERENCE.md`](docs/REFERENCE.md) (the README that shipped in the 1.8.0 zip, updated for 2.0.0).
+This README explains **how the extension is built and why**: every file, the path a move takes from the board to the engine and back, and the tricks that make it fast. The complete settings table, troubleshooting guide and changelog are in [`docs/REFERENCE.md`](docs/REFERENCE.md) (the README that shipped in the 1.8.0 zip, updated for 2.0.0 and 2.0.2).
 
 ---
 
@@ -94,7 +94,7 @@ What happens between "the opponent moved" and "our piece lands", with the file a
 | --- | --- |
 | **Lite NNUE build** (`stockfish-19-lite-single.wasm`, ~1.8 MB with the net inside) | The full-size Stockfish net is tens of MB; the lite net keeps the add-on small enough for a phone while keeping NNUE evaluation. |
 | **Single-thread build by default** | The multi-thread build needs `SharedArrayBuffer`, which needs cross-origin isolation. Whether a Firefox extension background page has it is not verified, so it is opt-in (`sfThreads > 1`) and guarded by a runtime test (`CV.sabSupport`); any failure silently keeps the single-thread engine. |
-| **Already uses WebAssembly SIMD** | A scan of the shipped binary finds ~7 300 SIMD instructions (`v128`, `i16x8`, …). The NNUE inference is vectorised; there is no further SIMD gain to be had from rebuilding. |
+| **WebAssembly SIMD, and relaxed SIMD since 2.0.2** | The plain build's NNUE is vectorised (`i32x4.dot_i16x8_s`). Since 2.0.2 a second build, `stockfish-19-lite-single-rsimd.js/.wasm`, uses **relaxed SIMD** (`i32x4.relaxed_dot_i8x16_i7x16_add`, Stockfish's own code path, deterministic because the activations are 0..127): the same search (identical depth-14 signature), about 30% more nodes per second (Node 537 → 703 k/s; Chromium 545 → 776 k/s). It is used when `WebAssembly.validate` accepts a one-instruction probe (`RELAXED_PROBE`); any failure to compile or start it falls back to the plain build for good. Both are built from source by `tools/build-stockfish.sh` (the plain one byte for byte as shipped). |
 | **asm.js fallback** (`stockfish-19-asm.js`) | Only for a browser where WebAssembly fails. Much slower, but the bot keeps playing. |
 | **Compiled once, shared** (`sfModuleFor`) | The background compiles the `.wasm` a single time with `WebAssembly.compileStreaming` and posts the compiled `WebAssembly.Module` to each worker. Compiling ~1.8 MB of wasm is the slow part of starting a worker; instantiating an already compiled Module is cheap. This matters because the ponder pool starts several Stockfish workers. |
 | **Unmodified loader + wrapper** (`engine/sf-worker.js`) | The npm loader is kept byte-identical (licence traceability, easy upgrades). The wrapper intercepts exactly **one** `fetch` + `instantiateStreaming` call of the loader and answers it with the shared Module, then removes the patch. If anything goes wrong it falls back to the real fetch, so the worst case is the old behaviour. |
@@ -108,12 +108,12 @@ What happens between "the opponent moved" and "our piece lands", with the file a
 | Choice | Why |
 | --- | --- |
 | **An attacking personality** | Plays sacrificial, aggressive chess; reports a `sacrifice` flag per move, which the recorder counts. |
-| **Plain + SIMD builds** | `aggrochess-simd.wasm` is chosen when `WebAssembly.validate` accepts a tiny SIMD probe module (`SIMD_PROBE`); otherwise `aggrochess.wasm`. Same search, ~15% faster with SIMD (Node). |
+| **Plain + SIMD builds** | `aggrochess-simd.wasm` is chosen when `WebAssembly.validate` accepts a tiny SIMD probe module (`SIMD_PROBE`); otherwise `aggrochess.wasm`. Same search. Since 2.0.2 the SIMD build computes the NNUE with explicit wasm SIMD (`screlu_dot` with `i32x4.dot_i16x8_s`, the accumulator updates with `i16x8` adds; bit-exact): 686 → 873 k nodes/s in Node, about 1.6x the plain build. Both are optimised by `wasm-opt -O3` (11% smaller). |
 | **Compiled once, shared** | Like Stockfish: `aggroModuleFor()` compiles once, each worker only instantiates (`{type:'init', module}`); a worker that receives no Module within 3 s loads the file itself. |
-| **Warm-up before `ready`** | The first search of a fresh instance allocates the net, book and hash (~40-65 ms). A worker pays that on a non-book middlegame position, then clears the hash and resets the game, so the first real search is not slowed down. |
-| **Patched source** (`engine/aggrochess-4.6.1-chessvision.patch`) | The clock is polled every 256 nodes instead of 1024 (a search overran its budget by ~50 ms in wasm, where reading the clock is a call into JavaScript), and two exports were added: `set_tt_mb` (hash size per worker) and `think_depth` (one depth step at a time, for interruptible pondering). |
+| **Warm-up before `ready`** | The first search of a fresh instance sets up the net, book and hash. A worker pays that on a non-book middlegame position (2.0.2: `think_depth(1)`, ~28 ms in Node instead of 45 for `think(5)`, which had to search the 30 ms floor), then clears the hash and resets the game; a warmed worker answers exactly like a cold one. Since 2.0.2 the hash tables are allocated zeroed and the nets read in place (54 MiB less resident memory per fresh worker). |
+| **Source in the repository** (`engine-src/aggrochess/`, built by `tools/build-aggrochess.sh`) | AggroChess 4.6.1 (GitHub tag `v4.6.1`) plus the web wrapper, which 2.0.2 reconstructed from the shipped binaries and checked call for call against them, and ChessVision's changes (`upstream.diff`): the clock is polled every 256 nodes instead of 1024 (a search overran its budget by ~50 ms in wasm, where reading the clock is a call into JavaScript); the exports `set_tt_mb` (hash size per worker) and `think_depth` (one depth step at a time); since 2.0.2 `analyze_floor` / `think_floor` (short searches that stay short: the ranking scans), `last_info` (benchmarks), the `js_poll` import (interruption) and the speed changes. The build is pinned (Rust 1.100.0, `Cargo.lock`, binaryen 132) and byte-reproducible. |
 | **Clock-sized search** | `think_clock(soft, hard)` is fed from your chess.com clock (`clock.js`), so the engine spends more time when it has it and never risks flagging. |
-| **Hard to interrupt** | A wasm `think()` call blocks its worker until it returns. The only way to cancel it is `Worker.terminate()`. This single fact shapes the whole AggroChess pondering design below. |
+| **Interruptible where the browser has JSPI (2.0.2)** | A wasm `think()` call blocks its worker until it returns. Since 2.0.2 the engine asks the page every 8 ms (`js_poll`) whether to stop; with JavaScript Promise Integration (`WebAssembly.Suspending` / `promising`, feature-detected) that question lets the worker receive a `stop`, and the search ends with its last completed depth (Chromium: median 6 ms after the stop, no measurable cost). Without JSPI (Firefox before ~153, unverified) a search still runs to its time limit and the only way to cancel it is `Worker.terminate()`, which shapes the AggroChess pondering design below. |
 
 ### Why two engines
 
@@ -123,7 +123,9 @@ Stockfish is the strongest move-finder; AggroChess plays the sharper, more enter
 
 ## Pondering (thinking on the opponent's time)
 
-Off by default (`aggroPonder`, `sfPonder`). When on, the extension uses the seconds while the opponent thinks to **prepare our reply in advance**. If the opponent then plays a move we prepared for, our answer is ready instantly ("ponder hit").
+**On by default since 2.0.2** (`aggroPonder`, `sfPonder`; 1 ponder worker each). The extension uses the seconds while the opponent thinks to **prepare our reply in advance**. If the opponent then plays a move we prepared for, our answer is ready instantly ("ponder hit"; 88% of moves in the 1.8.0 simulation).
+
+**What it costs, and how to switch it off.** While the opponent thinks, one ponder worker keeps one CPU core busy, for the whole opponent's think with **Keep pondering until the opponent moves** (up to **Ponder at most**, 8 s), and holds its memory (AggroChess about 50 MiB, Stockfish about 58 MiB with its 16 MB hash) for as long as pondering is on. On a phone that means more battery use and some warmth during long games. Pondering stops when the tab is hidden. To switch it off: in the panel, **AggroChess options → Ponder on opponent's time** and **Stockfish options → Ponder on opponent's time** (`aggroPonder`, `sfPonder` off = 2.0.0). A middle way: keep pondering on but switch **Keep pondering until the opponent moves** off; the job then ends after **Ponder time** (1.5 s).
 
 ### Why not classic UCI `go ponder`?
 
@@ -142,7 +144,8 @@ Classic pondering guesses **one** opponent move and searches it. Measured in thi
 * **1-3 ponder workers** (`*PonderWorkers`), capped at `max(1, hardwareConcurrency − 1)` so the main search and the page keep a core.
 * **Shared queues.** All ponder workers pull from one ranking queue and one reply queue: whichever worker is free takes the next opponent move.
 * **Warm spares.** After a job, replacements are created and warmed up **in advance** (`ponderTopUp`), so the next job starts at once. Spares are only made while pondering is wanted and never while a real search runs (instantiating a worker would steal CPU from it).
-* **Cancelling.** AggroChess workers are terminated (the only way to interrupt wasm `think()`), then replaced by warm spares. Stockfish workers are cancelled with `stop` + `isready` (~20 ms) and **recycled** with their hash; `terminate()` is only the escape hatch if they do not answer within 1.5 s.
+* **Cancelling.** Stockfish workers are cancelled with `stop` + `isready` (~20 ms) and **recycled** with their hash; `terminate()` is only the escape hatch if they do not answer within 1.5 s. AggroChess workers (2.0.2): an idle one goes back to the spares with its hash; a busy one is stopped and recycled the same way when it is interruptible (JSPI, answer within 150 ms), else terminated and replaced by a warm spare. A new game sends `clear` to a recycled worker; the worker that searched the line that was played gets the next job first.
+* **Ponder hits keep their depth (2.0.2).** A prepared reply is often shallower than what the main worker reaches in the pause a hit is played after anyway (a pass-1 Stockfish reply has depth ~10). The page draws that pause before asking; on a hit the main worker searches on through it when it should get deeper (`CV.hitTopUp`), and the deeper move is played (Stockfish in Node: 10 → 15.6-16.9 within 60-260 ms). The cursor starts towards the prepared move and turns if the move changed (`ponderHitTopUp`).
 * **Tokens.** Every ponder job carries `idleToken`; every async step re-checks it, so results of an outdated job can never leak into the next position. A new game bumps `ponderGen`, and recycled Stockfish workers send `ucinewgame` before their next job.
 * **Hidden tab** → pondering stops (`visibilitychange`), to save battery.
 
@@ -227,49 +230,59 @@ AggroChess uses this by default (`aggroUseClock`). For Stockfish it is an option
 | `engine/stockfish-19-asm.js` | asm.js fallback. |
 | `engine/aggro-worker.js` | AggroChess worker: instantiation, warm-up, the message protocol (`position`, `think`, `analyze`, `ponderMove`, `clear`). |
 | `engine/aggrochess.wasm` / `aggrochess-simd.wasm` | AggroChess 4.6.1, plain and SIMD builds. |
-| `engine/aggrochess-4.6.1-chessvision.patch` | The source changes made to AggroChess for this extension. |
+| `engine-src/aggrochess/` | The AggroChess source behind the two binaries (not loaded at runtime); `tools/build-aggrochess.sh` rebuilds them. |
 | `engine/NOTICE.txt` | Third-party sources and licences. |
 | `chessvision-project-summary.md` | Hand-over notes between development sessions: what was done, what was measured, what is unverified. |
 | `docs/REFERENCE.md` | The full user manual: every setting with key / range / default, troubleshooting, changelog. |
 | `docs/SONNET_PROMPT.md` | The speed / strength improvements, written as an implementation task (planned as 1.9.0, released as 2.0.0). |
-| `tests/` | Plain Node tests (`*.test.js`), the fake-worker background harness (`_fakebg.js`) and the delay-mode benchmark (`bench-delay-mode.js`). |
+| `docs/OPUS_PROMPT_2.0.2.md` | The 2.0.2 task (engine speed, workers, pondering), with its status. |
+| `engine/stockfish-19-lite-single-rsimd.js/.wasm` | 2.0.2: Stockfish 19 lite single-thread with relaxed SIMD (used where the browser supports it). |
+| `tools/build-aggrochess.sh`, `tools/build-stockfish.sh` | 2.0.2: pinned, reproducible engine builds (Rust 1.100.0 + binaryen 132; emsdk 6.0.9). Not needed to use the extension. |
+| `tests/` | Plain Node tests (`*.test.js`), the fake-worker background harness (`_fakebg.js`), the engine helpers (`_aggro-wasm.js`), and benchmarks: `bench-engines.js` (signatures, speed, `--diff`), `bench-delay-mode.js`, `bench-ponder-rank.js`, `bench-jspi.js` (Chromium via Playwright), `smoke-board.js` (jsdom page harness; jsdom is installed on demand, not a dependency). |
 
 ---
 
 ## Measured numbers
 
-From the project's own benchmarks (Node, see `chessvision-project-summary.md`) and a check made for this README (Node, x86-64 container):
+From the project's own benchmarks (Node 22, x86-64 container with 4 cores; each about ±15% run to run; see `docs/REFERENCE.md` › Changelog for the method of each):
 
-| What | Result |
-| --- | --- |
-| Stockfish lite, depth 10, middlegame, cold hash | **25 ms** (9 246 nodes, ~370 knps) |
-| Same search again, warm hash | **2 ms** |
-| Stockfish lite, depth 14 | ~410 ms |
-| Ponder hit rate, many-move pool vs single guess (`go ponder`) | 88% vs 52% |
-| MultiPV ranking vs per-move scan (1 worker, 1500 ms) | 77-81% vs 75% hit rate, a third of the CPU |
-| `stop` latency, single-thread Stockfish | ~20 ms |
-| AggroChess SIMD vs plain | identical moves, ~15% faster |
-| Larger Stockfish hash (64/128 MB) | no gain measured |
+| What | 2.0.0 | 2.0.2 |
+| --- | --- | --- |
+| AggroChess SIMD build, nodes per second (`think(1000)`) | 686 k | **873 k** (explicit NNUE SIMD) |
+| AggroChess SIMD, average depth at `think(100 / 300 / 1000)` | 12.2 / 14.7 / 17.8 | **12.7 / 15.3 / 18.7** |
+| AggroChess bench signature (depth 8 / 12) | 118 270 / 1 422 083 nodes | identical |
+| AggroChess binaries | 2.06 MB each | 1.84 MB (wasm-opt) |
+| AggroChess fresh worker: warm-up / resident memory | 45 ms / ~60 MiB | 28 ms / ~5 MiB until the hash fills |
+| AggroChess ranking scan (one opponent move) | 20 ms (analyze floor) | 12 ms as asked (3 ms floor) |
+| AggroChess ranking: opponent's move in the top 1 / 3 / 5 / 8 (80 positions) | 44 / 68 / 73 / 75% | **55 / 74 / 85 / 88%** |
+| Stockfish, nodes per second (`go movetime 1000`) | 537 k | **703 k** (relaxed SIMD) |
+| Stockfish depth in a 300 / 800 ms delay search | 17.1 / 20.1 | 17.7 / 20.7 |
+| Stockfish depth-14 signature | 748 260 nodes | identical |
+| Depth played on a Stockfish ponder hit (pass-1 reply) | 10.0 | **15.6-16.9** (top-up in 60-260 ms) |
+| AggroChess ponder workers started per move (2 workers, simulation) | 2 | 1 (job ended first); 0.25 with JSPI |
+| AggroChess stop of a running search (Chromium, JSPI) | terminate + restart | median 6 ms, kept warm |
+| Ponder hit rate, many-move pool vs single guess (`go ponder`, 1.8.0) | 88% vs 52% | not re-measured |
+| Stockfish lite, depth 10, cold hash / warm hash | 25 ms / 2 ms | unchanged |
 
-A phone is typically several times slower than these figures. None of this has been measured in real Firefox or on real chess.com bots yet.
+A phone is typically several times slower than these figures. None of this has been measured in real Firefox or on real chess.com bots yet (the JSPI and relaxed-SIMD numbers come from headless Chromium 157).
 
 ---
 
 ## Where the time actually goes, and what could be faster
 
-With the default settings (Stockfish, Search depth 10 as a minimum, human-like play on), the time from "opponent moved" to "our piece lands" in 2.0.0 is roughly:
+With the default settings (Stockfish, Search depth 10 as a minimum, human-like play on; 2.0.2: pondering on), the time from "opponent moved" to "our piece lands" is roughly:
 
-| Stage | 1.8.0 | 2.0.0 |
-| --- | --- | --- |
-| Debounce before the board is read | 250 ms | 80 ms + one frame + 20 ms (stable read) |
-| Engine | 2-25 ms at depth 10, then idle | searches **through** the pause: depth ~14-18 in Node (0 on a ponder hit) |
-| Human-like delay | 300-800 ms (80-300 for quick replies) | the same; 80-300 ms on a ponder hit (`ponderHitFast`) |
-| Cursor glide + two clicks | ~0.5-1.5 s after the pause | the glide to the from-square runs during the pause (160-520 ms saved) |
-| Pondering starts | ~1-2 s after the move was decided | when the move is decided, and runs until the opponent moves |
+| Stage | 1.8.0 | 2.0.0 | 2.0.2 |
+| --- | --- | --- | --- |
+| Debounce before the board is read | 250 ms | 80 ms + one frame + 20 ms (stable read) | 40 ms + one frame + 20 ms; the watchdog reads stably too |
+| Engine | 2-25 ms at depth 10, then idle | searches **through** the pause: depth ~14-18 in Node (0 on a ponder hit) | the same, ~30% more nodes per second (relaxed SIMD / NNUE SIMD); a ponder hit is deepened through its pause |
+| Human-like delay | 300-800 ms (80-300 for quick replies) | the same; 80-300 ms on a ponder hit (`ponderHitFast`) | the same (drawn before the search) |
+| Cursor glide + two clicks | ~0.5-1.5 s after the pause | the glide to the from-square runs during the pause (160-520 ms saved) | the same; re-aimed if a top-up changes the move |
+| Pondering starts | ~1-2 s after the move was decided | when the move is decided, and runs until the opponent moves | the same (after a top-up ends); on by default |
 
 Measured (`tests/bench-delay-mode.js`, real Stockfish loader in Node, 10 middlegame positions): `go depth 10` reaches depth 10 in 16 ms (median); a delay-matched search with a 300 ms pause reaches depth 15.8 on average, with 800 ms depth 18.1. The table is in [`docs/REFERENCE.md`](docs/REFERENCE.md#changelog).
 
-What is left: everything above was measured in Node and in a jsdom mock of the page, not in Firefox or on chess.com (see `chessvision-project-summary.md` for the list of real-browser checks). The watchdog still reads the board directly; a stable read for it too is an open point. [`docs/SONNET_PROMPT.md`](docs/SONNET_PROMPT.md) is the task description these changes were implemented from (written for "1.9.0", released as 2.0.0).
+What is left: everything above was measured in Node, in headless Chromium and in a jsdom mock of the page, not in Firefox or on chess.com (see `chessvision-project-summary.md` for the list of real-browser checks). [`docs/SONNET_PROMPT.md`](docs/SONNET_PROMPT.md) (2.0.0) and [`docs/OPUS_PROMPT_2.0.2.md`](docs/OPUS_PROMPT_2.0.2.md) (2.0.2) are the task descriptions these changes were implemented from.
 
 ---
 
@@ -278,7 +291,7 @@ What is left: everything above was measured in Node and in a jsdom mock of the p
 (Summarised from `chessvision-project-summary.md`, which is the authoritative hand-over file.)
 
 * Keep the separation: DOM code only in `content.js` / `overlay.js`, logic in the pure modules.
-* No new dependencies, no build step. Manifest changes only for the version, new content scripts, or an explicitly approved permission.
+* No new runtime dependencies, no build step for the extension (plain JS). Engine binaries are built only by the pinned scripts in `tools/` (since 2.0.2), and a pure speed-up must keep the engine signatures bit-identical (`tests/engine-signature.test.js`, `node tests/bench-engines.js --diff`). Manifest changes only for the version, new content scripts, or an explicitly approved permission.
 * Tests run with plain Node: `for t in tests/*.test.js; do node "$t" || exit 1; done`. The 1.8.0 zip did not contain the `tests/` folder or `.github/` its notes mention; `tests/` was recreated in 2.0.0 (see `docs/REFERENCE.md › Development`).
 * Keep `docs/REFERENCE.md` (settings + changelog), the tests and `chessvision-project-summary.md` in sync with every change.
 * Mark anything that depends on the real chess.com site as unverified until it has been checked.

@@ -4,7 +4,12 @@
 // `go depth 64` and stops it with the extension's own rule (CV.sfShouldStop: soft used AND depth >= 10, or the hard cap).
 // Also (--only warm): the main-worker warm-up of T10 (cost, and the first search after it).
 //
-//   node tests/bench-delay-mode.js [--only delay|warm] [--json]
+//   node tests/bench-delay-mode.js [--only delay|warm|hit] [--engine engine/<loader>.js] [--json]
+// --only hit (2.0.2, C2): the depth of a ponder hit. Per position the main engine searches our move (delay, soft 300 ms),
+// the opponent plays the expected reply (pv[1]), a second engine prepares our answer as pondering pass 1 does
+// (`go depth 10 movetime 250`, empty hash): that is the depth a 2.0.0 hit plays. Then the main engine (its hash warm from
+// our search) searches the same position for the hit pause (60 / 150 / 260 ms, the ponderHitFast range minus the 40 ms
+// margin): the depth a 2.0.2 top-up reaches.
 //
 // Node / V8 numbers on this machine; a phone is several times slower. Nothing here runs in Firefox.
 'use strict';
@@ -13,7 +18,7 @@ const { spawn } = require('child_process');
 const { load, ROOT } = require('./_load');
 const CV = load();
 
-const ENGINE = path.join(ROOT, 'engine', 'stockfish-19-lite-single.js');
+const ENGINE = path.join(ROOT, process.argv.includes('--engine') ? process.argv[process.argv.indexOf('--engine') + 1] : 'engine/stockfish-19-lite-single.js');
 const FENS = [
   'r3k2r/p1ppqpb1/bn2pnp1/3PN3/1p2P3/2N2Q1p/PPPBBPPP/R3K2R w KQkq - 0 1',
   'r1bqkb1r/pppp1ppp/2n2n2/4p3/2B1P3/5N2/PPPP1PPP/RNBQK2R w KQkq - 4 4',
@@ -125,8 +130,52 @@ async function benchWarm(reps = 5) {
   return { warmMedianMs: median(out.warmMs), firstSearchColdMedianMs: median(out.firstColdMs), firstSearchAfterWarmMedianMs: median(out.firstWarmMs), raw: out };
 }
 
+// One search on an engine in its current state (no ucinewgame): `position <posCmd>`, `go depth 64` stopped after stopMs
+// (or `goCmd` when given). Returns { depth, pv, best, ms }.
+async function goOn(e, posCmd, stopMs, goCmd) {
+  e.send('position ' + posCmd);
+  let depth = 0, pv = [];
+  const off = e.on((line) => { const p = CV.sfParseInfo(line); if (p && !p.bound && p.mpv === 1) { depth = p.depth; pv = CV.sfParsePv(line); } });
+  const done = e.until(/^bestmove/);
+  const t0 = Date.now();
+  e.send(goCmd || 'go depth 64');
+  const timer = goCmd ? null : setTimeout(() => e.send('stop'), stopMs);
+  const line = await done;
+  clearTimeout(timer); off();
+  return { depth, pv, best: line.split(' ')[1], ms: Date.now() - t0 };
+}
+
+async function benchHit() {
+  const main = engine(), pond = engine();
+  for (const e of [main, pond]) { e.send('uci'); await e.until(/^uciok/); e.send('setoption name Hash value 32'); await e.ready(); }
+  const PAUSES = [60, 150, 260];
+  const rows = { stored: [], same: {} };
+  for (const p of PAUSES) { rows[p] = []; rows.same[p] = 0; }
+  let n = 0;
+  for (const f of FENS) {
+    main.send('ucinewgame'); await main.ready();
+    const ours = await goOn(main, 'fen ' + f, 300);
+    if (ours.pv.length < 2) continue;
+    const posQ = 'fen ' + f + ' moves ' + ours.pv[0] + ' ' + ours.pv[1];
+    pond.send('ucinewgame'); await pond.ready();
+    const stored = await goOn(pond, posQ, 0, 'go depth 10 movetime 250');
+    rows.stored.push(stored.depth);
+    for (const pause of PAUSES) {                                    // the main engine's hash as after our search (re-searched each time)
+      main.send('ucinewgame'); await main.ready();
+      await goOn(main, 'fen ' + f, 300);
+      const top = await goOn(main, posQ, pause);
+      rows[pause].push(top.depth);
+      if (top.best === stored.best) rows.same[pause]++;
+    }
+    n++;
+  }
+  main.quit(); pond.quit();
+  return { positions: n, storedMean: mean(rows.stored), pauses: PAUSES.map((p) => ({ pause: p, depthMean: mean(rows[p]), depthMin: Math.min(...rows[p]), sameMove: rows.same[p] + '/' + n })) };
+}
+
 (async () => {
   const res = {};
+  if (only === 'hit') res.hit = await benchHit();
   if (!only || only === 'delay') res.delay = await benchDelay();
   if (!only || only === 'warm') res.warm = await benchWarm();
   if (args.includes('--json')) { console.log(JSON.stringify(res, null, 2)); return; }
@@ -135,6 +184,12 @@ async function benchWarm(reps = 5) {
     console.log('| search | mean depth | min depth | median ms | max ms | same move as depth 10 |');
     console.log('| --- | ---: | ---: | ---: | ---: | ---: |');
     for (const r of res.delay) console.log('| ' + r.config + ' | ' + r.depthMean.toFixed(1) + ' | ' + r.depthMin + ' | ' + Math.round(r.msMedian) + ' | ' + r.msMax + ' | ' + r.sameMove + ' |');
+  }
+  if (res.hit) {
+    console.log('Ponder hit (' + res.hit.positions + ' positions): prepared reply (pass 1, go depth 10 movetime 250) mean depth ' + res.hit.storedMean.toFixed(1));
+    console.log('| top-up pause | mean depth | min depth | same move as the prepared reply |');
+    console.log('| ---: | ---: | ---: | ---: |');
+    for (const r of res.hit.pauses) console.log('| ' + r.pause + ' ms | ' + r.depthMean.toFixed(1) + ' | ' + r.depthMin + ' | ' + r.sameMove + ' |');
   }
   if (res.warm) console.log('\nMain-worker warm-up: ' + res.warm.warmMedianMs + ' ms (median); first depth-10 search cold ' + res.warm.firstSearchColdMedianMs + ' ms, after warm-up ' + res.warm.firstSearchAfterWarmMedianMs + ' ms');
 })().catch((e) => { console.error(e); process.exit(1); });

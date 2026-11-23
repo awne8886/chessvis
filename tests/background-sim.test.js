@@ -188,4 +188,99 @@ test('T10: the main Stockfish worker is warmed up before the first search', asyn
   assert.ok(typeof bg.get('sfDbg.mainWarmMs') === 'number');
 });
 
+// ---- 2.0.2 C2: ponder hits never lose depth ----
+test('C2 Stockfish: a hit answers at once (provisional) and the main worker deepens it within hitSoftMs', async () => {
+  const bg = makeBackground({ stepMs: 5 });
+  const moves = ['e2e4', 'e7e5', 'g1f3'];
+  await bg.send({ type: 'aggroIdle', engine: 'stockfish', startFen: START, moves, ponder: true, ponderMs: 600, ponderWorkers: 1, ponderHashMb: 16, depth: 10, myColor: 'w', ponderUntilMove: false, sfSearchMode: 'delay' });
+  await sleep(450);
+  const results = bg.get('ponder.get().results');
+  const opp = Object.keys(results)[0];
+  assert.ok(results[opp].depth <= 10, 'pass-1 reply: ' + results[opp].depth);
+  const t0 = Date.now();
+  const r = await analyzeSf(bg, [...moves, opp], { sfSearchMode: 'delay', softMs: 300, ponder: true, hitSoftMs: 150 });
+  assert.ok(Date.now() - t0 < 60, 'answered at once');
+  assert.strictEqual(r.ponderHit, true);
+  assert.ok(r.topUp && r.topUp.id && r.topUp.ms >= 100, JSON.stringify(r.topUp));
+  const fin = await bg.send({ type: 'hitTopUp', id: r.topUp.id });
+  const ms = Date.now() - t0;
+  assert.ok(ms >= 140 && ms < 450, 'the top-up used the pause: ' + ms);
+  assert.ok(fin.used && fin.depth > fin.before, JSON.stringify(fin));
+  assert.strictEqual(fin.uci, best(CV.replayUci(START, [...moves, opp]).pos));
+  assert.strictEqual(bg.get('sfLast.topUp'), true);
+  assert.strictEqual(JSON.stringify(bg.get('ponderDbg.topUpDepths')[0].slice(0, 2)), JSON.stringify([fin.before, fin.depth]));
+  assert.strictEqual(await bg.send({ type: 'hitTopUp', id: r.topUp.id }), null, 'a result is handed out once');
+});
+
+test('C2 Stockfish: no top-up without hitSoftMs (2.0.0) or when the stored reply is already deeper than expected', async () => {
+  const bg = makeBackground({ stepMs: 5 });
+  await analyzeSf(bg, ['e2e4'], { sfSearchMode: 'delay', softMs: 100 });   // a depth-time sample (~20 depths in 100 ms)
+  const moves = ['e2e4', 'e7e5', 'g1f3'];
+  await bg.send({ type: 'aggroIdle', engine: 'stockfish', startFen: START, moves, ponder: true, ponderMs: 600, ponderWorkers: 1, ponderHashMb: 16, depth: 10, myColor: 'w', ponderUntilMove: false, sfSearchMode: 'delay' });
+  await sleep(450);
+  const opps = Object.keys(bg.get('ponder.get().results'));
+  const r0 = await analyzeSf(bg, [...moves, opps[0]], { sfSearchMode: 'delay', softMs: 300, ponder: true });
+  assert.ok(r0.ponderHit && !r0.topUp, 'no hitSoftMs: the 2.0.0 hit');
+  await bg.send({ type: 'aggroIdle', engine: 'stockfish', startFen: START, moves, ponder: true, ponderMs: 600, ponderWorkers: 1, ponderHashMb: 16, depth: 10, myColor: 'w', ponderUntilMove: false, sfSearchMode: 'delay' });
+  await sleep(450);
+  const opp = Object.keys(bg.get('ponder.get().results'))[0];
+  bg.get('ponder.get().results[' + JSON.stringify(opp) + '].depth = 60');     // as if a deepening pass got very deep
+  const r1 = await analyzeSf(bg, [...moves, opp], { sfSearchMode: 'delay', softMs: 300, ponder: true, hitSoftMs: 60 });
+  assert.ok(r1.ponderHit && !r1.topUp, 'expected depth in 60 ms is below 60');
+});
+
+test('C2 AggroChess: think(pause) on the main worker when the pause is at least the slice; the move can change', async () => {
+  const bg = makeBackground({});
+  const moves = ['e2e4'];
+  await bg.send({ type: 'aggroIdle', startFen: START, moves, ponder: true, showEval: false, ponderMs: 900, ponderWorkers: 1, ponderHashMb: 32, myColor: 'w', ponderUntilMove: false });
+  await sleep(1000);
+  const opp = best(CV.replayUci(START, moves).pos);
+  const stored = bg.get('ponder.get().results')[opp];
+  assert.ok(stored && stored.ms === 150, JSON.stringify(stored));   // slice = 900 / 6
+  // shorter pause than the slice: the prepared reply as in 2.0.0
+  const r0 = await bg.send({ type: 'analyze', engine: 'aggro', fen: START, startFen: START, moves: [...moves, opp], ms: 1000, ponder: true, hitSoftMs: 100 });
+  assert.ok(r0.ponderHit && !r0.topUp);
+  // again, with a pause of 200 ms and a planted (different) prepared reply
+  await bg.send({ type: 'aggroIdle', startFen: START, moves, ponder: true, showEval: false, ponderMs: 900, ponderWorkers: 1, ponderHashMb: 32, myColor: 'w', ponderUntilMove: false });
+  await sleep(1000);
+  bg.get('ponder.get().results[' + JSON.stringify(opp) + '] = { uci: "h2h4", san: "h4", depth: 15, sacrifice: false, ms: 150 }');
+  const r1 = await bg.send({ type: 'analyze', engine: 'aggro', fen: START, startFen: START, moves: [...moves, opp], ms: 1000, ponder: true, hitSoftMs: 200 });
+  assert.strictEqual(r1.uci, 'h2h4', 'provisional = the prepared reply');
+  assert.ok(r1.topUp);
+  assert.ok(bg.get('aggroThinking') > 0, 'counts as a real search while it runs (no spare is made)');
+  const fin = await bg.send({ type: 'hitTopUp', id: r1.topUp.id });
+  assert.strictEqual(fin.uci, best(CV.replayUci(START, [...moves, opp]).pos));
+  assert.ok(fin.changed && fin.used && fin.depth >= 15, JSON.stringify(fin));
+  assert.strictEqual(bg.get('ponderDbg.hitChanged'), 1);
+  assert.strictEqual(bg.get('aggroThinking'), 0);
+});
+
+// ---- 2.0.2 B1: the relaxed-SIMD Stockfish build ----
+test('B1: the relaxed-SIMD build is used where the probe validates, for the main and the ponder workers', async () => {
+  const bg = makeBackground({ stepMs: 2, wasm: { relaxed: true } });
+  await analyzeSf(bg, [], { sfSearchMode: 'depth' });
+  assert.strictEqual(bg.get('sfActive'), 'engine/stockfish-19-lite-single-rsimd.js');
+  const main = bg.workers.find((w) => w.kind === 'sf' && w.init);
+  assert.strictEqual(main.init.loader, 'stockfish-19-lite-single-rsimd.js');
+  assert.ok(/sf-worker\.js#.*rsimd\.wasm/.test(decodeURIComponent(main.url)), main.url);
+  await bg.send({ type: 'aggroIdle', engine: 'stockfish', startFen: START, moves: ['e2e4'], ponder: true, ponderMs: 300, ponderWorkers: 1, ponderHashMb: 16, depth: 6, myColor: 'w', ponderUntilMove: false, sfSearchMode: 'depth' });
+  await sleep(100);
+  assert.ok(bg.workers.filter((w) => w.kind === 'sf' && w.init).every((w) => w.init.loader === 'stockfish-19-lite-single-rsimd.js'));
+  const dbg = await bg.send({ type: 'aggroDebug' });
+  assert.strictEqual(dbg.stockfish.relaxedSimd.probe, true);
+});
+
+test('B1: no relaxed SIMD -> the plain build; a relaxed build that fails to start -> the plain build for good', async () => {
+  const bg = makeBackground({ stepMs: 2, wasm: { relaxed: false } });
+  await analyzeSf(bg, [], { sfSearchMode: 'depth' });
+  assert.strictEqual(bg.get('sfActive'), 'engine/stockfish-19-lite-single.js');
+  assert.strictEqual(bg.workers.find((w) => w.kind === 'sf' && w.init).init.loader, 'stockfish-19-lite-single.js');
+  const bg2 = makeBackground({ stepMs: 2, wasm: { relaxed: true, failRsimd: true } });
+  const r = await analyzeSf(bg2, [], { sfSearchMode: 'depth' });
+  assert.ok(r && r.uci, 'still plays');
+  assert.strictEqual(bg2.get('sfActive'), 'engine/stockfish-19-lite-single.js');
+  assert.ok(/relaxed SIMD build failed/.test(bg2.get('sfDbg.rsimdFailed')));
+  assert.strictEqual(JSON.stringify(bg2.get('sfCandidates()')), JSON.stringify(['engine/stockfish-19-lite-single.js']));
+});
+
 run();
