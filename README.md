@@ -111,7 +111,7 @@ What happens between "the opponent moved" and "our piece lands", with the file a
 | **Plain + SIMD builds** | `aggrochess-simd.wasm` is chosen when `WebAssembly.validate` accepts a tiny SIMD probe module (`SIMD_PROBE`); otherwise `aggrochess.wasm`. Same search, ~15% faster with SIMD (Node). |
 | **Compiled once, shared** | Like Stockfish: `aggroModuleFor()` compiles once, each worker only instantiates (`{type:'init', module}`); a worker that receives no Module within 3 s loads the file itself. |
 | **Warm-up before `ready`** | The first search of a fresh instance allocates the net, book and hash (~40-65 ms). A worker pays that on a non-book middlegame position, then clears the hash and resets the game, so the first real search is not slowed down. |
-| **Patched source** (`engine/aggrochess-4.6.1-chessvision.patch`) | The clock is polled every 256 nodes instead of 1024 (a search overran its budget by ~50 ms in wasm, where reading the clock is a call into JavaScript), and two exports were added: `set_tt_mb` (hash size per worker) and `think_depth` (one depth step at a time, for interruptible pondering). |
+| **Source in the repository** (`engine-src/aggrochess/`, built by `tools/build-aggrochess.sh`) | AggroChess 4.6.1 plus the web wrapper and ChessVision's changes (`upstream.diff`): the clock is polled every 256 nodes instead of 1024 (a search overran its budget by ~50 ms in wasm, where reading the clock is a call into JavaScript), and the exports `set_tt_mb` (hash size per worker), `think_depth` (one depth step at a time) and, since 2.0.2, `last_info` (benchmarks). The build is pinned (Rust 1.100.0, `Cargo.lock`) and byte-reproducible. |
 | **Clock-sized search** | `think_clock(soft, hard)` is fed from your chess.com clock (`clock.js`), so the engine spends more time when it has it and never risks flagging. |
 | **Hard to interrupt** | A wasm `think()` call blocks its worker until it returns. The only way to cancel it is `Worker.terminate()`. This single fact shapes the whole AggroChess pondering design below. |
 
@@ -227,7 +227,7 @@ AggroChess uses this by default (`aggroUseClock`). For Stockfish it is an option
 | `engine/stockfish-19-asm.js` | asm.js fallback. |
 | `engine/aggro-worker.js` | AggroChess worker: instantiation, warm-up, the message protocol (`position`, `think`, `analyze`, `ponderMove`, `clear`). |
 | `engine/aggrochess.wasm` / `aggrochess-simd.wasm` | AggroChess 4.6.1, plain and SIMD builds. |
-| `engine/aggrochess-4.6.1-chessvision.patch` | The source changes made to AggroChess for this extension. |
+| `engine-src/aggrochess/` | The AggroChess source behind the two binaries (not loaded at runtime); `tools/build-aggrochess.sh` rebuilds them. |
 | `engine/NOTICE.txt` | Third-party sources and licences. |
 | `chessvision-project-summary.md` | Hand-over notes between development sessions: what was done, what was measured, what is unverified. |
 | `docs/REFERENCE.md` | The full user manual: every setting with key / range / default, troubleshooting, changelog. |

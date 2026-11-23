@@ -251,7 +251,7 @@ wc-chess-board DOM  --read-->  content.js  --sendMessage-->  background.js
 | `popup.html`, `popup.js` | Toolbar popup with the Auto-play switch. |
 | `LICENSE` | GNU GPL v3. |
 | `.github/workflows/tests.yml` | GitHub Action that syntax-checks the scripts and runs the unit tests on every push and pull request. |
-| `engine/` | Engine binaries and workers. `stockfish-19-lite-single.js` + `stockfish-19-lite-single.wasm` (Stockfish.js 19, WebAssembly, lite net, single thread; the file name is the constant `SF_FILE` at the top of the Stockfish section of `background.js`), `stockfish-19-asm.js` (asm.js fallback, used only if the wasm engine fails to start), `aggrochess.wasm` and `aggrochess-simd.wasm` (AggroChess 4.6.1; the same engine built without and with simd128), `aggro-worker.js` (all GPL-3.0), `aggrochess-4.6.1-chessvision.patch` (the changes to the AggroChess 4.6.1 web source behind the two binaries, see Development). Sources and licences: `engine/NOTICE.txt` (not updated for 1.7.9: it still describes the older AggroChess build). |
+| `engine/` | Engine binaries and workers. `stockfish-19-lite-single.js` + `stockfish-19-lite-single.wasm` (Stockfish.js 19, WebAssembly, lite net, single thread; the file name is the constant `SF_FILE` at the top of the Stockfish section of `background.js`), `stockfish-19-asm.js` (asm.js fallback, used only if the wasm engine fails to start), `aggrochess.wasm` and `aggrochess-simd.wasm` (AggroChess 4.6.1; the same engine built without and with simd128), `aggro-worker.js` (all GPL-3.0). The AggroChess source is in `engine-src/aggrochess/` (2.0.2, see Development). Sources, build commands and sha256 of the binaries: `engine/NOTICE.txt`. |
 | `chessvision-project-summary.md` | Project context for the next person or model; kept in the zip and updated with every change. |
 | `tests/` | Node unit tests, and `bench-aggro.js`, `bench-stockfish.js` + `bench-stockfish-sims.js` (benchmarks, not part of the test run). |
 
@@ -317,6 +317,7 @@ node tests/search-mode.test.js          # sfShouldStop truth table, hard cap, Ag
 node tests/boardstate-signature.test.js # BS.signature for the stable read
 node tests/settings.test.js             # 2.0.0 keys: sanitize, export / import round trip, the 1.8.0 values
 node tests/background-sim.test.js       # the real background.js with fake workers: delay / depth / clock mode, early ponder -> hit, discarded move -> miss, PV seed, deepening passes, late wait, main warm-up
+node tests/engine-signature.test.js     # 2.0.2: both AggroChess builds still search exactly like 4.6.1 (depth-8 bench signature)
 for f in *.js engine/sf-worker.js engine/aggro-worker.js; do node --check "$f"; done
 ```
 
@@ -332,14 +333,14 @@ The older benchmark text below (`bench-stockfish.js`, `bench-aggro.js`) describe
 
 The benchmark (plain Node, `worker_threads`, a few minutes) reports instantiate time, the lazy-init cost of a cold first search, depth at 150 / 500 / 1500 ms on 5 fixed positions (cold first search vs warmed-up), depth with 1 / 2 / 3 concurrent instances, a check that a warmed-up instance answers exactly like a cold one, and how often the engine polls the clock. `--wasm engine/aggrochess-simd.wasm` measures the SIMD build.
 
-**Rebuilding the engine binaries** (not needed to use the extension). Source: AggroChess 4.6.1 web package (`source/`), plus `engine/aggrochess-4.6.1-chessvision.patch` (`patch -p0` style: apply the two hunks to `src/lib.rs` and `src/search.rs`). Then, with `opt-level = 3`, `lto = true` (fat), `codegen-units = 1`, `panic = "abort"` as in its `Cargo.toml`:
+**Rebuilding the engine binaries** (not needed to use the extension). Since 2.0.2 the AggroChess source is in the repository (`engine-src/aggrochess/`: AggroChess v4.6.1, the web wrapper and ChessVision's changes, see its README) and one command rebuilds both binaries with the pinned toolchain (Rust 1.100.0, `cargo --locked`, `opt-level = 3`, fat LTO, `codegen-units = 1`, `panic = "abort"`):
 
 ```
-cargo build --release --target wasm32-unknown-unknown                                   # engine/aggrochess.wasm
-RUSTFLAGS="-C target-feature=+simd128" cargo build --release --target wasm32-unknown-unknown   # engine/aggrochess-simd.wasm
+tools/build-aggrochess.sh                       # engine/aggrochess.wasm and engine/aggrochess-simd.wasm (+simd128)
+node tests/engine-signature.test.js             # the search must be unchanged (depth-8 signature, both builds)
+node tests/bench-engines.js --diff OLD NEW      # two builds answer identically under a deterministic clock
+node tests/bench-engines.js [--sig12]           # signature, nodes per second, depth at think(100/300/1000), start-up
 ```
-
-Both were built with rustc 1.100 (conda-forge); the plain build reproduced the shipped 4.6.1 binary's size to within 136 bytes before the patch.
 
 **Continuous integration:** (not in this repository; the 1.8.0 notes describe it) `.github/workflows/tests.yml` runs `node --check` on every script, validates `manifest.json` and runs all `tests/*.test.js` on every push and pull request (Node 20). The browser-level checks below are not part of CI.
 

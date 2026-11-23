@@ -1,0 +1,92 @@
+# Changes in engine-src/aggrochess against AggroChess 4d7692e955b677e7b3f6ec7a457598c2311685fe (tag v4.6.1, https://github.com/PhelRin/AggroChess).
+# src/lib.rs and src/web_clock.rs are new (the web wrapper); the nets are unchanged.
+--- a/src/search.rs
++++ b/src/search.rs
+@@ -14,13 +14,17 @@
+ use cozy_chess::{BitBoard, Board, Color, Move, Piece, Square};
+ use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU64, AtomicU8, AtomicUsize, Ordering};
+ use std::sync::{Arc, Mutex, RwLock};
+-use std::time::{Duration, Instant};
++use crate::web_clock::Instant; use std::time::Duration; // wasm: the clock comes from JavaScript
+ 
+ pub const MAX_PLY: usize = 128;
+ pub const INF: i32 = 32000;
+ pub const MATE: i32 = 30000;
+ pub const MATE_BOUND: i32 = MATE - 1000;
+ 
++/// The clock (and the stop flags) are looked at every this many nodes (a power of two). It was 1024; in WebAssembly the
++/// clock is a call into JavaScript and a search was seen to overrun its time by up to ~50 ms, so it is looked at more often.
++pub const CLOCK_POLL_NODES: u64 = 256;
++
+ pub static TT_SIZE_MB: AtomicUsize = AtomicUsize::new(128);
+ pub static NUM_THREADS: AtomicUsize = AtomicUsize::new(1);
+ /// Draw score penalty (centipawns) from the engine's point of view.
+@@ -1281,8 +1285,8 @@
+ 
+     #[inline]
+     fn check_time(&mut self) {
+-        if self.nodes & 1023 == 0 {
+-            self.shared_nodes.fetch_add(1024, Ordering::Relaxed);
++        if self.nodes & (CLOCK_POLL_NODES - 1) == 0 {
++            self.shared_nodes.fetch_add(CLOCK_POLL_NODES, Ordering::Relaxed);
+             if let Some(p) = &self.parent_stop {
+                 if p.load(Ordering::Relaxed) {
+                     self.stop.store(true, Ordering::Relaxed);
+@@ -2631,10 +2635,10 @@
+         let cap = (200.0 * 1.45f64.powi(skill)) as u64;
+         limits.nodes = Some(limits.nodes.map_or(cap, |n| n.min(cap)));
+         eval::NOISE.store((20 - skill) * 7, Ordering::Relaxed);
+-        let seed = std::time::SystemTime::now()
+-            .duration_since(std::time::UNIX_EPOCH)
+-            .map(|d| d.as_nanos() as u64)
+-            .unwrap_or(1);
++        // wasm: no system clock; the seed comes from JavaScript (this branch only runs with Skill < 20)
++        let seed = crate::web_clock::seed();
++        let seed = if seed == 0 { 1 } else { seed };
++
+         eval::NOISE_SEED.store(seed, Ordering::Relaxed);
+     } else {
+         eval::NOISE.store(0, Ordering::Relaxed);
+@@ -2834,7 +2838,7 @@
+ 
+         let elapsed = start.elapsed();
+         if print_info {
+-            let total_nodes = nodes.load(Ordering::Relaxed) + (s.nodes & 1023);
++            let total_nodes = nodes.load(Ordering::Relaxed) + (s.nodes & (CLOCK_POLL_NODES - 1));
+             let ms = elapsed.as_millis().max(1);
+             out!(
+                 "info depth {} seldepth {} score {} nodes {} nps {} hashfull {} time {} pv {}",
+--- a/src/book.rs
++++ b/src/book.rs
+@@ -13,7 +13,6 @@
+ use std::collections::HashMap;
+ use std::path::Path;
+ use std::sync::OnceLock;
+-use std::time::SystemTime;
+ 
+ pub struct Book {
+     pub book: Option<PolyglotBook>,
+@@ -477,10 +476,8 @@
+ }
+ 
+ fn seed() -> u64 {
+-    SystemTime::now()
+-        .duration_since(SystemTime::UNIX_EPOCH)
+-        .map(|d| d.as_nanos() as u64)
+-        .unwrap_or(88172645463325252)
++    // wasm: no system clock; two random numbers from JavaScript (see web_clock.rs)
++    crate::web_clock::seed()
+ }
+ 
+ impl Book {
+--- a/src/matesearch.rs
++++ b/src/matesearch.rs
+@@ -13,7 +13,7 @@
+ 
+ use cozy_chess::{Board, Move, Piece};
+ use std::sync::atomic::{AtomicBool, Ordering};
+-use std::time::Instant;
++use crate::web_clock::Instant; // wasm: the clock comes from JavaScript
+ 
+ const TT_BITS: u32 = 20;
+ 
