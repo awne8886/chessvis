@@ -123,7 +123,9 @@ Stockfish is the strongest move-finder; AggroChess plays the sharper, more enter
 
 ## Pondering (thinking on the opponent's time)
 
-Off by default (`aggroPonder`, `sfPonder`). When on, the extension uses the seconds while the opponent thinks to **prepare our reply in advance**. If the opponent then plays a move we prepared for, our answer is ready instantly ("ponder hit").
+**On by default since 2.0.2** (`aggroPonder`, `sfPonder`; 1 ponder worker each). The extension uses the seconds while the opponent thinks to **prepare our reply in advance**. If the opponent then plays a move we prepared for, our answer is ready instantly ("ponder hit"; 88% of moves in the 1.8.0 simulation).
+
+**What it costs, and how to switch it off.** While the opponent thinks, one ponder worker keeps one CPU core busy, for the whole opponent's think with **Keep pondering until the opponent moves** (up to **Ponder at most**, 8 s), and holds its memory (AggroChess about 50 MiB, Stockfish about 58 MiB with its 16 MB hash) for as long as pondering is on. On a phone that means more battery use and some warmth during long games. Pondering stops when the tab is hidden. To switch it off: in the panel, **AggroChess options → Ponder on opponent's time** and **Stockfish options → Ponder on opponent's time** (`aggroPonder`, `sfPonder` off = 2.0.0). A middle way: keep pondering on but switch **Keep pondering until the opponent moves** off; the job then ends after **Ponder time** (1.5 s).
 
 ### Why not classic UCI `go ponder`?
 

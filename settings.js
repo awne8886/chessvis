@@ -38,7 +38,7 @@
 
     // --- AggroChess options (shown only when the engine is AggroChess) ---
     aggroUseClock: true,      // size the search from my chess.com clock (think_clock) when a clock can be read
-    aggroPonder: false,       // think on the opponent's time with a second, killable worker
+    aggroPonder: true,        // think on the opponent's time with a second, killable worker (2.0.2: on by default; false = 2.0.0)
     aggroPonderMs: 1500,      // ms of pondering per opponent move
     aggroPonderHashMb: 32,    // hash table of each ponder worker in MB (32 = the engine's own size; lower fits more workers on a phone)
     aggroPonderWorkers: 1,    // ponder workers working through the opponent's moves together (~50 MiB each; capped by the CPU count)
@@ -47,7 +47,7 @@
 
     // --- Stockfish options (shown only when the engine is Stockfish) ---
     sfUseClock: false,        // cap the search with a budget sized from my chess.com clock (never more than a quarter of what is left)
-    sfPonder: false,          // think on the opponent's time with extra Stockfish workers (never the main one)
+    sfPonder: true,           // think on the opponent's time with extra Stockfish workers, never the main one (2.0.2: on by default; false = 2.0.0)
     sfPonderMs: 1500,         // ms of pondering per opponent move (a ceiling)
     sfPonderWorkers: 1,       // ponder workers sharing the opponent's moves (capped by the CPU count; each costs wasm memory + its hash)
     sfPonderHashMb: 16,       // hash table of each ponder worker in MB (the main worker keeps 32)
