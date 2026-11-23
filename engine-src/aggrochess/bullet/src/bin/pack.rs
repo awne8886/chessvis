@@ -65,6 +65,9 @@ fn load_nets(quantised: &str, old_net: &str) -> Nets {
     let (o1, o2) = (pad(nb * 768 * hl), pad(nb * 768 * hl) + pad(hl));
     let o3 = o2 + pad(16 * hl);
     let new = [rd(&raw, 0, nb * 768 * hl), rd(&raw, o1, hl), rd(&raw, o2, 16 * hl), rd(&raw, o3, 8)];
+    if old_net.is_empty() {
+        return Nets { new, old: [vec![], vec![], vec![], vec![]] };
+    }
     let ov = std::fs::read(old_net).expect("old net");
     assert_eq!(&ov[0..4], b"AGNN");
     let oh = 256;
@@ -141,8 +144,35 @@ fn calibrate(a: &[String]) {
     println!("positions {n}, OUT_SCALE {:.1} %, correlation new/old {:.3}, old/search score {:.3}, search score / new raw {:.3}", 100.0 * sxy / sxx, corr, corr_old, s_score_new / s_new_new);
 }
 
+/// `pack loss <quantised.bin> <valid.bf> [wdl]`: the training loss (sigmoid(output / 400) against
+/// wdl x result + (1 - wdl) x sigmoid(score / 400), squared error) of the quantised network on held-out positions
+/// (bullet's CPU backend does not compute a validation loss itself).
+fn loss(a: &[String]) {
+    use bullet_lib::game::inputs::{ChessBucketsMirrored, SparseInputType};
+    let nets = load_nets(&a[0], "");
+    let data = std::fs::read(&a[1]).expect("valid.bf");
+    let wdl: f64 = a.get(2).map(|s| s.parse().unwrap()).unwrap_or(0.3);
+    let inputs = ChessBucketsMirrored::new(train::BUCKET_LAYOUT);
+    let sig = |x: f64| 1.0 / (1.0 + (-x / 400.0).exp());
+    let (mut sum, mut n) = (0f64, 0f64);
+    for rec in data.chunks_exact(32) {
+        // SAFETY: a bulletformat record is a plain 32-byte repr(C) ChessBoard
+        let board: bulletformat::ChessBoard = unsafe { std::mem::transmute::<[u8; 32], _>(rec.try_into().unwrap()) };
+        let mut f = Vec::with_capacity(32);
+        inputs.map_features(&board, |s, n| f.push((s, n)));
+        let out = raw_eval(&nets.new, train::HL, &board, &f) as f64;
+        let target = wdl * f64::from(board.result) / 2.0 + (1.0 - wdl) * sig(f64::from(board.score));
+        sum += (sig(out) - target).powi(2);
+        n += 1.0;
+    }
+    println!("positions {n}, loss {:.6}", sum / n);
+}
+
 fn main() {
     let a: Vec<String> = std::env::args().skip(1).collect();
+    if a.first().map(String::as_str) == Some("loss") {
+        return loss(&a[1..]);
+    }
     if a.first().map(String::as_str) == Some("eval") {
         return eval_mode(&a[1..]);
     }

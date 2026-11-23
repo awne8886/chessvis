@@ -1,4 +1,5 @@
-//! `train <data.bin> <out-dir> <superbatches> <batches-per-superbatch> <threads> [initial-lr] [wdl] [net-id] [valid.bin]`
+//! `train <data.bin> <out-dir> <superbatches> <batches-per-superbatch> <threads> [initial-lr] [wdl] [net-id]`
+//! (held-out loss: `pack loss`; bullet's CPU backend does not compute one)
 //!
 //! The ChessVision 2.0.3 AggroChess network, trained with bullet's CPU backend on bulletformat data (see convert.rs):
 //! (768 x 3 mirrored king buckets -> 512) x 2 -> SCReLU -> 1, 8 output buckets by piece count (as AggroChess 4.6.1),
@@ -11,7 +12,7 @@ use bullet_lib::{
     trainer::{
         save::SavedFormat,
         schedule::{lr, wdl, TrainingSchedule, TrainingSteps},
-        settings::{LocalSettings, TestDataset},
+        settings::LocalSettings,
     },
     value::{loader::DirectSequentialDataLoader, ValueTrainerBuilder},
 };
@@ -42,7 +43,6 @@ fn main() {
     let initial_lr: f32 = a.get(5).map(|s| s.parse().unwrap()).unwrap_or(0.001);
     let wdl_proportion: f32 = a.get(6).map(|s| s.parse().unwrap()).unwrap_or(0.3);
     let net_id = a.get(7).cloned().unwrap_or_else(|| "aggro-768x3hm-512".to_string());
-    let valid = a.get(8).cloned();
     const NB: usize = get_num_buckets(&BUCKET_LAYOUT);
 
     let mut trainer = ValueTrainerBuilder::default()
@@ -89,8 +89,7 @@ fn main() {
         lr_scheduler: lr::CosineDecayLR { initial_lr, final_lr: initial_lr * 0.3f32.powi(5), final_superbatch: superbatches },
         save_rate: 5,
     };
-    let test_set = valid.as_deref().map(|path| TestDataset { path, freq: 64 });
-    let settings = LocalSettings { threads: 1, test_set, output_directory: &out_dir, batch_queue_size: 32 };
+    let settings = LocalSettings { threads: 1, test_set: None, output_directory: &out_dir, batch_queue_size: 32 };
     let loader = DirectSequentialDataLoader::new(&[data.as_str()]);
     trainer.run(&schedule, &settings, &loader);
 }

@@ -7,7 +7,7 @@
 #      (upstream src/datagen.rs; quiet positions with the search score and the game result). Deterministic per
 #      thread for a given seed.
 #   2. engine-src/aggrochess/bullet `convert`: to bulletformat, shuffled with a fixed seed; 100 000 positions are held
-#      out as a validation set (bullet reports the loss on it while training).
+#      out (`pack loss` measures the loss on them; bullet's CPU backend computes no validation loss itself).
 #   3. `train`: bullet (pinned to the last commit with a CPU backend), (768 x 3 mirrored king buckets -> 512) x 2,
 #      8 output buckets, AdamW, cosine learning rate, WDL weight 0.3 (as 4.6.1's trainer), eval scale 400.
 #      Multi-threaded float training is not bit-reproducible; the result is committed.
@@ -51,8 +51,9 @@ BIN=$ROOT/engine-src/aggrochess/bullet/target/release
 "$BIN/convert" "$WORK/train.bf" --valid "$WORK/valid.bf" 100000 "$WORK"/data_*.bin
 N=$(( $(stat -c %s "$WORK/train.bf") / 32 ))
 [ -n "$BATCHES" ] || BATCHES=$(( (N + 16383) / 16384 ))
-"$BIN/train" "$WORK/train.bf" "$WORK/checkpoints" "$SB" "$BATCHES" "$THREADS" "$LR" "$WDL" aggro-768x3hm-512 "$WORK/valid.bf"
+"$BIN/train" "$WORK/train.bf" "$WORK/checkpoints" "$SB" "$BATCHES" "$THREADS" "$LR" "$WDL" aggro-768x3hm-512
 Q=$(ls -d "$WORK"/checkpoints/aggro-768x3hm-512-"$SB" | head -1)/quantised.bin
 "$BIN/pack" "$Q" "$WORK/aggro-768x3hm-512.nnue"
-"$BIN/pack" calibrate "$Q" "$ROOT/engine-src/aggrochess/aggro.nnue" "$WORK/train.bf" 50000
+"$BIN/pack" loss "$Q" "$WORK/valid.bf" "$WDL"
+"$BIN/pack" calibrate "$Q" "$ROOT/engine-src/aggrochess/aggro.nnue" "$WORK/valid.bf" 100000
 echo "network: $WORK/aggro-768x3hm-512.nnue (copy it to engine-src/aggrochess/, set OUT_SCALE in src/nnue.rs)"
