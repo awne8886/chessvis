@@ -1,5 +1,7 @@
 # Task: ChessVision 2.0.2: faster engines, workers and pondering
 
+> **Status (2026-11-23): implemented as ChessVision 2.0.2**, one commit per task (A0-A7, B1, C1-C4, D). `AggroChess-4.6.1-wasm.zip` was not available: with the owner's approval the web wrapper was reconstructed on top of AggroChess v4.6.1 from GitHub and accepted because it reproduces the 2.0.0 binaries call for call and the §3 signatures exactly (`engine-src/aggrochess/README.md`). Gates passed: A1, A2, A4, A5, A6, A7 (Chromium), B1. Not adopted (measured): A3 eval cache (below the +5% gate). Not done (optional): the C4 peek (it cannot save 15 ms). No search change was made, so no strength match was needed. Results and the unverified points: `docs/REFERENCE.md` (2.0.2 changelog) and `chessvision-project-summary.md`.
+
 You are working on **ChessVision**, the Firefox (Manifest V2) extension in this repository (version 2.0.0). It plays chess.com **bots** with two local WebAssembly engines: **Stockfish 19 lite** (UCI, `engine/stockfish-19-lite-single.{js,wasm}`) and **AggroChess 4.6.1** (Rust → wasm, `engine/aggrochess{,-simd}.wasm`).
 
 **Goal:** the reply should be ready almost at once and be **at least as deep as today**. To get there:

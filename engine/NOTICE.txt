@@ -12,7 +12,8 @@ engine/aggrochess-simd.wasm - the same engine built with simd128 (chosen when We
                               (src/lib.rs, src/web_clock.rs; reconstructed in 2.0.2 from the 2.0.0 binaries, see
                               engine-src/aggrochess/README.md) + ChessVision's changes (engine-src/aggrochess/upstream.diff).
                               Build: tools/build-aggrochess.sh (Rust 1.100.0, cargo --locked, wasm32-unknown-unknown;
-                              the SIMD build with RUSTFLAGS="-C target-feature=+simd128"). The build is byte-reproducible.
+                              the SIMD build with RUSTFLAGS="-C target-feature=+simd128"; then wasm-opt -O3 from binaryen
+                              version_132, Apache-2.0, a build tool only). The build is byte-reproducible.
                               Dependencies (crates.io, compiled in): cozy-chess 0.3.4 and cozy-chess-types 0.2.2 (MIT),
                               polyglot-book-rs 0.1.0 (MIT OR Apache-2.0).
                               engine/aggrochess.wasm      sha256 7207bed530c6aac1dc2d6b591fe9c899f9978e1f81fc977598a981c073df967a
@@ -49,7 +50,7 @@ engine/stockfish-19-lite-single-rsimd.wasm    built with WebAssembly relaxed SIM
                               engine/stockfish-19-lite-single-rsimd.wasm sha256 744ae23293592254667b4b4fe2d5eae17319945ee06c51e364792b524880e6e7
                               Multi-thread builds are NOT used (they need SharedArrayBuffer / cross-origin isolation).
 
-Maia-3 (added in 1.3.0)
+Maia-3 (added in 1.3.0; REMOVED in 1.7.8 - none of the files below is shipped any more, the entries are kept for the record)
 engine/maia3-23m.fp16.onnx  - Maia-3 23M network weights, exported to ONNX (fp16).
                               Model: Maia-3 by the CSSLab (University of Toronto), AGPL-3.0
                               (https://github.com/CSSLab/maia3 - its LICENSE file is the GNU AGPL v3;
@@ -64,7 +65,7 @@ maia.js                     - JavaScript port of the Maia-3 board tokenizer, mov
                               The file is distributed here under the project's licence terms for ported
                               AGPL-3.0 code; keep this attribution.
 
-engine/ort.wasm.min.js, engine/ort-wasm-simd-threaded.mjs, engine/ort-wasm-simd-threaded.wasm
+engine/ort.wasm.min.js, engine/ort-wasm-simd-threaded.mjs, engine/ort-wasm-simd-threaded.wasm   (REMOVED in 1.7.8 with Maia-3)
                             - onnxruntime-web 1.31.1, MIT (https://github.com/microsoft/onnxruntime,
                               Copyright (c) Microsoft Corporation). All three files must come from the
                               same version.

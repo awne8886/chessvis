@@ -6,7 +6,7 @@
   window.__chessvisionLoaded = true;
 
   const DEBUG = true;
-  const FALLBACK_VERSION = '2.0.0';
+  const FALLBACK_VERSION = '2.0.2';
   const VERSION = (() => { try { return api.runtime.getManifest().version || FALLBACK_VERSION; } catch (e) { return FALLBACK_VERSION; } })();
   const log = (...a) => DEBUG && console.log('[ChessVision]', ...a);
   const { FILES } = CV.chess;
