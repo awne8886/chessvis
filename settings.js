@@ -467,6 +467,12 @@
     return ms >= CV.PONDER_MIN_SLICE_MS ? top.map((uci) => ({ uci, ms })) : [];
   };
 
+  // ---- 2.0.2: AggroChess ponder workers ----
+  // A ponder worker whose job ended or was cancelled while it had no request in flight goes back to the spares with its
+  // hash (busy ones are terminated: a wasm think cannot be interrupted); a new game sends it `clear` before its next
+  // job. false = 2.0.0: every AggroChess ponder worker is terminated when its job ends or is cancelled.
+  CV.AGGRO_PONDER_RECYCLE = true;
+
   // ---- 2.0.0: AggroChess `late` with the move's reply search almost done (pure; background.js) ----
   // meta = { startedAt, ms } of the running reply search, mainBudgetMs = the think budget a normal search would get.
   // Returns how long to wait for that search (ms, >= 0), or null = do not wait (think from scratch as in 1.8.0). Waiting is

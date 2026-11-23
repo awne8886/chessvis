@@ -399,7 +399,12 @@ const AGGRO_HARD_MAX_MS = 60000;          // upper bound for any search budget t
 // Creates one worker. Returns { ready, request(msg, timeoutMs), kill(), dead }.
 // `ready` rejects on a worker 'error' message before 'ready', on worker.onerror and after AGGRO_START_TIMEOUT_MS.
 function spawnAggroWorker(label, ttMb) {
-  const h = { kind: 'aggro', label, ttMb: ttMb || null, steps: false, worker: null, dead: false, pending: new Map(), seq: 0 };
+  // 2.0.2 (C1): gen = the game (ponderGen) its hash belongs to; isReady once 'ready' arrived; searched = the positions
+  // (history keys after an opponent move) whose replies it searched in its last job, so the next job can give the line
+  // that was played to the worker whose hash holds it.
+  const h = { kind: 'aggro', label, ttMb: ttMb || null, steps: false, worker: null, dead: false, pending: new Map(), seq: 0,
+    gen: typeof ponderGen === 'number' ? ponderGen : 0, isReady: false, searched: new Set() };
+  if (label === 'ponder') ponderDbg.aggroSpawns++;
   const failAll = (why) => {
     for (const [id, p] of h.pending) { h.pending.delete(id); clearTimeout(p.timer); p.reject(new Error(why)); }
   };
@@ -411,7 +416,7 @@ function spawnAggroWorker(label, ttMb) {
     try { h.worker = new Worker(api.runtime.getURL(AGGRO_WORKER)); } catch (e) { fail('could not create worker: ' + ((e && e.message) || e)); return; }
     h.worker.onmessage = (e) => {
       const m = e.data || {};
-      if (m.type === 'ready') { h.how = m.how || null; h.warmMs = m.warmMs; h.steps = !!m.steps; aggroDbg.workerStarts++; aggroDbg.lastStart = { label, how: h.how, warmMs: h.warmMs }; settle(resolve); return; }
+      if (m.type === 'ready') { h.how = m.how || null; h.warmMs = m.warmMs; h.steps = !!m.steps; h.isReady = true; aggroDbg.workerStarts++; aggroDbg.lastStart = { label, how: h.how, warmMs: h.warmMs }; settle(resolve); return; }
       if (m.type === 'error' && !settled) { fail(m.message || 'worker error'); return; }
       const p = h.pending.get(m.id);
       if (m.type === 'error') console.error('[ChessVision] AggroChess (' + label + ') error', m.message);
@@ -447,6 +452,10 @@ function spawnAggroWorker(label, ttMb) {
     try { if (h.worker) h.worker.terminate(); } catch (e) { /* ignore */ }
     failAll('worker was terminated');
   };
+  // 2.0.2 (C1): a request in flight = the worker is (or is about to be) inside wasm and cannot be interrupted.
+  h.busy = () => h.pending.size > 0;
+  // A new game began since this worker's last search: empty its hash before the next request (messages run in order).
+  h.newGame = (gen) => { h.gen = gen; h.request({ type: 'clear' }, AGGRO_QUICK_REQ_MS).catch(() => {}); };
   return h;
 }
 
@@ -553,7 +562,10 @@ let idleToken = 0, idleInfo = { pondering: false, evalLine: null };
 // 2.0.0 debug: passes of the latest ponder job, and the depth of the reply used on each recent hit (newest last)
 // AggroChess reply searches in flight (2.0.0, `late` wait): opponent move -> { promise, w, token } of the think request
 const aggroRunning = new Map();
-const ponderDbg = { lastPasses: 0, hitDepths: [], harvestUpgrades: 0, lateWaits: 0, lateWaitHits: 0 };
+const ponderDbg = { lastPasses: 0, hitDepths: [], harvestUpgrades: 0, lateWaits: 0, lateWaitHits: 0,
+  // 2.0.2 (C1): AggroChess ponder workers created / recycled with their hash / terminated (busy); ponder jobs; workers a
+  // job got that were still starting (cold); jobs whose first worker had searched the line that was played (warm line)
+  aggroSpawns: 0, aggroRecycled: 0, aggroKilled: 0, jobs: 0, claimCold: 0, claimWarmLine: 0 };
 const noteHitDepth = (d) => { ponderDbg.hitDepths.push(d || 0); if (ponderDbg.hitDepths.length > 20) ponderDbg.hitDepths.shift(); };
 
 // The job's ceiling (ms): the *PonderMs budget (1.8.0), or with ponderUntilMove (2.0.0) max(budget, ponderMaxMs): the job
@@ -639,17 +651,45 @@ function ponderTopUp() {
   }
 }
 // n workers for a job: warmed spares first, then new ones. The caller never asks for more than ponderCap.
-function ponderClaim(n) {
+// prefer (2.0.2, optional): a history key; a spare whose last job searched that position comes first (its hash holds
+// the line that was played, and the first worker of a job searches the first reply).
+function ponderClaim(n, prefer) {
   for (const w of ponderSpares) if (w.ttMb !== ponderHashMb || w.kind !== ponderKind) w.kill();
   ponderSpares = ponderSpares.filter((w) => !w.dead);
+  if (prefer) {
+    const i = ponderSpares.findIndex((w) => w.searched && w.searched.has(prefer));
+    if (i > 0) ponderSpares.unshift(ponderSpares.splice(i, 1)[0]);
+    if (i >= 0) ponderDbg.claimWarmLine++;
+  }
   const got = [];
   while (got.length < n && ponderSpares.length) got.push(ponderSpares.shift());
   while (got.length < n) got.push(ponderSpawn());
-  for (const w of got) if (w.kind === 'sf' && w.gen !== ponderGen) w.newGame(ponderGen);     // a new game began since this worker last searched
+  for (const w of got) {
+    if (w.gen !== ponderGen) w.newGame(ponderGen);       // a new game began since this worker last searched (sf: ucinewgame, aggro: clear)
+    if (w.kind === 'aggro') { if (!w.isReady) ponderDbg.claimCold++; w.searched = new Set(); }
+  }
   ponderActive.push(...got);
   return got;
 }
-function ponderDrop(w) {          // a job worker is finished or failed: Stockfish workers are stopped and recycled, AggroChess ones killed (spares are made again by ponderTopUp)
+// 2.0.2 (C1): an AggroChess job worker is done with this job. Idle (no request in flight): back to the spares with its
+// hash, like a Stockfish worker; busy (a wasm think running, which cannot be interrupted): terminated. A worker that is
+// not wanted any more (pondering off, another engine or hash size, cap reached) is terminated too.
+// CV.AGGRO_PONDER_RECYCLE = false: every job worker is terminated (2.0.0); ponderTopUp makes warm replacements.
+function aggroRelease(w) {
+  ponderActive = ponderActive.filter((x) => x !== w);
+  if (w.dead) return;
+  ponderSpares = ponderSpares.filter((x) => !x.dead && x !== w);
+  const keep = CV.AGGRO_PONDER_RECYCLE && !w.busy() && ponderWanted && ponderKind === 'aggro' && w.ttMb === ponderHashMb &&
+    ponderActive.length + ponderSpares.length + ponderCancelling.length < ponderCap;
+  if (!keep) { w.kill(); ponderDbg.aggroKilled++; return; }
+  ponderSpares.push(w);
+  ponderDbg.aggroRecycled++;
+}
+function ponderDrop(w) {          // a job worker is finished: Stockfish workers are stopped and recycled, AggroChess ones recycled when idle (aggroRelease)
+  if (w.kind === 'sf') { sfRelease(w); return; }
+  aggroRelease(w);
+}
+function ponderFail(w) {          // a job worker failed (error, timeout): never reused
   if (w.kind === 'sf') { sfRelease(w); return; }
   w.kill();
   ponderActive = ponderActive.filter((x) => x !== w);
@@ -662,7 +702,7 @@ function ponderStop() {             // stop working (ALL job workers), keep what
   idleInfo.pondering = false;
   const act = ponderActive;
   ponderActive = [];
-  for (const w of act) { if (w.kind === 'sf') sfRelease(w, true); else w.kill(); }
+  for (const w of act) { if (w.kind === 'sf') sfRelease(w, true); else aggroRelease(w); }   // 2.0.2: idle AggroChess workers are kept
   ponder.setRunning(null);
   ponderTopUp();
 }
@@ -709,8 +749,10 @@ async function runIdleJob(msg, token) {
   if (!after.ok) return;
   const legal = CV.chess.legalMoves(after.pos);                // the opponent's possible moves
 
-  // the workers of this job: ponderCap of them when pondering, one for the evaluation line alone
-  const pool = ponderClaim(msg.ponder ? Math.max(1, ponderCap) : 1);
+  // the workers of this job: ponderCap of them when pondering, one for the evaluation line alone. 2.0.2: a recycled
+  // worker that searched the opponent's move just played (the position before our move) comes first.
+  if (msg.ponder) ponderDbg.jobs++;
+  const pool = ponderClaim(msg.ponder ? Math.max(1, ponderCap) : 1, msg.moves.length >= 1 ? CV.ponderKey(msg.startFen, msg.moves.slice(0, -1)) : null);
   const doPonder = !!msg.ponder && legal.length > 0;
   if (doPonder) ponder.begin(msg.startFen, msg.moves, legal.map((m) => m.uci));
   const req = (w, m, ms) => w.request(m, ms * AGGRO_THINK_FACTOR + AGGRO_THINK_MARGIN_MS + 200);
@@ -746,6 +788,7 @@ async function runIdleJob(msg, token) {
     workers: pool, depthCap: 0, single: false, skipFirst: () => (predictedTaken ? predicted : null) }));
   const replySearch = async (w, c) => {
     ponder.addRunning(c.u, { startedAt: Date.now(), ms: c.ms });
+    if (w.searched) w.searched.add(CV.ponderKey(msg.startFen, [...msg.moves, c.u]));
     try {
       if (PONDER_STEPPED && w.steps) {                      // one depth at a time: every finished depth is a usable (partial) reply
         const sliceEnd = Date.now() + c.ms;
@@ -801,7 +844,7 @@ async function runIdleJob(msg, token) {
         if (token !== idleToken) return;
       }
     } catch (e) {
-      if (token === idleToken) { console.error('[ChessVision] AggroChess ponder worker stopped', e); ponderDrop(w); }   // the other workers go on
+      if (token === idleToken) { console.error('[ChessVision] AggroChess ponder worker stopped', e); ponderFail(w); }   // the other workers go on
     }
   };
   try {
@@ -853,10 +896,9 @@ async function analyzeAggroNow(msg) {
       if (wait !== null) {
         ponderDbg.lateWaits++;
         idleToken++; idleInfo.pondering = false;              // the job stops taking work; only this worker keeps running
-        for (const x of ponderActive) if (x !== run.w) x.kill();
-        ponderActive = ponderActive.filter((x) => x === run.w);
+        for (const x of ponderActive.filter((y) => y !== run.w)) aggroRelease(x);   // 2.0.2: idle ones are kept, busy ones terminated
         const r = await Promise.race([run.promise.catch(() => null), new Promise((res) => setTimeout(() => res(null), wait + 100))]);
-        run.w.kill(); ponderActive = ponderActive.filter((x) => x !== run.w); ponder.setRunning(null);
+        aggroRelease(run.w); ponder.setRunning(null);         // answered: kept; still searching: terminated
         const res = aggroResult(r);
         if (res) { ponderDbg.lateWaitHits++; ponderCancel(); noteHitDepth(res.depth); return { ...res, ponderHit: true, late: true }; }
       }
@@ -1159,7 +1201,9 @@ api.runtime.onMessage.addListener((msg) => {
   if (msg && msg.type === 'aggroIdle') return Promise.resolve(aggroIdle(msg));
   if (msg && msg.type === 'aggroIdleStatus') return Promise.resolve({ pondering: idleInfo.pondering, evalLine: idleInfo.evalLine, found: ponder.found() });
   if (msg && msg.type === 'aggroDebug') {
-    return Promise.resolve({ ponder: { ...ponder.counters, passes: ponderDbg.lastPasses, hitDepths: ponderDbg.hitDepths.slice(), harvestUpgrades: ponderDbg.harvestUpgrades, lateWaits: ponderDbg.lateWaits, lateWaitHits: ponderDbg.lateWaitHits }, verify: { checks: aggroDbg.verifyChecks, warnings: aggroDbg.verifyWarnings, last: aggroDbg.lastVerify },
+    return Promise.resolve({ ponder: { ...ponder.counters, passes: ponderDbg.lastPasses, hitDepths: ponderDbg.hitDepths.slice(), harvestUpgrades: ponderDbg.harvestUpgrades, lateWaits: ponderDbg.lateWaits, lateWaitHits: ponderDbg.lateWaitHits,
+      aggroWorkers: { jobs: ponderDbg.jobs, spawns: ponderDbg.aggroSpawns, respawnsPerMove: ponderDbg.jobs ? +(ponderDbg.aggroSpawns / ponderDbg.jobs).toFixed(2) : null, recycled: ponderDbg.aggroRecycled, killed: ponderDbg.aggroKilled, coldClaims: ponderDbg.claimCold, warmLineFirst: ponderDbg.claimWarmLine, recycle: !!CV.AGGRO_PONDER_RECYCLE } },
+      verify: { checks: aggroDbg.verifyChecks, warnings: aggroDbg.verifyWarnings, last: aggroDbg.lastVerify },
       aggroWorkerAlive: !!(aggroMain && !aggroMain.dead), aggroRestarts: aggroDbg.restarts, aggroFailure: aggroFailure ? aggroFailure.message : null,
       ponderPool: { cap: ponderCap, active: ponderActive.filter((w) => !w.dead).length, spares: ponderSpares.filter((w) => !w.dead).length, wanted: ponderWanted },
       module: { ...aggroModuleInfo, sendFailures: aggroDbg.moduleSendFailures }, ponderHashMb, ponderStepped: PONDER_STEPPED, workerStarts: aggroDbg.workerStarts, lastWorkerStart: aggroDbg.lastStart,

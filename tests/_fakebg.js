@@ -2,7 +2,8 @@
 // fake engine workers, so the ponder / search logic can be simulated without a browser or an engine.
 // Fake Stockfish: a UCI speaker whose search completes one depth every `stepMs` ms; its best move in any position is the
 // first legal move in sorted order, its PV continues that way, MultiPV lines rank the sorted legal moves.
-// Fake AggroChess: answers think after the requested ms with the same "best" move and depth = ms / 10.
+// Fake AggroChess: answers think after the requested ms with the same "best" move and depth = ms / 10; 'ready' comes
+// opts.aggroStartMs after init (instantiate + warm-up of a real worker: ~30-60 ms in Node).
 'use strict';
 const fs = require('fs');
 const path = require('path');
@@ -25,7 +26,7 @@ function makeBackground(opts = {}) {
   class FakeWorker {
     constructor(url) {
       this.url = String(url); this.kind = /aggro/.test(this.url) ? 'aggro' : 'sf'; this.dead = false; this.id = workers.length;
-      this.pos = null; this.search = null; this.multipv = 1;
+      this.pos = null; this.search = null; this.multipv = 1; this.msgs = [];
       workers.push(this);
     }
     emit(data) { if (!this.dead && this.onmessage) this.onmessage({ data }); }
@@ -73,7 +74,8 @@ function makeBackground(opts = {}) {
     }
     aggro(m) {
       const posOf = (x) => CV.replayUci(x.fen || CV.STANDARD_START_FEN, x.moves || []).pos;
-      if (m.type === 'init') { this.emit({ type: 'ready', how: 'module', warmMs: 1, steps: true }); return; }
+      this.msgs.push(m.type);                                // 2.0.2: what this AggroChess worker was asked, in order
+      if (m.type === 'init') { setTimeout(() => this.emit({ type: 'ready', how: 'module', warmMs: 1, steps: true }), opts.aggroStartMs || 0); return; }
       if (m.type === 'ponderMove') { this.emit({ type: 'ponderMove', id: m.id, uci: best(posOf(m)) || 'none' }); return; }
       if (m.type === 'clear') { this.emit({ type: 'cleared', id: m.id }); return; }
       if (m.type === 'analyze') {
