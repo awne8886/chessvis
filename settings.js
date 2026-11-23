@@ -454,8 +454,10 @@
   //   pass k>=2 = the top K = min(ranked, max(2, 2 x workers)) moves again, slice min(4000, firstSlice x 2^(k-1))
   // Stops when the time left (leftMs, minus the overrun allowance) cannot fit PONDER_MIN_SLICE_MS, and, with a depth cap
   // (Stockfish 'depth' mode: every search is `go depth N ...`), after pass 1 once every top-K result already has depth >= N.
-  CV.ponderDeepenPlan = function ({ ranked, results, pass, workers, firstSlice, leftMs, depthCap }) {
-    const list = Array.isArray(ranked) ? ranked : [];
+  // 2.0.3: `settled` (a Set of uci) leaves out replies with nothing more to find (CV.ponderSettled); the next likely moves
+  // take their places, and when every ranked move is settled the job ends instead of starting pass after pass.
+  CV.ponderDeepenPlan = function ({ ranked, results, pass, workers, firstSlice, leftMs, depthCap, settled }) {
+    const list = (Array.isArray(ranked) ? ranked : []).filter((u) => !(settled && settled.has(u)));
     const room = leftMs === undefined || leftMs === null ? Infinity : Number(leftMs) - CV.PONDER_OVERRUN_MS;
     if (!list.length || !(room >= CV.PONDER_MIN_SLICE_MS)) return [];
     const first = Math.max(CV.PONDER_MIN_SLICE_MS, Number(firstSlice) || CV.PONDER_MIN_SLICE_MS);
@@ -466,6 +468,21 @@
     if (cap > 0 && top.every((u) => results && results[u] && results[u].depth >= cap)) return [];
     const ms = Math.min(CV.PONDER_DEEPEN_MAX_SLICE_MS, first * Math.pow(2, k - 1), room);
     return ms >= CV.PONDER_MIN_SLICE_MS ? top.map((uci) => ({ uci, ms })) : [];
+  };
+
+  // 2.0.3: a reply is settled when its search ended in under a quarter of its slice and came back no deeper than before
+  // (depth -1 = no result: the game is over after that move). Then a longer slice finds nothing more: a forced mate
+  // (AggroChess stops at a proven mate, Stockfish runs to its depth ceiling of 245 at once), a single legal reply, or a
+  // finished game. Seen on a phone (2.0.2): the bot's only move followed by our mate in one made every search return in
+  // under 3 ms, and the job ran 21 271 passes until the bot moved. false = 2.0.2 (no reply is ever settled).
+  CV.PONDER_SETTLE = true;
+  CV.PONDER_SETTLE_FRACTION = 0.25;
+  CV.ponderSettled = function ({ ms, elapsedMs, depthBefore, depthAfter }) {
+    if (!CV.PONDER_SETTLE) return false;
+    const slice = Number(ms) || 0, e = Number(elapsedMs);
+    if (!(slice > 0) || !(e >= 0) || e >= slice * CV.PONDER_SETTLE_FRACTION) return false;
+    const num = (v) => (v === null || v === undefined || !Number.isFinite(Number(v)) ? -1 : Number(v));
+    return num(depthAfter) <= num(depthBefore);
   };
 
   // ---- 2.0.2: AggroChess ponder workers ----

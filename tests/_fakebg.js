@@ -98,9 +98,12 @@ function makeBackground(opts = {}) {
         const b = best(posOf(m));
         this.thinks = (this.thinks || 0) + 1;
         const t0 = Date.now();
-        const answer = (stopped) => this.emit({ type: 'bestmove', id: m.id, uci: b, san: b, score: '0', depth: Math.max(1, Math.floor((stopped ? Date.now() - t0 : ms) / 10)), sacrifice: false, stopped });
+        // opts.aggroInstant (2.0.3): every think ends after 1 ms with a forced mate at depth 8 (a position with nothing more to find)
+        const answer = opts.aggroInstant
+          ? (stopped) => this.emit({ type: 'bestmove', id: m.id, uci: b, san: b, score: 'mate1', depth: 8, sacrifice: false, stopped })
+          : (stopped) => this.emit({ type: 'bestmove', id: m.id, uci: b, san: b, score: '0', depth: Math.max(1, Math.floor((stopped ? Date.now() - t0 : ms) / 10)), sacrifice: false, stopped });
         this.running = this.running || new Map();
-        const t = { answer, timer: setTimeout(() => { this.running.delete(m.id); answer(false); }, ms) };
+        const t = { answer, timer: setTimeout(() => { this.running.delete(m.id); answer(false); }, opts.aggroInstant ? 1 : ms) };
         this.running.set(m.id, t);
       }
     }

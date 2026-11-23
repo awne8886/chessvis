@@ -682,7 +682,9 @@ const ponderDbg = { lastPasses: 0, hitDepths: [], harvestUpgrades: 0, lateWaits:
   topUps: 0, topUpUsed: 0, hitChanged: 0, topUpDepths: [],
   // 2.0.2 (A7): interruptible AggroChess workers: stops sent, answered in time / terminated, the last 20 stop times (ms);
   // late searches stopped and their move used
-  stops: 0, stopsOk: 0, stopsFailed: 0, stopMs: [], lateStops: 0, lateStopHits: 0, claimStopping: 0 };
+  stops: 0, stopsOk: 0, stopsFailed: 0, stopMs: [], lateStops: 0, lateStopHits: 0, claimStopping: 0,
+  // 2.0.3: replies settled (CV.ponderSettled), jobs that ended because every reply was settled, most passes of any job
+  settled: 0, settledJobs: 0, maxPasses: 0 };
 const noteStopMs = (ms, ok) => { ponderDbg.stops++; ponderDbg[ok ? 'stopsOk' : 'stopsFailed']++; ponderDbg.stopMs.push(ms); if (ponderDbg.stopMs.length > 20) ponderDbg.stopMs.shift(); };
 const noteHitDepth = (d) => { ponderDbg.hitDepths.push(d || 0); if (ponderDbg.hitDepths.length > 20) ponderDbg.hitDepths.shift(); };
 
@@ -704,15 +706,19 @@ function ponderCeiling(msg, budget) {
 function createReplyPasses(opts) {
   let pass = 0, queue = [], running = 0, waiters = [];
   const lastWorker = new Map(), busy = new Set();
+  const settled = new Set();      // 2.0.3: replies with nothing more to find (CV.ponderSettled); later passes leave them out
+  let allSettled = false;
+  const depthOf = (u) => { const p = ponder.get(); const r = p && p.results ? p.results[u] : null; return r && Number.isFinite(r.depth) ? r.depth : -1; };
   const wake = () => { const w = waiters; waiters = []; for (const r of w) r(); };
   const nextPass = () => {
     if (pass >= 1 && !opts.until) return false;
     const p = ponder.get();
-    let items = CV.ponderDeepenPlan({ ranked: opts.ranked, results: p ? p.results : null, pass: pass + 1, workers: opts.workers.length, firstSlice: opts.firstSlice, leftMs: opts.left(), depthCap: pass >= 1 ? opts.depthCap : 0 });
+    let items = CV.ponderDeepenPlan({ ranked: opts.ranked, results: p ? p.results : null, pass: pass + 1, workers: opts.workers.length, firstSlice: opts.firstSlice, leftMs: opts.left(), depthCap: pass >= 1 ? opts.depthCap : 0, settled });
+    if (!items.length && pass >= 1 && !allSettled && opts.ranked.length && opts.ranked.every((u) => settled.has(u))) { allSettled = true; ponderDbg.settledJobs++; }
     if (pass === 0 && opts.skipFirst) { const skip = opts.skipFirst(); if (skip) items = items.filter((it) => it.uci !== skip); }
     if (!items.length) return false;
     pass++; queue = items;
-    if (pass > 1) ponderDbg.lastPasses = pass - 1;
+    if (pass > 1) { ponderDbg.lastPasses = pass - 1; ponderDbg.maxPasses = Math.max(ponderDbg.maxPasses, pass - 1); }
     return true;
   };
   const free = (w) => !w.dead && !busy.has(w) && opts.workers.includes(w);
@@ -731,7 +737,14 @@ function createReplyPasses(opts) {
           if (ms < PONDER_MIN_SLICE_MS) { queue = []; continue; }        // nothing fits any more
           running++; busy.add(w); lastWorker.set(it.uci, w);
           let ended = false;
-          return { u: it.uci, ms, pass, done: () => { if (ended) return; ended = true; running--; busy.delete(w); if (!running) wake(); } };
+          // 2.0.3: only deepening passes settle a reply (pass 1 of Stockfish is depth-limited and may end early on purpose)
+          const t0 = Date.now(), depthBefore = depthOf(it.uci), itPass = pass;
+          return { u: it.uci, ms, pass, done: () => {
+            if (ended) return;
+            ended = true; running--; busy.delete(w);
+            if (itPass >= 2 && opts.token === idleToken && !settled.has(it.uci) && CV.ponderSettled({ ms, elapsedMs: Date.now() - t0, depthBefore, depthAfter: depthOf(it.uci) })) { settled.add(it.uci); ponderDbg.settled++; }
+            if (!running) wake();
+          } };
         }
         if (running > 0) { await new Promise((r) => waiters.push(r)); continue; }    // the pass is still finishing on other workers
         if (!nextPass()) { ponderDbg.lastPasses = Math.max(0, pass); wake(); return null; }
@@ -1382,7 +1395,7 @@ api.runtime.onMessage.addListener((msg) => {
   if (msg && msg.type === 'hitTopUp') return hitFinal(msg.id);
   if (msg && msg.type === 'aggroIdleStatus') return Promise.resolve({ pondering: idleInfo.pondering, evalLine: idleInfo.evalLine, found: ponder.found() });
   if (msg && msg.type === 'aggroDebug') {
-    return Promise.resolve({ ponder: { ...ponder.counters, passes: ponderDbg.lastPasses, hitDepths: ponderDbg.hitDepths.slice(), harvestUpgrades: ponderDbg.harvestUpgrades, lateWaits: ponderDbg.lateWaits, lateWaitHits: ponderDbg.lateWaitHits,
+    return Promise.resolve({ ponder: { ...ponder.counters, passes: ponderDbg.lastPasses, maxPasses: ponderDbg.maxPasses, settled: { enabled: !!CV.PONDER_SETTLE, replies: ponderDbg.settled, jobsEnded: ponderDbg.settledJobs }, hitDepths: ponderDbg.hitDepths.slice(), harvestUpgrades: ponderDbg.harvestUpgrades, lateWaits: ponderDbg.lateWaits, lateWaitHits: ponderDbg.lateWaitHits,
       hitTopUp: { started: ponderDbg.topUps, used: ponderDbg.topUpUsed, changed: ponderDbg.hitChanged, depths: ponderDbg.topUpDepths.slice() },
       interrupt: { enabled: !!CV.AGGRO_INTERRUPT, mainInterruptible: !!(aggroMain && aggroMain.interruptible), stops: ponderDbg.stops, ok: ponderDbg.stopsOk, failed: ponderDbg.stopsFailed,
         stopMs: ponderDbg.stopMs.slice(), lateStops: ponderDbg.lateStops, lateStopHits: ponderDbg.lateStopHits, claimedWhileStopping: ponderDbg.claimStopping },
