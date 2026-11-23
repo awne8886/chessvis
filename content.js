@@ -31,6 +31,7 @@
   let busy = false, busySince = 0, playToken = 0, recheckPending = false;
   let lastHandledKey = null, attempts = 0;
   let unstableReads = 0, unstableRun = 0, stableSeq = 0;   // stable-read debounce (2.0.0): total / in a row / cancels an outdated check
+  let stableArmed = false;                       // 2.0.2: a stable read is scheduled or under way (the watchdog then skips its tick)
   let rights = BS.freshRights();
   const tracker = BS.createTracker();            // the one game-tracking mechanism (history, new game, takeback)
   const rec = CV.createRecorder();               // records every ply the tracker reports
@@ -745,6 +746,7 @@
   function schedule(ms, reason = 'event') {
     clearTimeout(debounceTimer);
     stableSeq++;                                                 // a stable check still waiting for its second read is outdated
+    stableArmed = false;                                         // ... and this direct check replaces it
     debounceTimer = setTimeout(() => check(reason), ms);
   }
 
@@ -761,13 +763,14 @@
   function scheduleStable(ms, reason) {
     clearTimeout(debounceTimer);
     const seq = ++stableSeq;
+    stableArmed = true;
     debounceTimer = setTimeout(async () => {
       const a = boardSignature();
       await nextFrame();
       await sleep(STABLE_GAP_MS);
       if (seq !== stableSeq) return;                             // a newer mutation (or schedule) took over
       const b = boardSignature();
-      if (a === b || unstableRun >= UNSTABLE_MAX) { unstableRun = 0; check(reason); return; }
+      if (a === b || unstableRun >= UNSTABLE_MAX) { unstableRun = 0; stableArmed = false; check(reason); return; }
       unstableReads++; unstableRun++;
       scheduleStable(cfg.boardDebounceMs, 'unstable');
     }, ms);
@@ -775,9 +778,16 @@
 
   // Watchdog: re-reads the board on a timer, independent of any DOM event.
   // check() is idempotent, so this is cheap and recovers from any missed mutation.
+  // 2.0.2 (C4): the watchdog uses the stable read too (two reads a frame + 20 ms apart must agree): a tick that landed
+  // in the middle of a board update made of two DOM steps fed the tracker a half-updated board (a gap, then a ponder
+  // miss). When a stable read is already scheduled or running, the tick has nothing to add. CV.WATCHDOG_STABLE_READ =
+  // false: the 2.0.0 direct read.
   function startWatchdog() {
     clearInterval(watchdogTimer);
-    watchdogTimer = setInterval(() => check('watchdog'), cfg.watchdogMs);
+    watchdogTimer = setInterval(() => {
+      if (!CV.WATCHDOG_STABLE_READ) { check('watchdog'); return; }
+      if (!stableArmed) scheduleStable(0, 'watchdog');
+    }, cfg.watchdogMs);
   }
 
   function attach() {

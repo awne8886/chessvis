@@ -55,7 +55,7 @@
 
     // --- 2.0.0: speed (both engines unless noted) ---
     earlyPonder: true,        // start pondering the moment our move is decided, not when the board shows it (false = 1.8.0)
-    boardDebounceMs: 80,      // wait after a board change before the stable-read check (250 = the 1.8.0 timing)
+    boardDebounceMs: 40,      // wait after a board change before the stable-read check (2.0.2: 40; 80 = 2.0.0, 250 = the 1.8.0 timing)
     ponderUntilMove: true,    // keep pondering (deepening the likely replies) until the opponent moves, up to ponderMaxMs (false = the *PonderMs budget, 1.8.0)
     ponderMaxMs: 8000,        // ceiling of a ponder job with ponderUntilMove
     ponderHitFast: true,      // a ponder hit is answered with the quick delay and the faster hand (false = 1.8.0: normal delay)
@@ -479,6 +479,9 @@
   // Measured (tests/bench-ponder-rank.js, 80 positions, opponent AggroChess 150 ms, budget 1500): moves ranked in the
   // window 24.8 -> 33.5 of 33.9; opponent's move in the top 1 / 3 / 5 / 8: 44 / 68 / 73 / 75% -> 55 / 74 / 85 / 88%.
   CV.AGGRO_SCAN_FLOOR_MS = 3;
+  // The watchdog's board read goes through the stable read (two reads a frame + 20 ms apart must agree), like a
+  // mutation's. false = 2.0.0: the watchdog reads the board directly (content.js).
+  CV.WATCHDOG_STABLE_READ = true;
 
   // ---- 2.0.2: ponder hits never lose depth (pure; background.js) ----
   // A prepared reply is often shallower than what the main worker reaches in the pause a hit is played after anyway
