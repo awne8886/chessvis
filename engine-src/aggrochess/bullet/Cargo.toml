@@ -1,0 +1,20 @@
+# ChessVision 2.0.3: training the AggroChess network with bullet (https://github.com/jw1912/bullet, MIT), CPU backend.
+# Not part of the engine build. bullet is pinned to the last commit with a CPU backend (it was removed in #488).
+[package]
+name = "aggro-bullet"
+version = "0.1.0"
+edition = "2021"
+publish = false
+license = "GPL-3.0-or-later"
+
+[dependencies]
+bullet_lib = { git = "https://github.com/jw1912/bullet", rev = "feab6443fc523c9d349427bca2d5bb3c04369420", default-features = false, features = ["cpu"] }
+bulletformat = "1.8.0"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+debug = false
+
+[workspace]
