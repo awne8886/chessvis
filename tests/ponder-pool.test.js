@@ -182,4 +182,41 @@ test('measured: fewer respawns and cold workers per move (simulation, 8 moves, 2
   assert.ok(intUntil.spawnsPerMove < oldUntil.spawnsPerMove && intUntil.coldPerMove < oldUntil.coldPerMove, 'interruptible: until-move workers are kept');
 });
 
+// 2.0.3: seen on a phone with 2.0.2: the bot's only move followed by our mate in one made every reply search return in
+// under 3 ms, and the "until the opponent moves" job ran 21 271 passes. A reply that ends fast without getting deeper is
+// settled; the job ends once every ranked reply is.
+async function instantJob(settle) {
+  const bg = makeBackground({ aggroStartMs: 5, aggroInstant: true });
+  bg.get('CV.PONDER_SETTLE = ' + settle);
+  await bg.send(idle(['e2e4'], { ponderUntilMove: true, ponderMaxMs: 30000, ponderMs: 800 }));
+  await sleep(1200);
+  const out = { pondering: !!bg.get('idleInfo.pondering'), passes: bg.get('ponderDbg.maxPasses'), settled: bg.get('ponderDbg.settled'),
+    jobsEnded: bg.get('ponderDbg.settledJobs'), thinks: aggroWorkers(bg).reduce((n, w) => n + (w.thinks || 0), 0) };
+  await bg.send({ type: 'aggroInvalidate' });
+  return out;
+}
+
+test('2.0.3: replies with nothing more to find are settled and the job ends instead of spinning', async () => {
+  const on = await instantJob(true), off = await instantJob(false);
+  if (process.env.SHOW) console.table({ settle: on, '2.0.2': off });
+  assert.strictEqual(on.pondering, false, 'the job is over');
+  assert.strictEqual(on.jobsEnded, 1);
+  assert.ok(on.settled >= 1 && on.passes <= 12, JSON.stringify(on));
+  assert.ok(off.pondering === true && off.passes > 10 * on.passes, '2.0.2 keeps starting passes: ' + JSON.stringify(off));
+  assert.ok(on.thinks * 5 < off.thinks, JSON.stringify({ on: on.thinks, off: off.thinks }));
+});
+
+test('2.0.3: CV.ponderSettled: fast and no deeper = settled; slow, deeper or pass-1 style results are not', () => {
+  assert.strictEqual(CV.ponderSettled({ ms: 800, elapsedMs: 2, depthBefore: 8, depthAfter: 8 }), true);
+  assert.strictEqual(CV.ponderSettled({ ms: 800, elapsedMs: 2, depthBefore: undefined, depthAfter: undefined }), true, 'game over after the reply');
+  assert.strictEqual(CV.ponderSettled({ ms: 800, elapsedMs: 2, depthBefore: 8, depthAfter: 9 }), false, 'deeper');
+  assert.strictEqual(CV.ponderSettled({ ms: 800, elapsedMs: 200, depthBefore: 8, depthAfter: 8 }), false, 'used a quarter of its time');
+  assert.strictEqual(CV.ponderSettled({ ms: 0, elapsedMs: 0, depthBefore: 8, depthAfter: 8 }), false);
+  const plan = CV.ponderDeepenPlan({ ranked: ['a', 'b', 'c', 'd', 'e', 'f'], results: {}, pass: 2, workers: 1, firstSlice: 100, leftMs: 10000, settled: new Set(['a']) });
+  assert.deepStrictEqual(plan.map((x) => x.uci), ['b', 'c'], 'the next likely move takes a settled one\'s place');
+  assert.deepStrictEqual(CV.ponderDeepenPlan({ ranked: ['a'], results: {}, pass: 3, workers: 2, firstSlice: 100, leftMs: 10000, settled: new Set(['a']) }), []);
+  CV.PONDER_SETTLE = false;
+  try { assert.strictEqual(CV.ponderSettled({ ms: 800, elapsedMs: 2, depthBefore: 8, depthAfter: 8 }), false, 'false = 2.0.2'); } finally { CV.PONDER_SETTLE = true; }
+});
+
 run();

@@ -36,7 +36,13 @@ const SF_DELAY_GO = 'go depth 64';   // delay-matched search: effectively unboun
 let sfActive = null;    // engine file in use
 let sfPrevCount = null; // pieces in the previous request; null = nothing searched yet (see CV.sfIsNewGame)
 let sfMultiPvSent = null, sfThreadsSent = SF_THREADS;   // setoption is only sent when the value changes
-const sfDbg = { moduleSendFailures: 0, workerStarts: 0, lastStart: null, harvested: 0, harvestFailed: 0, threadedFailed: null, threadedStarts: 0, pvSeeds: 0, rsimdFailed: null };
+const sfDbg = { moduleSendFailures: 0, workerStarts: 0, lastStart: null, harvested: 0, harvestFailed: 0, threadedFailed: null, threadedStarts: 0, pvSeeds: 0, rsimdFailed: null,
+  // 2.0.3 (seen on a phone: a main search ran 4 752 ms with a 3 000 ms cap, and 27 Stockfish workers were started for 31
+  // ponder jobs): main searches that ended more than SF_OVERRUN_MS after their cap (count, the last 5 in full); Stockfish
+  // workers terminated, by reason; the last 20 ponder cancels (stop + readyok, ms)
+  overruns: 0, lastOverruns: [], kills: {}, cancelMs: [], claimedWhileStopping: 0, claimReplaced: 0 };
+const SF_OVERRUN_MS = 250;
+const noteSfKill = (reason) => { sfDbg.kills[reason] = (sfDbg.kills[reason] || 0) + 1; };
 const sfRelaxedOk = (() => { try { return typeof WebAssembly !== 'undefined' && typeof WebAssembly.validate === 'function' && WebAssembly.validate(RELAXED_PROBE); } catch (e) { return false; } })();
 // The single-thread builds to try, best first.
 const sfCandidates = () => (sfRelaxedOk && !sfDbg.rsimdFailed ? [SF_FILE_RSIMD, SF_FILE] : [SF_FILE]);
@@ -231,23 +237,30 @@ function sfStart(job) {
     // 2.0.0 delay-matched search: no depth limit; stopped from here once softMs is used and the minimum depth is done, or at
     // hardMs. Checked on every info line and on timers (a search can be silent for a while).
     sf.postMessage(SF_DELAY_GO);
-    job.softTimer = setTimeout(() => sfCheckStop(job), job.softMs);
-    job.hardTimer = setTimeout(() => sfCheckStop(job), job.hardMs);
+    job.softTimer = setTimeout(() => sfCheckStop(job, 'soft timer'), job.softMs);
+    job.hardTimer = setTimeout(() => sfCheckStop(job, 'hard timer'), job.hardMs);
   } else if (job.mode === 'clock') {
     sf.postMessage(job.clockGo);
-    job.hardTimer = setTimeout(() => sfCheckStop(job), job.hardMs);
+    job.hardTimer = setTimeout(() => sfCheckStop(job, 'hard timer'), job.hardMs);
   } else sf.postMessage(CV.sfGoCommand(job.depth, job.maxMs));
 }
 
 // Sends `stop` (once) when CV.sfShouldStop says so; the normal bestmove handling then resolves the job.
-function sfCheckStop(job) {
-  if (sfCurrent !== job || job.stopSent) return;
-  if (job.mode === 'clock') { if (Date.now() - job.startedAt >= job.hardMs) { job.stopSent = true; sf.postMessage('stop'); } return; }
-  if (job.mode !== 'delay') return;
-  if (CV.sfShouldStop({ elapsedMs: Date.now() - job.startedAt, softMs: job.softMs, depthDone: job.depthDone, minDepth: job.depth, hardMs: job.hardMs })) {
-    job.stopSent = true;
-    sf.postMessage('stop');
+// 2.0.3: `by` = what called it ('info' line, 'soft timer', 'hard timer'); a timer notes how late it fired (debug info).
+function sfCheckStop(job, by) {
+  if (by === 'soft timer' || by === 'hard timer') {
+    const late = Date.now() - job.startedAt - (by === 'soft timer' ? job.softMs : job.hardMs);
+    job[by === 'soft timer' ? 'softLateMs' : 'hardLateMs'] = late;
   }
+  if (sfCurrent !== job || job.stopSent) return;
+  if (job.mode === 'clock') { if (Date.now() - job.startedAt >= job.hardMs) sfSendStop(job, by); return; }
+  if (job.mode !== 'delay') return;
+  if (CV.sfShouldStop({ elapsedMs: Date.now() - job.startedAt, softMs: job.softMs, depthDone: job.depthDone, minDepth: job.depth, hardMs: job.hardMs })) sfSendStop(job, by);
+}
+// 2.0.3: `stop` to the main worker, noting why and when (ms after the search started) for the debug info.
+function sfSendStop(job, by) {
+  if (job && !job.stopSent && job.startedAt) { job.stopSent = true; job.stopBy = by; job.stopAtMs = Date.now() - job.startedAt; }
+  sf.postMessage('stop');
 }
 const sfClearTimers = (job) => { if (job) { clearTimeout(job.softTimer); clearTimeout(job.hardTimer); } };
 
@@ -260,7 +273,7 @@ function sfInfo(line) {
   if (!p || p.bound) return;                                     // lowerbound / upperbound lines are not exact
   if (p.mpv === 1) { job.depthDone = p.depth; job.pv = CV.sfParsePv(line); job.pvDepth = p.depth; (job.depthAt || (job.depthAt = [])).push([p.depth, Date.now() - job.startedAt]); }
   if (job.multipv >= 2) job.lines.set(p.mpv, { uci: p.uci, depth: p.depth, cp: p.cp, mate: p.mate });
-  if (job.mode === 'delay') sfCheckStop(job);
+  if (job.mode === 'delay') sfCheckStop(job, 'info');
 }
 
 // Occasionally returns a near-best alternative instead of the best move. Never when a mate is found.
@@ -286,12 +299,21 @@ function sfBestMove(line) {
     sf.postMessage(CV.sfPositionCommand(job.fen, job.startFen, job.moves));
     sf.postMessage(SF_DELAY_GO);
     clearTimeout(job.softTimer);
-    job.softTimer = setTimeout(() => sfCheckStop(job), Math.max(0, job.softMs - (Date.now() - job.startedAt)));
+    job.softTimer = setTimeout(() => sfCheckStop(job, 'soft timer'), Math.max(0, job.softMs - (Date.now() - job.startedAt)));
     return;
   }
   sfCurrent = null;
   sfClearTimers(job);
-  if (job) sfLast = { mode: job.mode + (job.extended ? ' (clock, extended)' : ''), depthDone: job.depthDone || 0, softMs: job.softMs, hardMs: job.hardMs, elapsedMs: Date.now() - job.startedAt, superseded: !!sfNext, topUp: !!job.topUp };
+  if (job) {
+    const elapsedMs = Date.now() - job.startedAt, da = job.depthAt || [];
+    sfLast = { mode: job.mode + (job.extended ? ' (clock, extended)' : ''), depthDone: job.depthDone || 0, softMs: job.softMs, hardMs: job.hardMs, elapsedMs, superseded: !!sfNext, topUp: !!job.topUp,
+      // 2.0.3: why and when `stop` was sent, how long the bestmove took after it, how late the timers fired, when the
+      // last exact depth arrived ([depth, ms]); all in ms after the search started (null = did not happen)
+      stopBy: job.stopBy || null, stopAtMs: job.stopAtMs === undefined ? null : job.stopAtMs, replyAfterStopMs: job.stopAtMs === undefined ? null : elapsedMs - job.stopAtMs,
+      softTimerLateMs: job.softLateMs === undefined ? null : job.softLateMs, hardTimerLateMs: job.hardLateMs === undefined ? null : job.hardLateMs,
+      lastDepthAt: da.length ? da[da.length - 1] : null };
+    if (job.hardMs > 0 && elapsedMs > job.hardMs + SF_OVERRUN_MS) { sfDbg.overruns++; sfDbg.lastOverruns.push(sfLast); if (sfDbg.lastOverruns.length > 5) sfDbg.lastOverruns.shift(); }
+  }
   if (job && job.mode === 'delay' && job.depthAt && job.depthAt.length) { sfDepthSamples.push(job.depthAt); if (sfDepthSamples.length > 8) sfDepthSamples.shift(); }   // 2.0.2: CV.expectedDepth
   if (sfNext) {
     const n = sfNext;
@@ -377,7 +399,7 @@ async function analyzeStockfishNow(fen, depth, imperfection, maxMs, startFen, mo
     if (sfCurrent) {
       if (sfNext) sfNext.resolve(null);
       sfNext = job;
-      sf.postMessage('stop');
+      sfSendStop(sfCurrent, 'superseded');
     } else {
       sfStart(job);
     }
@@ -434,7 +456,7 @@ function sfHitSearch(fen, startFen, moves, ms) {
   return new Promise((resolve) => {
     const job = { fen, resolve, startFen, moves, depth: 1, maxMs: 0, imperfection: 0, multipv: 1, lines: new Map(), mode: 'delay', clockGo: null,
       softMs: ms, hardMs: ms, depthDone: 0, pv: [], pvDepth: 0, topUp: true };
-    if (sfCurrent) { if (sfNext) sfNext.resolve(null); sfNext = job; sf.postMessage('stop'); } else sfStart(job);
+    if (sfCurrent) { if (sfNext) sfNext.resolve(null); sfNext = job; sfSendStop(sfCurrent, 'superseded'); } else sfStart(job);
   });
 }
 
@@ -682,7 +704,9 @@ const ponderDbg = { lastPasses: 0, hitDepths: [], harvestUpgrades: 0, lateWaits:
   topUps: 0, topUpUsed: 0, hitChanged: 0, topUpDepths: [],
   // 2.0.2 (A7): interruptible AggroChess workers: stops sent, answered in time / terminated, the last 20 stop times (ms);
   // late searches stopped and their move used
-  stops: 0, stopsOk: 0, stopsFailed: 0, stopMs: [], lateStops: 0, lateStopHits: 0, claimStopping: 0 };
+  stops: 0, stopsOk: 0, stopsFailed: 0, stopMs: [], lateStops: 0, lateStopHits: 0, claimStopping: 0,
+  // 2.0.3: replies settled (CV.ponderSettled), jobs that ended because every reply was settled, most passes of any job
+  settled: 0, settledJobs: 0, maxPasses: 0 };
 const noteStopMs = (ms, ok) => { ponderDbg.stops++; ponderDbg[ok ? 'stopsOk' : 'stopsFailed']++; ponderDbg.stopMs.push(ms); if (ponderDbg.stopMs.length > 20) ponderDbg.stopMs.shift(); };
 const noteHitDepth = (d) => { ponderDbg.hitDepths.push(d || 0); if (ponderDbg.hitDepths.length > 20) ponderDbg.hitDepths.shift(); };
 
@@ -704,15 +728,19 @@ function ponderCeiling(msg, budget) {
 function createReplyPasses(opts) {
   let pass = 0, queue = [], running = 0, waiters = [];
   const lastWorker = new Map(), busy = new Set();
+  const settled = new Set();      // 2.0.3: replies with nothing more to find (CV.ponderSettled); later passes leave them out
+  let allSettled = false;
+  const depthOf = (u) => { const p = ponder.get(); const r = p && p.results ? p.results[u] : null; return r && Number.isFinite(r.depth) ? r.depth : -1; };
   const wake = () => { const w = waiters; waiters = []; for (const r of w) r(); };
   const nextPass = () => {
     if (pass >= 1 && !opts.until) return false;
     const p = ponder.get();
-    let items = CV.ponderDeepenPlan({ ranked: opts.ranked, results: p ? p.results : null, pass: pass + 1, workers: opts.workers.length, firstSlice: opts.firstSlice, leftMs: opts.left(), depthCap: pass >= 1 ? opts.depthCap : 0 });
+    let items = CV.ponderDeepenPlan({ ranked: opts.ranked, results: p ? p.results : null, pass: pass + 1, workers: opts.workers.length, firstSlice: opts.firstSlice, leftMs: opts.left(), depthCap: pass >= 1 ? opts.depthCap : 0, settled });
+    if (!items.length && pass >= 1 && !allSettled && opts.ranked.length && opts.ranked.every((u) => settled.has(u))) { allSettled = true; ponderDbg.settledJobs++; }
     if (pass === 0 && opts.skipFirst) { const skip = opts.skipFirst(); if (skip) items = items.filter((it) => it.uci !== skip); }
     if (!items.length) return false;
     pass++; queue = items;
-    if (pass > 1) ponderDbg.lastPasses = pass - 1;
+    if (pass > 1) { ponderDbg.lastPasses = pass - 1; ponderDbg.maxPasses = Math.max(ponderDbg.maxPasses, pass - 1); }
     return true;
   };
   const free = (w) => !w.dead && !busy.has(w) && opts.workers.includes(w);
@@ -731,7 +759,14 @@ function createReplyPasses(opts) {
           if (ms < PONDER_MIN_SLICE_MS) { queue = []; continue; }        // nothing fits any more
           running++; busy.add(w); lastWorker.set(it.uci, w);
           let ended = false;
-          return { u: it.uci, ms, pass, done: () => { if (ended) return; ended = true; running--; busy.delete(w); if (!running) wake(); } };
+          // 2.0.3: only deepening passes settle a reply (pass 1 of Stockfish is depth-limited and may end early on purpose)
+          const t0 = Date.now(), depthBefore = depthOf(it.uci), itPass = pass;
+          return { u: it.uci, ms, pass, done: () => {
+            if (ended) return;
+            ended = true; running--; busy.delete(w);
+            if (itPass >= 2 && opts.token === idleToken && !settled.has(it.uci) && CV.ponderSettled({ ms, elapsedMs: Date.now() - t0, depthBefore, depthAfter: depthOf(it.uci) })) { settled.add(it.uci); ponderDbg.settled++; }
+            if (!running) wake();
+          } };
         }
         if (running > 0) { await new Promise((r) => waiters.push(r)); continue; }    // the pass is still finishing on other workers
         if (!nextPass()) { ponderDbg.lastPasses = Math.max(0, pass); wake(); return null; }
@@ -788,6 +823,19 @@ function ponderClaim(n, prefer) {
     if (i < 0) break;
     const w = ponderCancelling.splice(i, 1)[0];
     w.claimedWhileStopping = true; ponderDbg.claimStopping++;
+    got.push(w);
+  }
+  // 2.0.3: the same for Stockfish (seen on a phone with 2.0.2: 27 workers started for 31 jobs, because the next job begins
+  // right after a hit, while the last job's workers are still answering `stop`: it started new ones and the stopped
+  // ones were then terminated as surplus). The job's first step, `await w.ready`, waits for the stop to finish.
+  while (got.length < n && CV.SF_CLAIM_STOPPING) {
+    const i = ponderCancelling.findIndex((w) => w.kind === 'sf' && ponderKind === 'sf' && !w.dead && w.ttMb === ponderHashMb && w.cancelP);
+    if (i < 0) break;
+    const w = ponderCancelling.splice(i, 1)[0];
+    w.releaseSeq = (w.releaseSeq || 0) + 1;
+    w.claimedStop = true;
+    w.ready = w.cancelP.then((ok) => { if (!ok || w.dead) throw new Error('the stopped search did not end'); w.claimedStop = false; });
+    sfDbg.claimedWhileStopping++;
     got.push(w);
   }
   while (got.length < n) got.push(ponderSpawn());
@@ -1139,9 +1187,10 @@ const SF_PONDER_SCAN_SHARE = 0.35;     // the ranking pass may use at most this 
 // bestmove (and, after a cancel, a readyok), so a bestmove can never be taken for another position's.
 function spawnSfWorker(label, hashMb) {
   const h = { kind: 'sf', label, ttMb: hashMb || null, worker: null, dead: false, task: null, syncWait: null, multipv: null, gen: ponderGen, how: null, warmMs: null };
-  h.kill = () => {
+  h.kill = (reason) => {
     if (h.dead) return;
     h.dead = true;
+    noteSfKill(reason || 'not needed');           // 2.0.3: debug info (stockfish.kills)
     try { if (h.worker) h.worker.terminate(); } catch (e) { /* ignore */ }
     if (h.task) { const t = h.task; h.task = null; clearTimeout(t.timer); t.reject(new Error('worker was terminated')); }
     if (h.syncWait) { const x = h.syncWait; h.syncWait = null; clearTimeout(x.timer); x.resolve(false); }
@@ -1169,7 +1218,7 @@ function spawnSfWorker(label, hashMb) {
     if (h.dead) { try { r.worker.terminate(); } catch (e) { /* ignore */ } throw new Error('worker was terminated'); }
     h.worker = r.worker;
     h.worker.onmessage = (e) => onLine(typeof e.data === 'string' ? e.data : '');
-    h.worker.onerror = (e) => { console.error('[ChessVision] Stockfish (' + label + ') error', e && e.message); h.kill(); };
+    h.worker.onerror = (e) => { console.error('[ChessVision] Stockfish (' + label + ') error', e && e.message); h.kill('error'); };
     // warm-up: the first search of a fresh engine pays for its own lazy set-up; do it before the worker counts as ready
     const t0 = Date.now();
     h.worker.postMessage('ucinewgame');
@@ -1180,7 +1229,7 @@ function spawnSfWorker(label, hashMb) {
     h.warmMs = Date.now() - t0;
     sfDbg.workerStarts++; sfDbg.lastStart = { label, file: h.file, how: h.how, warmMs: h.warmMs };
   })();
-  h.ready = h.ready.catch((e) => { h.kill(); throw e; });      // a worker that failed to start or warm up is never reused
+  h.ready = h.ready.catch((e) => { h.kill('start failed'); throw e; });      // a worker that failed to start or warm up is never reused
   h.ready.catch(() => {});
   // Searches one position. key = what the result is for (an opponent move, 'rank', 'warm'); movetime comes from `go`.
   h.search = (startFen, moves, go, key, multipv, extra) => new Promise((resolve, reject) => {
@@ -1191,7 +1240,7 @@ function spawnSfWorker(label, hashMb) {
     let settle; t.promise = new Promise((res) => { settle = res; });      // resolves with the result, or null when the search failed (cancel() and the harvest wait on it)
     t.resolve = (v) => { resolve(v); settle(v); };
     t.reject = (e) => { reject(e); settle(null); };
-    t.timer = setTimeout(() => { h.task = null; t.reject(new Error('no answer within ' + (ms + SF_SEARCH_MARGIN_MS) + ' ms')); h.kill(); }, ms + SF_SEARCH_MARGIN_MS);
+    t.timer = setTimeout(() => { h.task = null; t.reject(new Error('no answer within ' + (ms + SF_SEARCH_MARGIN_MS) + ' ms')); h.kill('search timeout'); }, ms + SF_SEARCH_MARGIN_MS);
     h.task = t;
     try {
       const mpv = multipv || 1;
@@ -1204,13 +1253,15 @@ function spawnSfWorker(label, hashMb) {
   h.cancel = async () => {
     if (h.dead) return false;
     const t = h.task;
+    const t0 = Date.now();
     if (t) {
       t.stopped = true;
-      try { h.worker.postMessage('stop'); } catch (e) { h.kill(); return false; }
+      try { h.worker.postMessage('stop'); } catch (e) { h.kill('error'); return false; }
       const got = await Promise.race([t.promise, new Promise((r) => setTimeout(() => r(null), SF_STOP_TIMEOUT_MS))]).catch(() => null);
-      if (!got) { h.kill(); return false; }
+      if (!got) { h.kill('no bestmove after stop'); return false; }
     }
-    if (!(await h.sync(SF_STOP_TIMEOUT_MS))) { h.kill(); return false; }
+    if (!(await h.sync(SF_STOP_TIMEOUT_MS))) { h.kill('no readyok after stop'); return false; }
+    sfDbg.cancelMs.push(Date.now() - t0); if (sfDbg.cancelMs.length > 20) sfDbg.cancelMs.shift();
     return true;
   };
   h.newGame = (gen) => { h.gen = gen; try { if (h.worker && !h.dead) h.worker.postMessage('ucinewgame'); } catch (e) { /* ignore */ } };   // runs in order, before the next position
@@ -1219,16 +1270,21 @@ function spawnSfWorker(label, hashMb) {
 
 // A job worker is finished or the job was cancelled: stop it, wait for readyok (it never blocks anyone: only the worker is
 // busy), then it is a warm spare again, or it is killed when it did not answer / is no longer wanted.
+// 2.0.3: a new job may claim the worker while it is being stopped (ponderClaim): then w.releaseSeq changes and this
+// release leaves the worker to that job. One cancel at a time per worker (w.cancelP), shared by overlapping releases.
 async function sfRelease(w) {
   ponderActive = ponderActive.filter((x) => x !== w);
   if (ponderCancelling.includes(w) || w.dead) return;
   ponderCancelling.push(w);
+  const my = w.releaseSeq = (w.releaseSeq || 0) + 1;
   let ok = false;
-  try { ok = await w.cancel(); } catch (e) { ok = false; }
+  try { ok = await (w.cancelP || (w.cancelP = w.cancel().finally(() => { w.cancelP = null; }))); } catch (e) { ok = false; }
   ponderCancelling = ponderCancelling.filter((x) => x !== w);
+  if (w.releaseSeq !== my) return;                          // claimed by a new job meanwhile (its w.ready says whether the stop worked)
   if (!ok || w.dead) { w.kill(); ponderTopUp(); return; }
   ponderSpares = ponderSpares.filter((x) => !x.dead);
-  if (!ponderWanted || ponderKind !== 'sf' || w.ttMb !== ponderHashMb || ponderActive.length + ponderSpares.length + ponderCancelling.length >= ponderCap) { w.kill(); return; }
+  if (!ponderWanted || ponderKind !== 'sf' || w.ttMb !== ponderHashMb) { w.kill('not needed'); return; }
+  if (ponderActive.length + ponderSpares.length + ponderCancelling.length >= ponderCap) { w.kill('pool full after cancel'); return; }
   ponderSpares.push(w);
 }
 
@@ -1285,7 +1341,18 @@ async function runIdleSfJob(msg, token) {
 
   const work = async (w) => {
     try {
-      await w.ready;
+      try { await w.ready; } catch (e) {
+        // 2.0.3: a worker claimed while it was being stopped whose old search did not end (it was terminated): a new
+        // worker takes its place in this job (2.0.2 would have started one at once)
+        if (!w.claimedStop || token !== idleToken) throw e;
+        ponderActive = ponderActive.filter((x) => x !== w);
+        const nw = ponderSpawn();
+        ponderActive.push(nw);
+        const i = pool.indexOf(w);
+        if (i >= 0) pool[i] = nw;
+        sfDbg.claimReplaced++;
+        return work(nw);
+      }
       if (token !== idleToken) return;
       idleInfo.pondering = true;
       if (mode === 'multipv') {
@@ -1382,7 +1449,7 @@ api.runtime.onMessage.addListener((msg) => {
   if (msg && msg.type === 'hitTopUp') return hitFinal(msg.id);
   if (msg && msg.type === 'aggroIdleStatus') return Promise.resolve({ pondering: idleInfo.pondering, evalLine: idleInfo.evalLine, found: ponder.found() });
   if (msg && msg.type === 'aggroDebug') {
-    return Promise.resolve({ ponder: { ...ponder.counters, passes: ponderDbg.lastPasses, hitDepths: ponderDbg.hitDepths.slice(), harvestUpgrades: ponderDbg.harvestUpgrades, lateWaits: ponderDbg.lateWaits, lateWaitHits: ponderDbg.lateWaitHits,
+    return Promise.resolve({ ponder: { ...ponder.counters, passes: ponderDbg.lastPasses, maxPasses: ponderDbg.maxPasses, settled: { enabled: !!CV.PONDER_SETTLE, replies: ponderDbg.settled, jobsEnded: ponderDbg.settledJobs }, hitDepths: ponderDbg.hitDepths.slice(), harvestUpgrades: ponderDbg.harvestUpgrades, lateWaits: ponderDbg.lateWaits, lateWaitHits: ponderDbg.lateWaitHits,
       hitTopUp: { started: ponderDbg.topUps, used: ponderDbg.topUpUsed, changed: ponderDbg.hitChanged, depths: ponderDbg.topUpDepths.slice() },
       interrupt: { enabled: !!CV.AGGRO_INTERRUPT, mainInterruptible: !!(aggroMain && aggroMain.interruptible), stops: ponderDbg.stops, ok: ponderDbg.stopsOk, failed: ponderDbg.stopsFailed,
         stopMs: ponderDbg.stopMs.slice(), lateStops: ponderDbg.lateStops, lateStopHits: ponderDbg.lateStopHits, claimedWhileStopping: ponderDbg.claimStopping },
@@ -1392,7 +1459,7 @@ api.runtime.onMessage.addListener((msg) => {
       ponderPool: { cap: ponderCap, active: ponderActive.filter((w) => !w.dead).length, spares: ponderSpares.filter((w) => !w.dead).length, wanted: ponderWanted },
       module: { ...aggroModuleInfo, sendFailures: aggroDbg.moduleSendFailures }, ponderHashMb, ponderStepped: PONDER_STEPPED, workerStarts: aggroDbg.workerStarts, lastWorkerStart: aggroDbg.lastStart,
       stockfish: { active: sfActive, relaxedSimd: { probe: sfRelaxedOk, failed: sfDbg.rsimdFailed }, threads: sfThreadsSent, threadedFailed: sfDbg.threadedFailed, threadedStarts: sfDbg.threadedStarts, sab: sfSab, module: { ...sfModuleInfo, sendFailures: sfDbg.moduleSendFailures },
-        poolKind: ponderKind, cancelling: ponderCancelling.length, harvested: sfDbg.harvested, harvestFailed: sfDbg.harvestFailed, workerStarts: sfDbg.workerStarts, lastWorkerStart: sfDbg.lastStart, rankMode: SF_RANK_MODE,
+        poolKind: ponderKind, cancelling: ponderCancelling.length, harvested: sfDbg.harvested, harvestFailed: sfDbg.harvestFailed, kills: { ...sfDbg.kills }, cancelMs: sfDbg.cancelMs.slice(), claimedWhileStopping: sfDbg.claimedWhileStopping, claimReplaced: sfDbg.claimReplaced, overruns: sfDbg.overruns, lastOverruns: sfDbg.lastOverruns.slice(), workerStarts: sfDbg.workerStarts, lastWorkerStart: sfDbg.lastStart, rankMode: SF_RANK_MODE,
         searchMode: sfLast ? sfLast.mode : null, depthDone: sfLast ? sfLast.depthDone : null, softMs: sfLast ? sfLast.softMs : null, elapsedMs: sfLast ? sfLast.elapsedMs : null,
         lastSearch: sfLast, pvSeeds: sfDbg.pvSeeds, mainWarmMs: sfDbg.mainWarmMs === undefined ? null : sfDbg.mainWarmMs },
       aggroLastBudget: aggroDbg.lastBudget || null });

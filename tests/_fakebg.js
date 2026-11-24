@@ -48,7 +48,11 @@ function makeBackground(opts = {}) {
         const [fenPart, movesPart] = m.slice('position fen '.length).split(' moves ');
         this.pos = CV.replayUci(fenPart, movesPart ? movesPart.split(' ') : []).pos;
       } else if (m.startsWith('go')) this.go(m);
-      else if (m === 'stop') { if (this.search) setTimeout(() => this.finish(), 1); }
+      else if (m === 'stop') {
+        // 2.0.3: sfStopDelayMs = a slow stop; sfHangOnStop = the search never answers after a stop (a stuck worker)
+        if (this.search && opts.sfHangOnStop) { const s = this.search; clearTimeout(s.timer); clearTimeout(s.mt); return; }
+        if (this.search) setTimeout(() => this.finish(), opts.sfStopDelayMs || 1);
+      }
     }
     go(cmd) {
       const dMax = +((/depth (\d+)/.exec(cmd) || [])[1] || 64);
@@ -98,9 +102,12 @@ function makeBackground(opts = {}) {
         const b = best(posOf(m));
         this.thinks = (this.thinks || 0) + 1;
         const t0 = Date.now();
-        const answer = (stopped) => this.emit({ type: 'bestmove', id: m.id, uci: b, san: b, score: '0', depth: Math.max(1, Math.floor((stopped ? Date.now() - t0 : ms) / 10)), sacrifice: false, stopped });
+        // opts.aggroInstant (2.0.3): every think ends after 1 ms with a forced mate at depth 8 (a position with nothing more to find)
+        const answer = opts.aggroInstant
+          ? (stopped) => this.emit({ type: 'bestmove', id: m.id, uci: b, san: b, score: 'mate1', depth: 8, sacrifice: false, stopped })
+          : (stopped) => this.emit({ type: 'bestmove', id: m.id, uci: b, san: b, score: '0', depth: Math.max(1, Math.floor((stopped ? Date.now() - t0 : ms) / 10)), sacrifice: false, stopped });
         this.running = this.running || new Map();
-        const t = { answer, timer: setTimeout(() => { this.running.delete(m.id); answer(false); }, ms) };
+        const t = { answer, timer: setTimeout(() => { this.running.delete(m.id); answer(false); }, opts.aggroInstant ? 1 : ms) };
         this.running.set(m.id, t);
       }
     }
