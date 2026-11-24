@@ -13,10 +13,6 @@ path = "src/lib.rs"
 cozy-chess = "0.3"
 polyglot-book-rs = "0.1"
 
-[features]
-# 2.0.3 experiment, not shipped: the (768 x 3 mirrored king buckets -> 512) x 2 network (src/nnue512.rs)
-net512 = []
-
 [profile.release]
 opt-level = 3
 lto = true

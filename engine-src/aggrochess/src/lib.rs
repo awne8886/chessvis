@@ -24,7 +24,7 @@ macro_rules! out {
 pub mod book;
 pub mod eval;
 pub mod matesearch;
-#[rustfmt::skip] #[cfg_attr(feature = "net512", path = "nnue512.rs")] pub mod nnue; // 2.0.3: see the end of the file
+pub mod nnue;
 pub mod search;
 pub mod web_clock;
 
@@ -479,66 +479,4 @@ pub extern "C" fn clear_hash() {
 pub extern "C" fn last_info() -> u32 {
     let s = LAST_INFO.lock().unwrap().clone();
     write_output(&s)
-}
-
-// ChessVision 2.0.3 experiment, not shipped. The main network is 4.6.1's (768 -> 256) x 2 (src/nnue.rs) by default.
-// `--features net512` (tools/build-aggrochess.sh --net512 --out DIR) builds src/nnue512.rs as `nnue` instead: the
-// (768 x 3 mirrored king buckets -> 512) x 2 network with a Finny table (aggro-768x3hm-512.nnue; README.md, "The 2.0.3
-// network"); it lost to 4.6.1's network at equal time per move. Everything for it is placed so that the default build
-// stays byte-identical to the shipped binaries: panic locations carry line numbers, so the switch is on the line of
-// `pub mod nnue;` and nothing else above this comment moved.
-
-/// Tests only (ChessVision 2.0.3, `net512` builds): the main net's raw output for the current position (side to move's
-/// view, before OUT_SCALE), built from scratch.
-#[cfg(feature = "net512")]
-#[no_mangle]
-pub extern "C" fn nn_eval_raw() -> i32 {
-    with_game(|g| {
-        let mut a = nnue::Accumulator::default();
-        a.refresh_scratch(&g.board);
-        a.evaluate_raw(&g.board)
-    })
-}
-
-/// Tests only (ChessVision 2.0.3, `net512` builds): plays `games` random games of up to `plies` moves from the current
-/// position and checks every incrementally updated accumulator (through the Finny table on king moves) against one built
-/// from scratch, and the Finny-table refresh against it too. Returns the number of mismatching positions (0 = all exact).
-#[cfg(feature = "net512")]
-#[no_mangle]
-pub extern "C" fn nnue_selftest(games: u32, plies: u32, seed: u32) -> u32 {
-    let start = with_game(|g| g.board.clone());
-    let mut s = u64::from(seed) | 1;
-    let mut rnd = |n: usize| {
-        s ^= s << 13;
-        s ^= s >> 7;
-        s ^= s << 17;
-        (s % n as u64) as usize
-    };
-    let mut bad = 0;
-    for _ in 0..games {
-        let mut board = start.clone();
-        let mut acc = nnue::Accumulator::default();
-        acc.refresh(&board);
-        for _ in 0..plies {
-            let moves = legal_moves_of(&board);
-            if moves.is_empty() {
-                break;
-            }
-            // prefer king moves now and then, so bucket and mirror changes are frequent
-            let kings: Vec<Move> = moves.iter().copied().filter(|m| board.piece_on(m.from) == Some(Piece::King)).collect();
-            let mv = if !kings.is_empty() && rnd(3) == 0 { kings[rnd(kings.len())] } else { moves[rnd(moves.len())] };
-            let mut next = nnue::Accumulator::default();
-            next.apply_from(&acc, &board, mv);
-            board.play_unchecked(mv);
-            let mut scratch = nnue::Accumulator::default();
-            scratch.refresh_scratch(&board);
-            let mut finny = nnue::Accumulator::default();
-            finny.refresh(&board);
-            if next.v != scratch.v || finny.v != scratch.v {
-                bad += 1;
-            }
-            acc = next;
-        }
-    }
-    bad
 }
