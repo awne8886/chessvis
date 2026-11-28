@@ -202,8 +202,9 @@
   }
 
   // ---------- Input: pointer events ----------
-  function squareCenter(file, rank) {
-    const rect = board.getBoundingClientRect();
+  // rect (2.0.4, D2): the board's rect, read once per move by movePoints (else read here, as in 2.0.3)
+  function squareCenter(file, rank, rect) {
+    rect = rect || board.getBoundingClientRect();
     const s = rect.width / 8;
     const flipped = board.classList.contains('flipped');
     const x = flipped ? (8 - file + 0.5) * s : (file - 0.5) * s;
@@ -212,10 +213,10 @@
   }
 
   // Click target inside a square; off-centre (centre-weighted) when "Off-centre clicks" is on.
-  function squarePoint(file, rank) {
-    const [cx, cy] = squareCenter(file, rank);
+  function squarePoint(file, rank, rect) {
+    const [cx, cy] = squareCenter(file, rank, rect);
     if (!(hum() && cfg.clickOffset)) return { x: cx, y: cy };
-    const s = board.getBoundingClientRect().width / 8;
+    const s = (rect || board.getBoundingClientRect()).width / 8;
     const off = () => (Math.random() + Math.random() - 1) * 0.32 * s;
     return { x: cx + off(), y: cy + off() };
   }
@@ -233,8 +234,15 @@
 
   // The synthetic events never depend on the real cursor, so the panel is skipped when choosing the target
   // (a panel dragged over the board must not swallow the moves).
+  // 2.0.4 (D2): elementFromPoint first: it is the first element elementsFromPoint would list, and only a hit on the panel
+  // (its shadow root retargets to ui.host) or on nothing needs the full list. The same element as before for every
+  // point (checked in Chromium, tests/bench-hittest.js). CV.CHEAP_HIT_TEST = false: always elementsFromPoint (2.0.3).
   const targetAt = (x, y) => {
     const host = ui && ui.host;
+    if (CV.CHEAP_HIT_TEST && document.elementFromPoint) {
+      const top = document.elementFromPoint(x, y);
+      if (top && top !== host) return top;
+    }
     if (document.elementsFromPoint) return document.elementsFromPoint(x, y).find((el) => el !== host) || board;
     return document.elementFromPoint(x, y) || board;
   };
@@ -247,10 +255,10 @@
   }
 
   // Moves the cursor to (x, y): along a curved path when enabled, otherwise it just appears there.
-  async function glideTo(x, y, buttons = 0, linearSteps) {
+  async function glideTo(x, y, buttons = 0, linearSteps, rect) {
     if (!(hum() && cfg.mouseMove) && !linearSteps) { mouse = { x, y }; return; }
     if (mouse.x === null) {
-      const r = board.getBoundingClientRect();
+      const r = rect || board.getBoundingClientRect();
       mouse = { x: Math.min(innerWidth - 5, Math.max(5, r.left + rand(0.1, 0.9) * r.width)), y: Math.min(innerHeight - 5, r.bottom + rand(20, 120)) };
     }
     if (mouse.x === x && mouse.y === y) return;                  // already there (aimMove glided during the pause): no empty path
@@ -274,51 +282,53 @@
     if (click) fire(el, 'click', x, y);
   }
 
-  async function clickAt(x, y) {
-    await glideTo(x, y);
+  async function clickAt(x, y, rect) {
+    await glideTo(x, y, 0, undefined, rect);
     await pressAt(x, y);
     await sleep(hum() ? (fast ? rand(25, 60) : rand(35, 95)) : 15);
     await releaseAt(x, y, true);
     await sleep(hum() ? 0 : 15);
   }
 
-  async function dragFromTo(a, b) {
-    await glideTo(a.x, a.y);
+  async function dragFromTo(a, b, rect) {
+    await glideTo(a.x, a.y, 0, undefined, rect);
     await pressAt(a.x, a.y);
     await sleep(fast ? rand(30, 70) : rand(60, 130));
-    await glideTo(b.x, b.y, 1, 6);
+    await glideTo(b.x, b.y, 1, 6, rect);
     await sleep(rand(20, 60));
     await releaseAt(b.x, b.y, false);
   }
 
   // The click points of a move, computed once (off-centre points are random, so aim and finish must use the same ones).
+  // 2.0.4 (D2): the board's rect is read once per move and passed down (2.0.3 read it for every point).
   function movePoints(uci) {
     const f1 = FILES.indexOf(uci[0]) + 1, r1 = +uci[1];
     const f2 = FILES.indexOf(uci[2]) + 1, r2 = +uci[3];
-    return { from: squarePoint(f1, r1), to: squarePoint(f2, r2) };
+    const rect = CV.CHEAP_HIT_TEST ? board.getBoundingClientRect() : undefined;
+    return { from: squarePoint(f1, r1, rect), to: squarePoint(f2, r2, rect), rect };
   }
 
   // 2.0.0: the cursor glides to the from-square while the human-like pause runs (play() does both at once), then
   // finishMove presses / clicks / drags from there. Returns the points for finishMove.
   async function aimMove(uci) {
     const pts = movePoints(uci);
-    await glideTo(pts.from.x, pts.from.y);
+    await glideTo(pts.from.x, pts.from.y, 0, undefined, pts.rect);
     return pts;
   }
 
   async function finishMove(pts, uci, color) {
-    const { from, to } = pts;
+    const { from, to, rect } = pts;
     let mode = CV.human.pickInput(cfg);
     if (mode === 'drag' && dragDisabled) mode = 'click';   // drag did not register earlier
     lastMode = mode;
     log('input method:', mode);
 
     if (mode === 'drag') {
-      await dragFromTo(from, to);
+      await dragFromTo(from, to, rect);
     } else {
-      await clickAt(from.x, from.y);
+      await clickAt(from.x, from.y, rect);
       await sleep(hum() ? (fast ? rand(50, 130) : rand(110, 340)) : rand(80, 160));
-      await clickAt(to.x, to.y);
+      await clickAt(to.x, to.y, rect);
     }
     if (uci.length === 5) { // promotion
       await sleep(hum() ? (fast ? rand(150, 260) : rand(250, 520)) : 300);
