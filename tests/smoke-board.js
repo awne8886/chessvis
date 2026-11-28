@@ -21,6 +21,7 @@ try { ({ JSDOM } = require('jsdom')); } catch (e) {
 const fs = require('fs');
 const path = require('path');
 const { makeBackground, sleep, CV } = require('./_fakebg');
+require('../ponderstats.js');                 // PONDER_STATS (temporary): CV.ponderStatsParse for --ponder-stats
 
 const ROOT = path.join(__dirname, '..');
 const args = process.argv.slice(2);
@@ -120,6 +121,13 @@ async function game({ engine, debounce, steps, watchdogMs, watchdogStable, moves
   while (ourMoves < maxMoves && Date.now() < deadline && !CV.chess.gameState(pos)) await sleep(50);
   await sleep(300);
   const info = JSON.parse(await overlayOpts.onDebug());
+  // PONDER_STATS (temporary) begin: --ponder-stats prints the recorder's records of this game (page fields included)
+  if (args.includes('--ponder-stats')) {
+    await bg.send({ type: 'ponderStats', op: 'gameEnd' });
+    const ex = await bg.send({ type: 'ponderStats', op: 'export' });
+    for (const sec of CV.ponderStatsParse(ex.text)) for (const r of sec.records) console.log(JSON.stringify({ w: sec.run.w, t: sec.run.t, b: sec.run.b, ...r, at: undefined }));
+  }
+  // PONDER_STATS (temporary) end
   window.close();
   await bg.send({ type: 'aggroInvalidate' });
   const p = info.background.ponder;

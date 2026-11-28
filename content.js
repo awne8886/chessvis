@@ -53,6 +53,35 @@
   let fast = false;                // true while executing a quick reply: faster hand, shorter pauses
   let ui = null;
   let wfoShown = false;            // 2.0.4: the status line shows the waiting state (a pushed ponder status may update it)
+  // PONDER_STATS (temporary) begin
+  // 2.0.6 (D): what only the page knows, for the background's ponder-stats records: when our move and the opponent's move
+  // were seen on the board (tracker 'ply' events), the history key of the position we last played from, our latency for
+  // it (sent with the next message: `prev`), and this game's clock (the first readable one, in s). Never used for play.
+  let psLandedAt = null, psOppAt = null, psOppMs = null, psLastKey = null, psPrev = null, psClockSec = null;
+  function psPly(ev) {
+    const now = Date.now(), mine = board && board.classList.contains('flipped') ? 'b' : 'w';
+    if (ev.color === mine) {
+      if (psOppAt !== null && psLastKey) psPrev = { key: psLastKey, latMs: now - psOppAt };
+      psLandedAt = now; psOppAt = null;
+    } else {
+      psOppAt = now; psOppMs = psLandedAt !== null ? now - psLandedAt : null;
+    }
+  }
+  function psReset(newGame) { psLandedAt = null; psOppAt = null; psOppMs = null; psLastKey = null; if (newGame) psClockSec = null; }
+  // the `ps` field of a message (null when the recorder is off); `prev` is sent once
+  function psFields(pos) {
+    if (!CV.PONDER_STATS) return undefined;
+    if (psClockSec === null && pos) {
+      try { const c = readClocks(pos.myColor), ms = Math.max(c.me ? c.me.ms : 0, c.opp ? c.opp.ms : 0); if (ms > 0) psClockSec = Math.round(ms / 1000); } catch (e) { /* no clock */ }
+    }
+    const sfE = cfg.engine === 'stockfish';
+    const out = { oppMs: psOppMs, clockSec: psClockSec, prev: psPrev,
+      ws: sfE ? cfg.sfPonderWorkers : cfg.aggroPonderWorkers, pm: sfE ? cfg.sfPonderMs : cfg.aggroPonderMs, px: cfg.ponderUntilMove ? cfg.ponderMaxMs : 0,
+      ph: sfE ? cfg.sfPonderHashMb : cfg.aggroPonderHashMb, mh: sfE ? cfg.sfHashMb : null, sm: sfE ? cfg.sfSearchMode : (cfg.aggroUseClock ? 'clock' : 'think') };
+    psPrev = null;
+    return out;
+  }
+  // PONDER_STATS (temporary) end
 
   const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
   const rand = (a, b) => a + Math.random() * (b - a);
@@ -151,6 +180,15 @@
   }
 
   function handleTrackerEvent(ev) {
+    // PONDER_STATS (temporary) begin
+    if (CV.PONDER_STATS) {
+      if (ev.type === 'ply') psPly(ev);
+      else if (ev.type === 'newGame' || ev.type === 'takeback' || ev.type === 'reset') {
+        if (ev.type === 'newGame' && psPrev) api.runtime.sendMessage({ type: 'ponderStats', op: 'note', ps: { prev: psPrev } }).catch(() => {});
+        psPrev = null; psReset(ev.type === 'newGame');
+      }
+    }
+    // PONDER_STATS (temporary) end
     if (ev.type === 'newGame') {
       rights = BS.freshRights();
       if (lastGrid) rights = BS.updateRights(rights, lastGrid);
@@ -493,6 +531,7 @@
       sfMaxMs: p.sfCap,
       sfSearchMode: quick ? 'depth' : (p.searchMode || cfg.sfSearchMode), softMs: quick ? 0 : (softMs || 0), uciClock: quick ? undefined : p.uciClock, spentMs: quick ? 0 : (p.spentMs || 0),
       hitSoftMs: quick ? 0 : (hitSoftMs || 0),
+      ps: psFields(pos),                                                  // PONDER_STATS (temporary)
     });
   }
 
@@ -548,6 +587,9 @@
 
       if (cfg.quickReplies && cfg.quickOnlyMove && legal.length === 1) {
         uci = legal[0].uci; category = 'only';            // forced: no need to ask the engine
+        // PONDER_STATS (temporary) begin
+        if (CV.PONDER_STATS && ponderOn()) { const h = histFor(pos); if (h) api.runtime.sendMessage({ type: 'ponderStats', op: 'skipped', engine: cfg.engine, startFen: h.startFen, moves: h.moves.slice(), ps: psFields(pos) }).catch(() => {}); }
+        // PONDER_STATS (temporary) end
       } else {
         const likely = CV.human.likelyObvious(parsed, legal, ctx, cfg);
         setStatus(likely ? 'quick look (' + engineName + ')\u2026' : 'thinking (' + engineName + ')\u2026', 'on');
@@ -638,6 +680,7 @@
 
       const mv = byUci(uci);
       ownMove = { afterCount: pos.count - (mv && mv.capture ? 1 : 0) };
+      if (CV.PONDER_STATS) { const h = histFor(pos); psLastKey = h ? CV.ponderKey(h.startFen, h.moves) : null; }   // PONDER_STATS (temporary)
       // remember what is being played; it counts only if the board then shows exactly this move from this position
       rec.noteBotMove({ fen: pos.fen, uci, color: pos.myColor, sacrifice, engine: cfg.engine, flagKnown: cfg.engine === 'aggro' && category !== 'only' });
       if (pts) await finishMove(pts, uci, pos.myColor);
@@ -803,6 +846,9 @@
     const result = over === 'checkmate' ? (pos.turn === 'w' ? '0-1' : '1-0') : over === 'stalemate' ? '1/2-1/2' : '*';
     const game = rec.end(result);
     if (!game) return;
+    // PONDER_STATS (temporary) begin
+    if (CV.PONDER_STATS) { api.runtime.sendMessage({ type: 'ponderStats', op: 'gameEnd', ps: { prev: psPrev } }).catch(() => {}); psPrev = null; }
+    // PONDER_STATS (temporary) end
     const names = readNames() || game.meta.names;
     const save = (brilliants) => {
       const record = rec.build(game, { cfg, result, myColor: pos.myColor, names, brilliants });
@@ -1022,6 +1068,9 @@
     onSaveNow: () => saveCurrentNow().catch((e) => 'Could not save: ' + (e && e.message || e)),
     onListGames: async () => { const g = await api.runtime.sendMessage({ type: 'listGames' }); return Array.isArray(g) ? g : []; },
     onClearGames: () => api.runtime.sendMessage({ type: 'clearGames' }),
+    // PONDER_STATS (temporary) begin
+    onPonderStats: CV.PONDER_STATS ? (op) => api.runtime.sendMessage({ type: 'ponderStats', op }) : null,
+    // PONDER_STATS (temporary) end
     onReset() {
       const keep = { overlayOpen: cfg.overlayOpen, overlayX: cfg.overlayX, overlayY: cfg.overlayY };
       const fresh = { ...CV.DEFAULTS, ...keep };
@@ -1045,6 +1094,7 @@
     const keys = Object.keys(changes);
     if (keys.some(CV.isSavedGameKey) && ui) ui.gamesChanged();
     if (keys.every(CV.isSavedGameKey)) return;
+    if (CV.isPonderStatsKey && keys.every((k) => CV.isSavedGameKey(k) || CV.isPonderStatsKey(k))) return;   // PONDER_STATS (temporary)
     const next = {};
     for (const k in changes) next[k] = changes[k].newValue;
     // 2.0.4 (C1): the echo of this tab's own write (every value already equals cfg): nothing to apply or re-render

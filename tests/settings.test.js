@@ -106,5 +106,12 @@ test('2.0.6: the threaded builds to try: relaxed SIMD first, then npm; failures 
   assert.strictEqual(CV.SF_MAIN_WAIT_STOP_MS, 0);
 });
 
+// PONDER_STATS (temporary) begin
+test('2.0.6: the ponder-stats keys (temporary) are not settings', () => {
+  assert.strictEqual(CV.PONDER_STATS, true);
+  assert.ok(CV.isPonderStatsKey('ponderStats') && CV.isPonderStatsKey('ponderStats:g12') && !CV.isPonderStatsKey('ponderStatsX') && !CV.isPonderStatsKey('sfHashMb'));
+  assert.deepStrictEqual(CV.sanitize({ ponderStats: { v: 1 } }), {});
+});
+// PONDER_STATS (temporary) end
 
 run();

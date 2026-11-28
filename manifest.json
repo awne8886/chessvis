@@ -23,6 +23,7 @@
     "scripts": [
       "settings.js",
       "chessmini.js",
+      "ponderstats.js",
       "background.js"
     ]
   },

@@ -6,6 +6,7 @@ const { runner } = require('./_load');
 const { makeBackground, makeStorage, sleep, CV, best } = require('./_fakebg');
 const fs = require('fs');
 const path = require('path');
+require('../ponderstats.js');                 // PONDER_STATS (temporary): CV.ponderStats* for the recorder tests
 const { test, run } = runner('background-sim');
 const START = CV.STANDARD_START_FEN;
 const after = (moves) => CV.replayUci(START, moves).pos;
@@ -632,5 +633,86 @@ test('A3: with CV.SF_MAIN_WAIT_STOP_MS the main go waits for the stopping ponder
   assert.strictEqual(CV.SF_MAIN_WAIT_STOP_MS, 0, 'measured: no gain in Chromium (docs/REFERENCE.md 2.0.6), so 2.0.5 behaviour');
 });
 
+// PONDER_STATS (temporary) begin
+// ---- 2.0.6 (D): the ponder-stats recorder ----
+// One simulated game: early ponder after each of our moves, the opponent answers after `think` ms with the predicted
+// move or another one, our next search asks with the page's ps fields.
+async function statsGame(bg, opts) {
+  const plies = [['e2e4', 'e7e5'], ['g1f3', 'b8c6'], ['f1c4', 'g8f6'], ['d2d3', 'f8c5'], ['e1g1', 'd7d6']];
+  const out = [];
+  let moves = [], prev = null;
+  for (let i = 0; i < plies.length; i++) {
+    const [ours, theirs] = plies[i];
+    const t0 = Date.now();
+    const r = await analyzeSf(bg, moves, { ponder: true, sfSearchMode: 'depth', depth: 6, ps: { oppMs: i ? 150 : null, clockSec: 60, prev, ws: 2, pm: 3000, px: 5000, ph: 16, mh: 32, sm: 'depth' } });
+    out.push({ uci: r.uci, ponderHit: !!r.ponderHit, depth: r.depth, ms: Date.now() - t0 });
+    moves = [...moves, ours];
+    await bg.send(sfIdle(moves, { ponderWorkers: 2, sfSearchMode: 'depth', depth: 6 }));
+    await sleep(i % 2 ? 40 : 150);
+    prev = { key: CV.ponderKey(START, moves.slice(0, -1)), latMs: 100 + i };
+    moves = [...moves, theirs];
+  }
+  await bg.send({ type: 'ponderStats', op: 'gameEnd', ps: { prev } });
+  await bg.send({ type: 'aggroInvalidate' });
+  return out;
+}
+test('D: CV.PONDER_STATS on and off play the same moves at the same speed; only the storage writes differ', async () => {
+  const sOn = makeStorage(), sOff = makeStorage();
+  const on = makeBackground({ stepMs: 2, storage: sOn }), off = makeBackground({ stepMs: 2, storage: sOff, setup: 'CV.PONDER_STATS = false' });
+  const a = await statsGame(on, {}), b = await statsGame(off, {});
+  assert.deepStrictEqual(a.map(({ uci, ponderHit, depth }) => ({ uci, ponderHit, depth })), b.map(({ uci, ponderHit, depth }) => ({ uci, ponderHit, depth })));
+  for (let i = 0; i < a.length; i++) assert.ok(Math.abs(a[i].ms - b[i].ms) < 40, 'move ' + i + ': ' + a[i].ms + ' vs ' + b[i].ms + ' ms');
+  assert.deepStrictEqual(mainCmds(on), mainCmds(off), 'the main worker got the same commands');
+  assert.ok(Object.keys(sOn.data).some((k) => k.startsWith('ponderStats')), 'on: written');
+  assert.deepStrictEqual(Object.keys(sOff.data), [], 'off: nothing written');
+  const r = await off.send({ type: 'ponderStats', op: 'status' });
+  assert.strictEqual(r.ok, false, 'off: no recorder');
+});
+test('D: records (decision, depths, lead, rank, latency, kills), one write per game end, export / summary / reset, survives a reload', async () => {
+  const storage = makeStorage();
+  const bg = makeBackground({ stepMs: 2, storage });
+  const setsBefore = storage.counts.set;
+  await statsGame(bg, {});
+  await sleep(20);
+  assert.ok(storage.counts.set - setsBefore <= 2, 'not one write per move: ' + (storage.counts.set - setsBefore));
+  const idx = storage.data.ponderStats;
+  assert.ok(idx && idx.v === 1 && idx.games.length === 1 && idx.games[0].n === 5, JSON.stringify(idx));
+  const recs = storage.data['ponderStats:g1'].recs;
+  assert.strictEqual(recs.length, 5);
+  assert.strictEqual(recs[0].d, 'none', 'the first move: no ponder job yet');
+  for (const x of recs.slice(1)) {
+    assert.ok(['hit', 'late', 'miss'].includes(x.d), JSON.stringify(x));
+    assert.ok(x.lm > 0 && x.ot === 150, JSON.stringify(x));
+    if (x.d === 'hit') assert.ok(x.hd >= 1 && x.md === undefined, JSON.stringify(x)); else assert.ok(x.md >= 1, JSON.stringify(x));
+  }
+  assert.ok(recs.slice(1).some((x) => x.rk !== undefined), 'ranks: ' + JSON.stringify(recs.map((x) => x.rk)));
+  assert.deepStrictEqual(recs.map((x) => x.lat), [100, 101, 102, 103, 104], 'latency of each move arrives with the next message');
+  const run0 = CV.ponderStatsRunOf(idx.runs[recs[1].r]);
+  assert.deepStrictEqual([run0.e, run0.w, run0.ws, run0.t, run0.pm, run0.px, run0.ph, run0.mh, run0.sm, run0.b], ['sf', 2, 2, 1, 3000, 5000, 16, 32, 'depth', 'stockfish-19-lite-single.js']);
+  // a skipped move (only legal move: no engine) and the status
+  await bg.send({ type: 'aggroClear' });
+  await bg.send({ type: 'ponderStats', op: 'skipped', engine: 'stockfish', startFen: START, moves: ['e2e4'], ps: { oppMs: 90, ws: 2, pm: 3000, px: 5000, ph: 16, mh: 32, sm: 'depth' } });
+  const st = await bg.send({ type: 'ponderStats', op: 'status' });
+  assert.deepStrictEqual([st.records, st.games, st.workers], [6, 2, 2]);
+  // export: one text file; summary
+  const ex = await bg.send({ type: 'ponderStats', op: 'export' });
+  assert.ok(ex.ok && /^# ChessVision ponder stats/.test(ex.text) && ex.text.includes('=== workers: 2 (run 1, engine sf'), ex.text.split('\n').filter((l) => l.startsWith('===')).join('\n'));
+  const parsed = CV.ponderStatsParse(ex.text);
+  assert.strictEqual(parsed.reduce((n, s) => n + s.records.length, 0), 6);
+  assert.ok(parsed[0].records.some((x) => x.d === 'skipped' && x.g === 2));
+  assert.ok((await bg.send({ type: 'ponderStats', op: 'summary' })).text.startsWith('workers | run | engine'));
+  // reload: a new background page on the same storage keeps everything and numbers new games after the old ones
+  const bg2 = makeBackground({ stepMs: 2, storage });
+  await analyzeSf(bg2, [], { ponder: true, sfSearchMode: 'depth', depth: 4, ps: { clockSec: 180, ws: 2, pm: 3000, px: 5000, ph: 16, mh: 32, sm: 'depth' } });
+  await bg2.send({ type: 'ponderStats', op: 'gameEnd' });
+  const st2 = await bg2.send({ type: 'ponderStats', op: 'status' });
+  assert.deepStrictEqual([st2.records, st2.games], [7, 3]);
+  assert.strictEqual(storage.data['ponderStats:g3'].c, 180);
+  // reset
+  await bg2.send({ type: 'ponderStats', op: 'reset' });
+  assert.deepStrictEqual(Object.keys(storage.data).filter((k) => k.startsWith('ponderStats')), []);
+  assert.deepStrictEqual((await bg2.send({ type: 'ponderStats', op: 'status' })).records, 0);
+});
+// PONDER_STATS (temporary) end
 
 run();

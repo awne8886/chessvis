@@ -185,6 +185,45 @@ details[open] summary .arrow { transform: rotate(90deg); }
         el('button', { class: 'btn', type: 'button', onclick: () => { opts.onReset(); flash('Settings reset'); } }, 'Reset settings')),
       importBox, msg,
       el('p', { class: 'note' }, 'Export/Import skip Auto-play, the panel position and saved games. Clear engine memory empties AggroChess\u2019s hash and starts a new game in Stockfish. Debug info contains settings and board state, no account data.'));
+    // PONDER_STATS (temporary) begin
+    // 2.0.6 (D): "Ponder stats (temporary)" next to Copy debug info: one text file with every run, divided by the ponder
+    // worker count (ponderstats.js); only when CV.PONDER_STATS is on (content.js passes onPonderStats).
+    if (opts.onPonderStats) {
+      const psLine = el('p', { class: 'note' }, 'Ponder stats: \u2026');
+      const psDay = () => { const d = new Date(); return d.getFullYear() + '-' + String(d.getMonth() + 1).padStart(2, '0') + '-' + String(d.getDate()).padStart(2, '0'); };
+      const psStatus = async () => {
+        try {
+          const r = await opts.onPonderStats('status');
+          psLine.textContent = r && r.ok ? 'Ponder stats: ' + r.records + ' records, ' + r.games + ' games' + (r.dropped ? ' (' + r.dropped + ' oldest dropped)' : '') + ' \u00b7 workers now ' + r.workers : 'Ponder stats: ' + ((r && r.error) || 'no answer');
+        } catch (e) { psLine.textContent = 'Ponder stats: ' + ((e && e.message) || e); }
+      };
+      let psArmed = false, psArmTimer = null;
+      const psResetBtn = el('button', { class: 'btn', type: 'button' }, 'Reset stats');
+      const psDisarm = () => { psArmed = false; psResetBtn.textContent = 'Reset stats'; clearTimeout(psArmTimer); };
+      psResetBtn.addEventListener('click', async () => {
+        if (!psArmed) { psArmed = true; psResetBtn.textContent = 'Click again to confirm'; psArmTimer = setTimeout(psDisarm, 4000); return; }
+        psDisarm();
+        await opts.onPonderStats('reset');
+        flash('Ponder stats cleared'); psStatus();
+      });
+      const psDet = el('details', {}, el('summary', {}, el('span', {}, el('span', { class: 'arrow' }, '\u25b8'), 'Ponder stats (temporary)')),
+        el('div', { class: 'btns' },
+          el('button', { class: 'btn', type: 'button', onclick: async () => {
+            const r = await opts.onPonderStats('export');
+            if (!r || !r.ok) { flash('Ponder stats: ' + ((r && r.error) || 'no answer')); return; }
+            await downloadOrCopy('chessvision-ponder-stats-' + psDay() + '.txt', r.text, { type: 'text/plain', flash, ok: 'Download started (' + r.records + ' records; if nothing was saved, use Copy summary)', failed: 'Download failed \u2013 stats copied instead' });
+            psStatus();
+          } }, 'Download stats'),
+          el('button', { class: 'btn', type: 'button', onclick: async () => {
+            const r = await opts.onPonderStats('summary');
+            if (r && r.ok) await copyOrShow(r.text, 'Summary copied'); else flash('Ponder stats: ' + ((r && r.error) || 'no answer'));
+          } }, 'Copy summary'),
+          psResetBtn),
+        psLine);
+      psDet.addEventListener('toggle', () => { if (psDet.open) psStatus(); });
+      toolsBox.append(psDet);
+    }
+    // PONDER_STATS (temporary) end
 
 
     // ---- AggroChess options (visible only for AggroChess) ----

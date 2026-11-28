@@ -405,6 +405,7 @@ async function analyzeStockfishNow(fen, depth, imperfection, maxMs, startFen, mo
   else {
     const hist = typeof startFen === 'string' && Array.isArray(moves);
     const d = ponder.decide(hist ? startFen : null, hist ? moves : null);
+    psDecide('sf', msg, d, hist ? startFen : null, hist ? moves : null);      // PONDER_STATS (temporary)
     if (d.decision === 'hit') {
       // 2.0.0 harvest upgrade: a deepening pass may be searching exactly this move right now and already be deeper than the
       // stored reply. Stop it and use its bestmove if it answers within SF_HARVEST_MS; otherwise the stored reply.
@@ -1160,6 +1161,7 @@ async function runIdleJob(msg, token) {
     if (rankedList || !rank.ended || rank.pending > 0) return;
     rankedList = legal.map((m) => m.uci).filter((u) => scoreOf.get(u) !== null)
       .sort((x, y) => (scoreOf.has(x) ? scoreOf.get(x) : Infinity) - (scoreOf.has(y) ? scoreOf.get(y) : Infinity));
+    psRanked(token, rankedList);                               // PONDER_STATS (temporary)
     resolveRanked();
   };
   const rankClaim = () => {
@@ -1259,6 +1261,7 @@ function aggroIdle(msg) {
   ponderCancel();
   const token = idleToken;
   if (!(msg.ponder || msg.showEval) || typeof msg.startFen !== 'string' || !Array.isArray(msg.moves)) return { state: 'off' };
+  if (msg.ponder) psJobStart(msg, token);                      // PONDER_STATS (temporary)
   runIdle(msg, token).catch((e) => { if (token === idleToken) console.error('[ChessVision] AggroChess idle job failed', e); });
   return { state: 'started' };
 }
@@ -1294,6 +1297,7 @@ async function analyzeAggroNow(msg) {
     if (!msg.ponder) ponderCancel();
     else {
       const d = ponder.decide(hist ? msg.startFen : null, hist ? msg.moves : null);
+      psDecide('aggro', msg, d, hist ? msg.startFen : null, hist ? msg.moves : null);   // PONDER_STATS (temporary)
       if (d.decision === 'hit') {
         ponderStop(); const e = d.result; noteHitDepth(e.depth);
         const res = { uci: e.uci, best: e.uci, san: e.san, sacrifice: e.sacrifice, depth: e.depth, ponderHit: true };
@@ -1526,6 +1530,7 @@ async function runIdleSfJob(msg, token) {
   const setRanked = (list) => {
     if (rankedList) return;
     rankedList = CV.moveFirst(list, predicted);
+    psRanked(token, rankedList);                               // PONDER_STATS (temporary)
     resolveRanked();
   };
   if (mode === 'single') setRanked(legal.slice());
@@ -1611,6 +1616,7 @@ function sfIdle(msg) {
   ponderCancel();
   const token = idleToken;
   if (!msg.ponder || typeof msg.startFen !== 'string' || !Array.isArray(msg.moves)) return { state: 'off' };
+  psJobStart(msg, token);                                      // PONDER_STATS (temporary)
   runIdleSf(msg, token).catch((e) => { if (token === idleToken) console.error('[ChessVision] Stockfish idle job failed', e); });
   return { state: 'started' };
 }
@@ -1754,11 +1760,220 @@ function migrateAtStart() {
   gameSerial(migrateSavedGames).catch((e) => { gameDbg.migrateError = String((e && e.message) || e); console.error('[ChessVision] saved games migration failed (will retry)', e); });
 }
 
+// PONDER_STATS (temporary) begin
+// ======================= Ponder stats recorder (2.0.6, D; temporary) =======================
+// One record per ponder decision (hit / late / miss / none from ponder.decide(), skipped = our move needed no engine),
+// with the run's settings, the depths, the lead time, the rank of the opponent's move in the job's ranked list and the
+// kills since the previous record; the page adds what only it knows (the opponent's think time, our move latency, the
+// clock, the ponder settings) in a `ps` field of its next message. Nothing here changes a search: it reads state only.
+// Storage (2.0.4 discipline): an index under CV.PONDER_STATS_KEY ({ v, nextGame, dropped, droppedGames, runs, games:
+// [{ g, c, at, n, bytes }] }) and one key per game (CV.PONDER_STATS_KEY + ':g' + n: { g, c, at, recs }), written at a game
+// end and at most every PS_WRITE_MS (never per move); a write carries the index and the games that changed only (one key
+// for everything would rewrite up to 5 MB, and send it to every chess.com tab in storage.onChanged, every 10 s). Finished
+// games leave memory once written. Read once on the first use and merged with what was recorded meanwhile
+// (CV.ponderStatsMerge). Capped at CV.PONDER_STATS_MAX_RECORDS / _MAX_BYTES (oldest whole games dropped and counted).
+const PS_WRITE_MS = 10000;
+const psOn = () => !!CV.PONDER_STATS && typeof CV.ponderStatsNew === 'function' && !!(api.storage && api.storage.local);
+const psGameKey = (g) => CV.PONDER_STATS_KEY + ':g' + g;
+let psStore = null, psLoadP = null, psLoaded = false, psCur = null, psTimer = null, psChain = Promise.resolve();
+const psDirty = new Set();                 // game numbers to write
+const psByKey = new Map();                 // history key -> record, current game only (a quick look + full search = one record)
+let psJob = null;                          // the latest ponder job: { key, token, startedAt, ranked }
+let psKillsPrev = null;
+const psStoreNow = () => psStore || (psStore = CV.ponderStatsNew());
+const psSerial = (fn) => { const p = psChain.then(fn); psChain = p.catch(() => {}); return p; };
+function psLoad() {
+  if (!psLoadP) {
+    psLoadP = (async () => {
+      let stored = null;
+      try { stored = (await api.storage.local.get(CV.PONDER_STATS_KEY))[CV.PONDER_STATS_KEY] || null; } catch (e) { stored = null; }
+      const live = psStoreNow();
+      const { store, map } = CV.ponderStatsMerge(stored, live);
+      for (const g of store.games) if (!g.recs) g.recs = null;   // stored games stay in storage (index entries only)
+      psStore = store; psLoaded = true;
+      if (psCur !== null && map[psCur] !== undefined) psCur = map[psCur];
+      psDirty.clear(); for (const g of store.games) if (g.recs) psDirty.add(g.g);
+    })();
+  }
+  return psLoadP;
+}
+const psKey = (startFen, moves) => (typeof startFen === 'string' && Array.isArray(moves) ? CV.ponderKey(startFen, moves) : null);
+function psKillsDelta() {
+  const now = { ...sfDbg.kills };
+  if (ponderDbg.aggroKilled) now['aggro killed'] = ponderDbg.aggroKilled;
+  const prev = psKillsPrev || {};
+  const d = {};
+  for (const k of Object.keys(now)) if (now[k] > (prev[k] || 0)) d[k] = now[k] - (prev[k] || 0);
+  psKillsPrev = now;
+  return d;
+}
+// the page's fields: latency of our previous move, the clock of this game
+function psFromPage(ps) {
+  if (!ps || typeof ps !== 'object') return;
+  if (ps.prev && ps.prev.key && Number.isFinite(Number(ps.prev.latMs))) {
+    const r = psByKey.get(ps.prev.key);
+    if (r && r.lat === undefined) { r.lat = Math.max(0, Math.round(Number(ps.prev.latMs))); if (psCur !== null) psMark(psCur); }
+  }
+}
+function psGameNow(ps) {
+  const st = psStoreNow();
+  if (psCur === null) { psCur = CV.ponderStatsNewGame(st); psByKey.clear(); }
+  const c = ps && Number(ps.clockSec) > 0 ? Math.round(Number(ps.clockSec)) : null;
+  CV.ponderStatsGame(st, psCur, c, Date.now());
+  return psCur;
+}
+const psNum = (v) => (v === null || v === undefined || !Number.isFinite(Number(v)) ? null : Math.round(Number(v)));
+// A ponder job started (aggroIdle): its key and, later, its ranked list (psRanked).
+function psJobStart(msg, token) {
+  if (!psOn()) return;
+  psJob = { key: psKey(msg.startFen, msg.moves), token, startedAt: Date.now(), ranked: null };
+}
+function psRanked(token, list) { if (psJob && psJob.token === token && !psJob.ranked && Array.isArray(list)) psJob.ranked = list.slice(); }
+function psRankOf(startFen, moves) {
+  if (!psJob || !psJob.ranked || !Array.isArray(moves) || !moves.length || psJob.key !== psKey(startFen, moves.slice(0, -1))) return null;
+  const i = psJob.ranked.indexOf(moves[moves.length - 1]);
+  return i < 0 ? null : i;
+}
+// A decision was made (analyze*Now, right after ponder.decide). The record is completed by psFinish (msg._ps).
+function psDecide(engine, msg, d, startFen, moves) {
+  if (!psOn()) return;
+  try {
+    const ps = msg.ps || {};
+    psFromPage(ps);
+    const key = psKey(startFen, moves);
+    const old = key ? psByKey.get(key) : null;
+    if (old) { msg._ps = { rec: old, engine, again: true }; return; }     // the full search after a quick look: same record
+    const g = psGameNow(ps);
+    const rec = CV.ponderStatsAdd(psStoreNow(), { g, run: psRunFor(engine, ps), p: Array.isArray(moves) ? moves.length : null, d: d.decision,
+      ot: psNum(ps.oppMs), lm: psNum(d.leadMs), rk: psRankOf(startFen, moves), k: psKillsDelta(), at: Date.now() });
+    if (key) psByKey.set(key, rec);
+    msg._ps = { rec, engine, ps };
+    psMark(g);
+  } catch (e) { /* the recorder never breaks a move */ }
+}
+// The run key of a record: the page's settings and what is in effect here (ponderCap, main threads, build, main hash).
+function psRunFor(engine, ps) {
+  const sfMain = engine === 'sf';
+  const base = (f) => (f ? String(f).split('/').pop() : null);
+  // w: the effective worker count of the page's setting (= ponderCap of its jobs; before the first job ponderCap is still 1)
+  return { e: engine, w: psNum(ps.ws) !== null ? ponderEffectiveCount(ps.ws) : ponderCap, ws: psNum(ps.ws), t: sfMain ? (isSfThreaded(sfActive) ? sfThreadsSent : 1) : 1, pm: psNum(ps.pm), px: psNum(ps.px), ph: psNum(ps.ph),
+    mh: sfMain ? (sfHashSent !== null ? sfHashSent : psNum(ps.mh)) : psNum(ps.mh), sm: ps.sm ? String(ps.sm) : null, b: sfMain ? base(sfActive) : base(aggroModuleInfo.file) };
+}
+// The request ended with result r: depths, and the run key now that the main search's threads / build are known.
+function psFinish(msg, r) {
+  const x = msg && msg._ps;
+  if (!x || !psStore) return;
+  try {
+    const rec = x.rec;
+    if (!x.again) {
+      const key = CV.ponderStatsRunKey(psRunFor(x.engine, x.ps || {}));
+      let i = psStore.runs.indexOf(key);
+      if (i < 0) { psStore.runs.push(key); i = psStore.runs.length - 1; }
+      rec.r = i;
+    }
+    if (r && !r.error) {
+      if (r.ponderHit) { rec.hd = psNum(r.depth); if (rec.d === 'late') rec.lh = 1; }
+      else if (Number.isFinite(Number(r.depth))) rec.md = psNum(r.depth);
+    }
+    if (psCur !== null) psMark(psCur);
+  } catch (e) { /* ignore */ }
+}
+// Our move needed no engine (the only legal move): a 'skipped' record.
+function psSkipped(msg) {
+  if (!psOn()) return;
+  const ps = msg.ps || {};
+  psFromPage(ps);
+  const moves = Array.isArray(msg.moves) ? msg.moves : null, key = psKey(msg.startFen, moves);
+  if (key && psByKey.has(key)) return;
+  ponder.skip();
+  const g = psGameNow(ps);
+  const lead = psJob && moves && moves.length && psJob.key === psKey(msg.startFen, moves.slice(0, -1)) ? Date.now() - psJob.startedAt : null;
+  const rec = CV.ponderStatsAdd(psStoreNow(), { g, run: psRunFor(msg.engine === 'stockfish' ? 'sf' : 'aggro', ps), p: moves ? moves.length : null, d: 'skipped',
+    ot: psNum(ps.oppMs), lm: lead, rk: psRankOf(msg.startFen, moves), k: psKillsDelta(), at: Date.now() });
+  if (key) psByKey.set(key, rec);
+  psMark(g);
+}
+function psMark(g) {
+  psDirty.add(g);
+  if (!psTimer) psTimer = setTimeout(() => { psTimer = null; psFlush().catch(() => {}); }, PS_WRITE_MS);
+}
+// Writes the index and the changed games; trims first. Finished games then leave memory (index entry only).
+function psFlush() {
+  if (!psOn()) return Promise.resolve();
+  return psSerial(async () => {
+    await psLoad();
+    clearTimeout(psTimer); psTimer = null;
+    const st = psStore;
+    const dropped = CV.ponderStatsTrim(st);
+    const write = {};
+    for (const g of st.games) {
+      if (!psDirty.has(g.g) || !g.recs) continue;
+      const chunk = { g: g.g, c: g.c, at: g.at, recs: g.recs };
+      write[psGameKey(g.g)] = chunk;
+      g.bytes = JSON.stringify(chunk).length; g.n = g.recs.length;
+    }
+    write[CV.PONDER_STATS_KEY] = { v: st.v, nextGame: st.nextGame, dropped: st.dropped, droppedGames: st.droppedGames, runs: st.runs,
+      games: st.games.map((g) => ({ g: g.g, c: g.c, at: g.at, n: g.recs ? g.recs.length : g.n, bytes: g.bytes })) };
+    psDirty.clear();
+    await api.storage.local.set(write);
+    if (dropped.length) await api.storage.local.remove(dropped.map(psGameKey));
+    for (const g of st.games) if (g.g !== psCur && g.recs) { g.n = g.recs.length; g.recs = null; }   // written: out of memory
+  });
+}
+// New game (the page's tracker): the old game is written now; the next record opens a new one.
+function psNewGame() {
+  if (!psOn() || psCur === null) return;
+  psCur = null; psByKey.clear();
+  psFlush().catch(() => {});
+}
+// Everything, read back from storage (export).
+function psFull() {
+  return psFlush().then(() => psSerial(async () => {
+    const st = psStore;
+    const missing = st.games.filter((g) => !g.recs).map((g) => psGameKey(g.g));
+    const got = missing.length ? await api.storage.local.get(missing) : {};
+    const games = st.games.map((g) => (g.recs ? { g: g.g, c: g.c, at: g.at, recs: g.recs } : { g: g.g, c: g.c, at: g.at, recs: (got[psGameKey(g.g)] && got[psGameKey(g.g)].recs) || [] }));
+    return { ...st, games };
+  }));
+}
+const psMeta = () => ({ version: (() => { try { return api.runtime.getManifest().version; } catch (e) { return null; } })(), exportedAt: new Date().toISOString(),
+  userAgent: typeof navigator !== 'undefined' ? navigator.userAgent : null, hardwareConcurrency: typeof navigator !== 'undefined' ? navigator.hardwareConcurrency : null });
+function psStatus() {
+  return psLoad().then(() => ({ ok: true, records: CV.ponderStatsCount(psStore), games: psStore.games.length, dropped: psStore.dropped, workers: ponderCap, kind: ponderKind }));
+}
+function psReset() {
+  return psSerial(async () => {
+    await psLoad();
+    const keys = [CV.PONDER_STATS_KEY, ...psStore.games.map((g) => psGameKey(g.g))];
+    clearTimeout(psTimer); psTimer = null;
+    psStore = CV.ponderStatsNew(); psCur = null; psByKey.clear(); psDirty.clear(); psKillsPrev = null;
+    await api.storage.local.remove(keys);
+    return { ok: true };
+  });
+}
+function psMessage(msg) {
+  if (!psOn()) return Promise.resolve({ ok: false, error: 'ponder stats are off (CV.PONDER_STATS)' });
+  const op = msg.op;
+  if (op === 'skipped') { psSkipped(msg); return Promise.resolve({ ok: true }); }
+  if (op === 'note') { psFromPage(msg.ps); return Promise.resolve({ ok: true }); }
+  if (op === 'gameEnd') { psFromPage(msg.ps); return psFlush().then(() => ({ ok: true })); }
+  if (op === 'status') return psStatus();
+  if (op === 'export') return psFull().then((st) => ({ ok: true, text: CV.ponderStatsFormat(st, psMeta()), records: CV.ponderStatsCount(st) }));
+  if (op === 'summary') return psFull().then((st) => ({ ok: true, text: CV.ponderStatsSummaryText(st) }));
+  if (op === 'reset') return psReset();
+  return Promise.resolve({ ok: false, error: 'unknown op' });
+}
+if (psOn()) psLoad().catch(() => {});
+// PONDER_STATS (temporary) end
 
 // ======================= Messaging =======================
 api.runtime.onMessage.addListener((msg, sender) => {
   if (msg && msg.type === 'allowlist') return loadAllowlist();
   if (msg && msg.type === 'fetchImage') return fetchImage(msg.url);
+  // PONDER_STATS (temporary) begin
+  if (msg && msg.type === 'aggroClear') psNewGame();
+  if (msg && msg.type === 'ponderStats') return psMessage(msg);
+  // PONDER_STATS (temporary) end
   if (msg && msg.type === 'aggroClear') { aggroClear(); return Promise.resolve({ ok: true }); }
   if (msg && msg.type === 'clearEngines') { clearEngines(); return Promise.resolve({ ok: true }); }
   if (msg && msg.type === 'aggroInvalidate') { ponderWanted = false; ponderCancel(); return Promise.resolve({ ok: true }); }   // also frees the spares
@@ -1794,6 +2009,9 @@ api.runtime.onMessage.addListener((msg, sender) => {
   const run = withEngine(() => (msg.engine === 'stockfish'
     ? analyzeStockfish(msg.fen, msg.depth, msg.imperfection, msg.sfMaxMs, msg.startFen, msg.moves, msg)
     : analyzeAggro(msg)));
+  // PONDER_STATS (temporary) begin
+  if (psOn()) run.then((r) => psFinish(msg, r), () => {});
+  // PONDER_STATS (temporary) end
   return run;
 });
 

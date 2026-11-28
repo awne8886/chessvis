@@ -719,6 +719,14 @@
     return { list: out, dropped };
   };
 
+  // PONDER_STATS (temporary) begin
+  // 2.0.6 (D): a temporary recorder of ponder results per ponder-worker count (ponderstats.js, background.js, content.js,
+  // overlay.js; all in blocks marked like this one). It never changes what the engines search or play. false = off (no
+  // records, no panel block). Storage: the index under PONDER_STATS_KEY and one key per game (PONDER_STATS_KEY + ':g' + n).
+  CV.PONDER_STATS = true;
+  CV.PONDER_STATS_KEY = 'ponderStats';
+  CV.isPonderStatsKey = (k) => k === CV.PONDER_STATS_KEY || String(k).startsWith(CV.PONDER_STATS_KEY + ':');
+  // PONDER_STATS (temporary) end
 
   // ---- allowed pages (allowed-pages.txt) ----
   // Turns the file's text into a list of normalised entries.
