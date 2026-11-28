@@ -19,6 +19,40 @@ function pvFrom(pos, n) {
   return pv;
 }
 
+// 2.0.4: an in-memory storage.local shared by the page and the background (get with defaults / a key / a list / null,
+// set, remove, onChanged with { key: { oldValue, newValue } }). Values are deep-copied in and out, like the real API.
+function makeStorage() {
+  const data = {};
+  const listeners = [];
+  const clone = (x) => (x === undefined ? undefined : JSON.parse(JSON.stringify(x)));
+  const counts = { get: 0, set: 0, remove: 0, setKeys: 0, setBytes: 0 };
+  const fire = (ch) => { if (Object.keys(ch).length) for (const fn of listeners.slice()) { try { fn(clone(ch), 'local'); } catch (e) { /* ignore */ } } };
+  const local = {
+    async get(q) {
+      counts.get++;
+      if (q === null || q === undefined) return clone(data);
+      if (typeof q === 'string') return q in data ? { [q]: clone(data[q]) } : {};
+      if (Array.isArray(q)) { const o = {}; for (const k of q) if (k in data) o[k] = clone(data[k]); return o; }
+      const o = {};
+      for (const k of Object.keys(q)) o[k] = k in data ? clone(data[k]) : clone(q[k]);
+      return o;
+    },
+    async set(obj) {
+      counts.set++; counts.setKeys += Object.keys(obj).length; counts.setBytes += JSON.stringify(obj).length;
+      const ch = {};
+      for (const k of Object.keys(obj)) { ch[k] = { oldValue: clone(data[k]), newValue: clone(obj[k]) }; data[k] = clone(obj[k]); }
+      fire(ch);
+    },
+    async remove(keys) {
+      counts.remove++;
+      const ch = {};
+      for (const k of [].concat(keys)) if (k in data) { ch[k] = { oldValue: clone(data[k]) }; delete data[k]; }
+      fire(ch);
+    },
+  };
+  return { local, onChanged: { addListener: (fn) => listeners.push(fn), removeListener: (fn) => { const i = listeners.indexOf(fn); if (i >= 0) listeners.splice(i, 1); } }, data, counts };
+}
+
 function makeBackground(opts = {}) {
   const stepMs = opts.stepMs || 10;          // fake Stockfish: ms per depth
   const workers = [];
@@ -125,15 +159,35 @@ function makeBackground(opts = {}) {
     setTimeout, clearTimeout, setInterval, clearInterval,
     navigator: { hardwareConcurrency: opts.cores || 4 },
     Worker: FakeWorker,
-    browser: { runtime: { getURL: (p) => p, onMessage: { addListener(fn) { handler = fn; } } } },
+    browser: { runtime: { getURL: (p) => p, onMessage: { addListener(fn) { handler = fn; } }, onConnect: { addListener(fn) { connectHandlers.push(fn); } } },
+      storage: opts.storage || makeStorage() },
   });
-  for (const f of ['settings.js', 'chessmini.js', 'background.js']) vm.runInContext(fs.readFileSync(path.join(ROOT, f), 'utf8'), ctx, { filename: f });
+  // 2.0.4: runtime.connect ports (A4). connect(name) -> the page's end: { postMessage, onMessage, onDisconnect, disconnect }
+  const connectHandlers = [];
+  const ports = [];
+  function connect(name, sender) {
+    const mk = () => ({ ml: [], dl: [], open: true });
+    const a = mk(), b = mk();
+    const end = (me, other) => ({
+      name, sender: sender || { tab: { id: 1 } },
+      postMessage: (m) => { if (!me.open || !other.open) return; const c = JSON.parse(JSON.stringify(m)); setTimeout(() => { if (other.open) for (const fn of other.ml.slice()) fn(c); }, 0); },
+      onMessage: { addListener: (fn) => me.ml.push(fn) },
+      onDisconnect: { addListener: (fn) => me.dl.push(fn) },
+      disconnect: () => { if (!me.open) return; me.open = false; if (other.open) { other.open = false; setTimeout(() => { for (const fn of other.dl.slice()) fn(); }, 0); } },
+    });
+    const page = end(a, b), back = end(b, a);
+    ports.push(page);
+    for (const fn of connectHandlers) fn(back);
+    return page;
+  }
+  for (const f of ['settings.js', 'chessmini.js', 'background.js']) vm.runInContext(fs.readFileSync(path.join(opts.root || ROOT, f), 'utf8'), ctx, { filename: f });
   return {
-    send: (msg) => Promise.resolve(handler(msg)),
+    send: (msg, sender) => Promise.resolve(handler(msg, sender || { tab: { id: 1 } })),
     get: (expr) => vm.runInContext(expr, ctx),
+    connect, ports, connectHandlers,
     workers, log, CV, best, pvFrom,
   };
 }
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
-module.exports = { makeBackground, sleep, CV, best, pvFrom };
+module.exports = { makeBackground, makeStorage, sleep, CV, best, pvFrom };
