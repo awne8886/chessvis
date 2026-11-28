@@ -77,4 +77,34 @@ test('2.0.5: the Stockfish ranking covers the moves the deepening passes use', (
   for (let w = 1; w <= 7; w++) assert.ok(CV.sfRankLines(8, w) >= Math.min(CV.SF_RANK_LINES_MAX, Math.max(2, 2 * w)));
 });
 
+test('2.0.6: sfThreads 1-7 (capped at cores - 1, 1 without SharedArrayBuffer), sfHashMb 16-256 default 32, export / import', () => {
+  assert.deepStrictEqual(CV.LIMITS.sfThreads, [1, 7, 1]);
+  assert.deepStrictEqual(CV.LIMITS.sfHashMb, [16, 256, 16]);
+  assert.strictEqual(CV.DEFAULTS.sfThreads, 1, '2.0.5 default');
+  assert.strictEqual(CV.DEFAULTS.sfHashMb, 32, '2.0.5 hash');
+  assert.strictEqual(CV.sfThreadCount(7, 8, true), 7);
+  assert.strictEqual(CV.sfThreadCount(7, 4, true), 3, 'a 4-core device: 3 at most');
+  assert.strictEqual(CV.sfThreadCount(9, 16, true), 7);
+  assert.strictEqual(CV.sfThreadCount(7, 8, false), 1, 'no SharedArrayBuffer');
+  assert.strictEqual(CV.sfThreadCount(4, undefined, true), 1, 'unknown CPU count');
+  assert.deepStrictEqual(CV.sanitize({ sfHashMb: 999, sfThreads: 9 }), { sfHashMb: 256, sfThreads: 7 });
+  assert.deepStrictEqual(CV.sanitize({ sfHashMb: 1 }), { sfHashMb: 16 });
+  assert.deepStrictEqual(CV.sanitize({ sfHashMb: 100 }), { sfHashMb: 96 });
+  const r = CV.importSettings(CV.exportSettings({ ...CV.DEFAULTS, sfHashMb: 128, sfThreads: 6 }));
+  assert.ok(r.ok && r.values.sfHashMb === 128 && r.values.sfThreads === 6);
+});
+
+test('2.0.6: the threaded builds to try: relaxed SIMD first, then npm; failures and CV.SF_THREADED_RSIMD = false', () => {
+  assert.strictEqual(CV.SF_THREADED_RSIMD, true);
+  assert.deepStrictEqual(CV.sfThreadedCandidates({ relaxedOk: true }), ['rsimd', 'npm']);
+  assert.deepStrictEqual(CV.sfThreadedCandidates({ relaxedOk: false }), ['npm']);
+  assert.deepStrictEqual(CV.sfThreadedCandidates({ relaxedOk: true, failed: { rsimd: true } }), ['npm']);
+  assert.deepStrictEqual(CV.sfThreadedCandidates({ relaxedOk: true, failed: { npm: true } }), []);
+  assert.deepStrictEqual(CV.sfThreadedCandidates(), ['npm']);
+  CV.SF_THREADED_RSIMD = false;
+  try { assert.deepStrictEqual(CV.sfThreadedCandidates({ relaxedOk: true }), ['npm'], '2.0.5'); } finally { CV.SF_THREADED_RSIMD = true; }
+  assert.strictEqual(CV.SF_MAIN_WAIT_STOP_MS, 0);
+});
+
+
 run();

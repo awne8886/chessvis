@@ -3,7 +3,9 @@
 'use strict';
 const assert = require('node:assert');
 const { runner } = require('./_load');
-const { makeBackground, sleep, CV, best } = require('./_fakebg');
+const { makeBackground, makeStorage, sleep, CV, best } = require('./_fakebg');
+const fs = require('fs');
+const path = require('path');
 const { test, run } = runner('background-sim');
 const START = CV.STANDARD_START_FEN;
 const after = (moves) => CV.replayUci(START, moves).pos;
@@ -521,9 +523,12 @@ test('B2: the last tab disconnects -> the job is cancelled and the spares are re
   await old.send({ type: 'aggroInvalidate' });
 });
 
-// ---- 2.0.4 F1: the lean package (tools/package.sh --lean) has no threaded Stockfish build and no asm.js fallback ----
-test('F1: without engine/stockfish-19-lite.js the threaded start fails once and the single-thread engine keeps playing', async () => {
-  const bg = makeBackground({ stepMs: 2, sab: true, cores: 4, missing: ['engine/stockfish-19-lite.js', 'engine/stockfish-19-asm.js'] });
+// ---- 2.0.4 F1 / 2.0.6: the lean package (tools/package.sh --lean) has no asm.js fallback; since 2.0.6 it keeps both
+// threaded builds. A tree without the threaded builds still plays on the single-thread engine (the fallback chain).
+test('F1 (2.0.6): lean = no asm.js only; without any threaded build the start fails once per build and the single-thread engine plays', async () => {
+  const lean = fs.readFileSync(path.join(__dirname, '..', 'tools', 'package.sh'), 'utf8');
+  assert.ok(/^LEAN_SKIP=\(engine\/stockfish-19-asm\.js\)$/m.test(lean), 'lean leaves out only the asm.js fallback');
+  const bg = makeBackground({ stepMs: 2, sab: true, cores: 4, missing: ['engine/stockfish-19-lite.js', 'engine/stockfish-19-lite-rsimd.js', 'engine/stockfish-19-asm.js'] });
   assert.strictEqual(bg.get('sfSab.ok'), true, 'the SharedArrayBuffer test passes, so the threaded build is tried');
   const r = await analyzeSf(bg, [], { sfSearchMode: 'depth', sfThreads: 2 });
   assert.ok(r && r.uci && !r.error, JSON.stringify(r));
@@ -534,5 +539,98 @@ test('F1: without engine/stockfish-19-lite.js the threaded start fails once and 
   assert.ok(r2 && r2.uci);
   assert.strictEqual(bg.workers.filter((w) => w.missing).length, tries, 'not tried again');
 });
+
+// ---- 2.0.6 (C): the threaded builds, best first: relaxed-SIMD threaded -> npm threaded -> single thread ----
+const mainUrl = (bg) => decodeURIComponent(bg.workers.filter((w) => w.kind === 'sf' && !w.dead)[0].url);
+test('C: sfThreads > 1 starts the relaxed-SIMD threaded build with its own .wasm; failures fall back one step, remembered', async () => {
+  const bg = makeBackground({ stepMs: 2, sab: true, cores: 8, wasm: { relaxed: true } });
+  await analyzeSf(bg, [], { sfSearchMode: 'depth', sfThreads: 4 });
+  assert.strictEqual(bg.get('sfActive'), 'engine/stockfish-19-lite-rsimd.js');
+  assert.ok(/^engine\/stockfish-19-lite-rsimd\.js#engine\/stockfish-19-lite-rsimd\.wasm,worker$/.test(mainUrl(bg)), mainUrl(bg));
+  assert.strictEqual(bg.get('sfThreadsSent'), 4);
+  const dbg = await bg.send({ type: 'aggroDebug' });
+  assert.strictEqual(dbg.stockfish.active, 'engine/stockfish-19-lite-rsimd.js');
+  assert.strictEqual(dbg.stockfish.rsimdThreadedFailed, null);
+
+  // the relaxed threaded build does not start: the npm threaded build, and it is not tried again
+  const b2 = makeBackground({ stepMs: 2, sab: true, cores: 8, wasm: { relaxed: true }, missing: ['engine/stockfish-19-lite-rsimd.js'] });
+  await analyzeSf(b2, [], { sfSearchMode: 'depth', sfThreads: 4 });
+  assert.strictEqual(b2.get('sfActive'), 'engine/stockfish-19-lite.js');
+  assert.ok(/not found/.test(b2.get('sfDbg.rsimdThreadedFailed')));
+  assert.strictEqual(b2.get('sfDbg.threadedFailed'), null);
+  assert.ok(/^engine\/stockfish-19-lite\.js#engine\/stockfish-19-lite\.wasm,worker$/.test(mainUrl(b2)), mainUrl(b2));
+
+  // no relaxed SIMD, or CV.SF_THREADED_RSIMD = false (2.0.5): the npm threaded build only
+  for (const bg3 of [makeBackground({ stepMs: 2, sab: true, cores: 8, wasm: { relaxed: false } }),
+    makeBackground({ stepMs: 2, sab: true, cores: 8, wasm: { relaxed: true }, setup: 'CV.SF_THREADED_RSIMD = false' })]) {
+    await analyzeSf(bg3, [], { sfSearchMode: 'depth', sfThreads: 3 });
+    assert.strictEqual(bg3.get('sfActive'), 'engine/stockfish-19-lite.js');
+    assert.ok(!bg3.workers.some((w) => /lite-rsimd\.js/.test(w.url)), 'the relaxed threaded build was never started');
+  }
+  // 4 cores: at most 3 threads; 7 threads on 8 cores
+  const b4 = makeBackground({ stepMs: 2, sab: true, cores: 4, wasm: { relaxed: true } });
+  await analyzeSf(b4, [], { sfSearchMode: 'depth', sfThreads: 7 });
+  assert.strictEqual(b4.get('sfThreadsSent'), 3);
+  const b8 = makeBackground({ stepMs: 2, sab: true, cores: 8, wasm: { relaxed: true } });
+  await analyzeSf(b8, [], { sfSearchMode: 'depth', sfThreads: 7 });
+  assert.strictEqual(b8.get('sfThreadsSent'), 7);
+});
+
+// ---- 2.0.6 (B): the main worker's hash ----
+const mainCmds = (bg) => { const id = bg.workers.filter((w) => w.kind === 'sf')[0].id; return bg.log.filter((x) => x.w === id).map((x) => x.cmd); };
+test('B: sfHashMb: the main worker starts with it, a change is sent once between searches; ponder workers keep theirs', async () => {
+  const d = makeBackground({ stepMs: 2 });
+  await analyzeSf(d, [], { sfSearchMode: 'depth' });
+  assert.deepStrictEqual(mainCmds(d).filter((c) => /Hash/.test(c)), ['setoption name Hash value 32'], '2.0.5: 32 without the setting');
+
+  const bg = makeBackground({ stepMs: 2 });
+  await bg.send({ type: 'warm', engine: 'stockfish', sfHashMb: 64 });
+  await analyzeSf(bg, [], { sfSearchMode: 'depth', sfHashMb: 64 });
+  await analyzeSf(bg, ['e2e4', 'e7e5'], { sfSearchMode: 'depth', sfHashMb: 64 });
+  assert.deepStrictEqual(mainCmds(bg).filter((c) => /Hash/.test(c)), ['setoption name Hash value 64']);
+  await analyzeSf(bg, ['e2e4', 'e7e5', 'g1f3', 'b8c6'], { sfSearchMode: 'depth', sfHashMb: 128 });
+  const cmds = mainCmds(bg);
+  assert.deepStrictEqual(cmds.filter((c) => /Hash/.test(c)), ['setoption name Hash value 64', 'setoption name Hash value 128']);
+  const i = cmds.indexOf('setoption name Hash value 128');
+  const goAfter = cmds.slice(i + 1).findIndex((c) => c.startsWith('go'));
+  assert.ok(cmds.slice(0, i).filter((c) => c.startsWith('go depth')).length === 2 && goAfter >= 0 && cmds[i - 1].startsWith('go') && !cmds.slice(i + 1, i + 1 + goAfter).some((c) => /setoption name Hash/.test(c)),
+    'after the last search, before the next: ' + cmds.slice(i - 2, i + 4).join(' / '));
+  assert.strictEqual(bg.get('sfHashSent'), 128);
+  assert.strictEqual((await bg.send({ type: 'aggroDebug' })).stockfish.hashMb, 128);
+  // out of range values are clamped by sanitize
+  await analyzeSf(bg, ['e2e4', 'e7e5', 'g1f3', 'b8c6', 'f1c4', 'f8c5'], { sfSearchMode: 'depth', sfHashMb: 999 });
+  assert.strictEqual(bg.get('sfHashSent'), 256);
+  // ponder workers: sfPonderHashMb
+  await bg.send(sfIdle(['e2e4'], { ponderWorkers: 1, ponderHashMb: 16 }));
+  await sleep(100);
+  const pw = bg.workers.filter((w) => w.kind === 'sf')[1];
+  assert.ok(bg.log.some((x) => x.w === pw.id && x.cmd === 'setoption name Hash value 16'));
+  assert.ok(!bg.log.some((x) => x.w === pw.id && /Hash value (64|128|256)/.test(x.cmd)));
+  await bg.send({ type: 'aggroInvalidate' });
+});
+
+// ---- 2.0.6 (A3): CV.SF_MAIN_WAIT_STOP_MS ----
+test('A3: with CV.SF_MAIN_WAIT_STOP_MS the main go waits for the stopping ponder workers, at most the cap; 0 = at once', async () => {
+  const run1 = async (cap, stopDelay) => {
+    const bg = makeBackground({ stepMs: 40, sfStopDelayMs: stopDelay, setup: 'CV.SF_MAIN_WAIT_STOP_MS = ' + cap });
+    await bg.send(sfIdle(['e2e4'], { ponderWorkers: 2, sfSearchMode: 'depth' }));
+    await sleep(250);                                            // both ponder workers are searching
+    const t0 = Date.now();
+    const r = await analyzeSf(bg, ['d2d4', 'd7d5'], { ponder: true, sfSearchMode: 'depth', depth: 2 });   // a miss
+    const out = { ms: Date.now() - t0, waits: bg.get('sfDbg.mainWaits'), waitMs: bg.get('sfDbg.mainWaitMs'), kills: bg.get('sfDbg.kills'), uci: r.uci };
+    await bg.send({ type: 'aggroInvalidate' });
+    return out;
+  };
+  const none = await run1(0, 25);
+  assert.strictEqual(none.waits, 0);
+  const quick = await run1(40, 25);
+  assert.strictEqual(quick.waits, 1);
+  assert.ok(quick.waitMs[0] >= 15 && quick.waitMs[0] < 40, 'waited for the stop: ' + quick.waitMs);
+  const slow = await run1(40, 300);
+  assert.ok(slow.waitMs[0] >= 38 && slow.waitMs[0] < 70, 'capped: ' + slow.waitMs);
+  for (const x of [none, quick, slow]) { assert.ok(!Object.keys(x.kills).some((k) => /after stop|timeout/.test(k)), JSON.stringify(x.kills)); assert.strictEqual(x.uci, none.uci); }
+  assert.strictEqual(CV.SF_MAIN_WAIT_STOP_MS, 0, 'measured: no gain in Chromium (docs/REFERENCE.md 2.0.6), so 2.0.5 behaviour');
+});
+
 
 run();

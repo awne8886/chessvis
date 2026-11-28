@@ -6,7 +6,7 @@
   window.__chessvisionLoaded = true;
 
   const DEBUG = true;
-  const FALLBACK_VERSION = '2.0.4';
+  const FALLBACK_VERSION = '2.0.6';
   const VERSION = (() => { try { return api.runtime.getManifest().version || FALLBACK_VERSION; } catch (e) { return FALLBACK_VERSION; } })();
   const log = (...a) => DEBUG && console.log('[ChessVision]', ...a);
   const { FILES } = CV.chess;
@@ -488,6 +488,7 @@
       type: 'analyze', fen: pos.fen, engine: cfg.engine, depth, ms,
       startFen: h ? h.startFen : null, moves: h ? h.moves : null,       // null = no reliable history: engines get the bare FEN
       soft: p.soft, hard: p.hard, verify: cfg.engine === 'aggro' && cfg.aggroVerify, ponder: ponderOn(), sfThreads: cfg.engine === 'stockfish' ? cfg.sfThreads : undefined,
+      sfHashMb: cfg.engine === 'stockfish' ? cfg.sfHashMb : undefined,          // 2.0.6 (B): the main worker's hash
       imperfection: !quick && cfg.engine === 'stockfish' && hum() ? cfg.imperfection : 0,
       sfMaxMs: p.sfCap,
       sfSearchMode: quick ? 'depth' : (p.searchMode || cfg.sfSearchMode), softMs: quick ? 0 : (softMs || 0), uciClock: quick ? undefined : p.uciClock, spentMs: quick ? 0 : (p.spentMs || 0),
@@ -741,7 +742,7 @@
     if (!CV.LAZY_ENGINES || !cfg.enabled || !isAllowedPage() || warmedFor === cfg.engine) return;
     const engine = cfg.engine;
     warmedFor = engine;
-    api.runtime.sendMessage({ type: 'warm', engine }).then((r) => { if (r && r.ok === false && warmedFor === engine) warmedFor = null; }, () => { if (warmedFor === engine) warmedFor = null; });
+    api.runtime.sendMessage({ type: 'warm', engine, sfHashMb: cfg.sfHashMb }).then((r) => { if (r && r.ok === false && warmedFor === engine) warmedFor = null; }, () => { if (warmedFor === engine) warmedFor = null; });
   }
 
   // ---------- Idle work (opponent's turn): pondering / evaluation line ----------

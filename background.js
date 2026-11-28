@@ -6,8 +6,9 @@ const api = typeof browser !== 'undefined' ? browser : chrome;
 // same name (SF_WASM) are both in engine/. If it fails to start, SF_FALLBACK_FILE (asm.js, much slower) is used.
 // Start order of every Stockfish worker: (1) engine/sf-worker.js, which loads the UNMODIFIED loader and hands it a wasm
 // Module compiled once here (sfModuleFor), (2) the loader directly (it fetches and compiles the .wasm itself), (3) asm.js
-// (main worker only). The threaded build SF_THREADED_FILE is used for the MAIN worker only, only when setting sfThreads > 1
-// AND the runtime feature test (CV.sabSupport) passes; any failure there keeps the single-thread engine.
+// (main worker only). The threaded builds (2.0.6: SF_THREADED_FILE_RSIMD, then SF_THREADED_FILE) are used for the MAIN
+// worker only, only when setting sfThreads > 1 AND the runtime feature test (CV.sabSupport) passes; any failure there falls
+// back one step (relaxed-SIMD threaded -> npm threaded -> the single-thread engine) and is remembered.
 const SF_FILE = 'engine/stockfish-19-lite-single.js';
 const SF_WASM = SF_FILE.replace(/\.js$/, '.wasm');
 // 2.0.2 (B1): the same engine built with WebAssembly relaxed SIMD (its NNUE uses i32x4.relaxed_dot_i8x16_i7x16_add; same
@@ -19,9 +20,13 @@ const sfWasmOf = (file) => file.replace(/\.js$/, '.wasm');
 const isSfSingle = (file) => file === SF_FILE || file === SF_FILE_RSIMD;
 const SF_WRAPPER = 'engine/sf-worker.js';
 const SF_THREADED_FILE = 'engine/stockfish-19-lite.js';
-const SF_THREADED_WASM = SF_THREADED_FILE.replace(/\.js$/, '.wasm');
+// 2.0.6 (C): the threaded build with WebAssembly relaxed SIMD (tools/build-stockfish.sh; the same search, Threads 1 gives the
+// depth-14 bench signature of the single builds). Its loader gets its own .wasm in "#<url>,worker" (sfWasmOf), and its
+// pthread workers load the same URL, so they never see the plain .wasm (tests/bench-threads.js --only load).
+const SF_THREADED_FILE_RSIMD = 'engine/stockfish-19-lite-rsimd.js';
+const isSfThreaded = (file) => file === SF_THREADED_FILE || file === SF_THREADED_FILE_RSIMD;
 const SF_FALLBACK_FILE = 'engine/stockfish-19-asm.js';
-const SF_THREADS = 1, SF_HASH_MB = 32;      // sent once after start-up
+const SF_THREADS = 1, SF_HASH_MB = 32;      // sent once after start-up (2.0.6: the main worker's Hash is the setting sfHashMb, see sfHashWant)
 const SF_START_TIMEOUT_MS = 30000;          // no readyok within this long = the engine did not start
 const SF_WRAPPER_TIMEOUT_MS = 15000;        // ... for the wrapper / shared-module start (then the direct loader is tried)
 // "Imperfection" only considers alternatives within this many centipawns of the best line.
@@ -36,7 +41,14 @@ const SF_DELAY_GO = 'go depth 64';   // delay-matched search: effectively unboun
 let sfActive = null;    // engine file in use
 let sfPrevCount = null; // pieces in the previous request; null = nothing searched yet (see CV.sfIsNewGame)
 let sfMultiPvSent = null, sfThreadsSent = SF_THREADS;   // setoption is only sent when the value changes
+// 2.0.6 (B): the main worker's hash (MB): the latest setting value from the page (sfHashWant, used at the next start) and
+// what the running main worker has (sfHashSent; null = the engine's default); sfSpin = the spin options the main engine
+// listed ({ name: { min, max } }), so a runtime setoption stays inside them.
+let sfHashWant = CV.DEFAULTS.sfHashMb, sfHashSent = null, sfSpin = {};
 const sfDbg = { moduleSendFailures: 0, workerStarts: 0, lastStart: null, harvested: 0, harvestFailed: 0, threadedFailed: null, threadedStarts: 0, pvSeeds: 0, rsimdFailed: null,
+  // 2.0.6: the relaxed-SIMD threaded build failed to start (why; then the npm threaded build is used); Hash changes sent to
+  // the main worker; main searches that waited for stopping ponder workers (CV.SF_MAIN_WAIT_STOP_MS) and the last waits (ms)
+  rsimdThreadedFailed: null, hashChanges: 0, mainWaits: 0, mainWaitMs: [],
   // 2.0.3 (seen on a phone: a main search ran 4 752 ms with a 3 000 ms cap, and 27 Stockfish workers were started for 31
   // ponder jobs): main searches that ended more than SF_OVERRUN_MS after their cap (count, the last 5 in full); Stockfish
   // workers terminated, by reason; the last 20 ponder cancels (stop + readyok, ms)
@@ -78,6 +90,7 @@ function sfModuleFor(file) {
 // Starts one engine file and resolves { worker, notes } once it has answered `readyok` after the options were sent.
 // Rejects on a worker error, a start timeout or a failure to create the worker.
 // opts (all optional): wrapper + module = start SF_FILE through SF_WRAPPER with that compiled Module; hashMb; threads; timeoutMs.
+// 2.0.6: also resolves `spin` (the spin options the engine listed) and `sent` ({ Threads, Hash }: the values sent, or null).
 function sfSpawn(file, opts) {
   opts = opts || {};
   const hashMb = opts.hashMb || SF_HASH_MB, threads = opts.threads || SF_THREADS;
@@ -86,6 +99,7 @@ function sfSpawn(file, opts) {
     let w = null, done = false, stage = 'uci';
     const spin = {};      // option name -> { min, max } for the spin options the engine lists
     const notes = [];     // what happened with the options, for the log
+    const sent = { Threads: null, Hash: null };
     const fail = (why) => {
       if (done) return;
       done = true; clearTimeout(timer);
@@ -95,8 +109,8 @@ function sfSpawn(file, opts) {
     const timer = setTimeout(() => fail('no readyok within ' + (opts.timeoutMs || SF_START_TIMEOUT_MS) + ' ms (waiting for ' + stage + ')'), opts.timeoutMs || SF_START_TIMEOUT_MS);
     try {
       // The wasm loader finds its .wasm from "#<url>,worker"; passing it explicitly avoids relying on location.origin.
-      const wasmFile = file === SF_THREADED_FILE ? SF_THREADED_WASM : sfWasmOf(file);
-      w = new Worker(api.runtime.getURL(viaWrapper ? SF_WRAPPER : file) + (isSfSingle(file) || file === SF_THREADED_FILE ? '#' + encodeURIComponent(api.runtime.getURL(wasmFile)) + ',worker' : ''));
+      // 2.0.6: every wasm loader (single and threaded, plain and relaxed SIMD) gets the .wasm of its own name.
+      w = new Worker(api.runtime.getURL(viaWrapper ? SF_WRAPPER : file) + (isSfSingle(file) || isSfThreaded(file) ? '#' + encodeURIComponent(api.runtime.getURL(sfWasmOf(file))) + ',worker' : ''));
     } catch (e) { return fail('could not create worker: ' + ((e && e.message) || e)); }
     w.onerror = (e) => fail('worker error: ' + ((e && e.message) || 'unknown'));
     w.onmessage = (e) => {
@@ -111,7 +125,7 @@ function sfSpawn(file, opts) {
             const o = spin[name];
             if (!o) notes.push(name + ': option not offered');
             else if (value < o.min || value > o.max) notes.push(name + ': ' + value + ' outside ' + o.min + '-' + o.max + ', not sent');
-            else { w.postMessage('setoption name ' + name + ' value ' + value); notes.push(name + ' = ' + value + ' sent'); }
+            else { w.postMessage('setoption name ' + name + ' value ' + value); notes.push(name + ' = ' + value + ' sent'); sent[name] = value; }
           }
           w.postMessage('isready');
         }
@@ -119,7 +133,7 @@ function sfSpawn(file, opts) {
         notes.push('engine refused an option: ' + line);
       } else if (line === 'readyok') {
         done = true; clearTimeout(timer);
-        resolve({ worker: w, notes });
+        resolve({ worker: w, notes, spin, sent });
       }
     };
     if (viaWrapper) {       // first message: the compiled module (null = the wrapper fetches the file itself)
@@ -165,12 +179,12 @@ function initStockfish() {
   sfReady = (async () => {
     let r, file;
     try {
-      r = await sfSpawnWasm();
+      r = await sfSpawnWasm({ hashMb: sfHashWant });            // 2.0.6 (B): the main worker's hash is the setting sfHashMb
       file = r.file || SF_FILE;
     } catch (e) {
       if (gen !== engineGen) throw e;
       console.error('[ChessVision] Stockfish: ' + SF_FILE + ' did not start (' + ((e && e.message) || e) + '); falling back to ' + SF_FALLBACK_FILE);
-      r = await sfSpawn(SF_FALLBACK_FILE);
+      r = await sfSpawn(SF_FALLBACK_FILE, { hashMb: sfHashWant });
       file = SF_FALLBACK_FILE;
     }
     // 2.0.0 (T10): warm the main worker like the ponder workers before sfReady resolves: the first search of a fresh engine
@@ -183,6 +197,7 @@ function initStockfish() {
     sfDbg.mainWarmMs = warmMs;
     sfAttach(r.worker);
     sfThreadsSent = SF_THREADS;
+    sfHashSent = r.sent ? r.sent.Hash : null; sfSpin = r.spin || {};
     sfDbg.workerStarts++; sfDbg.lastStart = { label: 'main', file: sfActive, how: r.how || 'direct' };
     // Threads missing on the asm fallback is expected (it is single-threaded); anything else is worth a look.
     const notes = sfActive === SF_FALLBACK_FILE ? r.notes.filter((n) => n !== 'Threads: option not offered') : r.notes;
@@ -210,28 +225,50 @@ function sfWarmMain(w) {
 const SF_MAIN_WARM_TIMEOUT_MS = 2000;
 
 // Optional: the threaded build for the main worker (setting sfThreads > 1). Needs SharedArrayBuffer (runtime test, sfSab).
-// Any failure keeps the single-thread engine and is remembered (no retry loop). Returns the thread count in use.
+// 2.0.6 (C): the builds of CV.sfThreadedCandidates in turn (relaxed-SIMD threaded, then the npm threaded build); a build
+// that fails is remembered (sfDbg.rsimdThreadedFailed / threadedFailed) and the next one is tried; when none starts, the
+// single-thread engine stays (no retry loop). Returns the thread count in use.
+const sfThreadedFiles = () => CV.sfThreadedCandidates({ relaxedOk: sfRelaxedOk, failed: { rsimd: !!sfDbg.rsimdThreadedFailed, npm: !!sfDbg.threadedFailed } })
+  .map((k) => (k === 'rsimd' ? SF_THREADED_FILE_RSIMD : SF_THREADED_FILE));
 async function sfApplyThreads(setting) {
   const want = CV.sfThreadCount(setting, typeof navigator !== 'undefined' ? navigator.hardwareConcurrency : undefined, sfSab.ok);
-  if (sfActive === SF_THREADED_FILE) {
+  if (isSfThreaded(sfActive)) {
     if (want !== sfThreadsSent && !sfCurrent) { sf.postMessage('setoption name Threads value ' + want); sfThreadsSent = want; }
     return sfThreadsSent;
   }
-  if (want <= 1 || sfDbg.threadedFailed || sfCurrent || sfNext) return 1;
-  try {
-    const r = await sfSpawn(SF_THREADED_FILE, { threads: want });
-    if (sfCurrent) { try { r.worker.terminate(); } catch (e) { /* ignore */ } return 1; }     // a search started meanwhile: keep the old engine
-    const old = sf; sfAttach(r.worker); sfActive = SF_THREADED_FILE; sfThreadsSent = want; sfPrevCount = null;
-    try { if (old) old.terminate(); } catch (e) { /* ignore */ }
-    sfDbg.threadedStarts++; sfDbg.lastStart = { label: 'main', file: sfActive, how: 'threaded, Threads ' + want };
-    console.log('[ChessVision] Stockfish threaded build active:', SF_THREADED_FILE, 'Threads', want, r.notes.join('; '));
-    return want;
-  } catch (e) {
-    sfDbg.threadedFailed = String((e && e.message) || e);
-    console.error('[ChessVision] Stockfish threaded build did not start (' + sfDbg.threadedFailed + '); keeping ' + sfActive);
-    return 1;
+  if (want <= 1 || sfCurrent || sfNext) return 1;
+  for (const file of sfThreadedFiles()) {
+    try {
+      const r = await sfSpawn(file, { threads: want, hashMb: sfHashWant });
+      if (sfCurrent) { try { r.worker.terminate(); } catch (e) { /* ignore */ } return 1; }     // a search started meanwhile: keep the old engine
+      const old = sf; sfAttach(r.worker); sfActive = file; sfThreadsSent = want; sfPrevCount = null;
+      sfHashSent = r.sent ? r.sent.Hash : null; sfSpin = r.spin || {};
+      try { if (old) old.terminate(); } catch (e) { /* ignore */ }
+      sfDbg.threadedStarts++; sfDbg.lastStart = { label: 'main', file: sfActive, how: 'threaded, Threads ' + want };
+      console.log('[ChessVision] Stockfish threaded build active:', file, 'Threads', want, r.notes.join('; '));
+      return want;
+    } catch (e) {
+      const why = String((e && e.message) || e);
+      if (file === SF_THREADED_FILE_RSIMD) { sfDbg.rsimdThreadedFailed = why; console.error('[ChessVision] Stockfish relaxed-SIMD threaded build did not start (' + why + '); trying ' + SF_THREADED_FILE); continue; }
+      sfDbg.threadedFailed = why;
+      console.error('[ChessVision] Stockfish threaded build did not start (' + why + '); keeping ' + sfActive);
+      return 1;
+    }
   }
+  return 1;
 }
+
+// 2.0.6 (B): the main worker's hash follows the setting sfHashMb: `setoption name Hash` only when the value changed and only
+// while the main worker is idle (called right before a search starts; nothing is searching then). A new size clears the
+// table. A value outside the range the engine listed is not sent (the engine keeps its table).
+function sfApplyHash() {
+  if (!sf || sfCurrent || sfNext || sfHashWant === sfHashSent) return;
+  const o = sfSpin.Hash;
+  if (o && (sfHashWant < o.min || sfHashWant > o.max)) return;
+  sf.postMessage('setoption name Hash value ' + sfHashWant);
+  sfHashSent = sfHashWant; sfDbg.hashChanges++;
+}
+const sfHashFrom = (msg) => { if (msg && msg.sfHashMb !== undefined) { const v = CV.sanitize({ sfHashMb: msg.sfHashMb }).sfHashMb; if (v) sfHashWant = v; } };
 
 function sfStart(job) {
   sfCurrent = job;
@@ -339,6 +376,21 @@ function sfBestMove(line) {
   }
 }
 
+// 2.0.6 (A3): the ponder workers just stopped (ponderCancel) are answering `stop` + `isready`; with CV.SF_MAIN_WAIT_STOP_MS > 0
+// the main `go` waits until every one of them answered, at most that long (their search threads and the main search's
+// would otherwise compete for the cores for those few ms). 0 = 2.0.5 (no wait).
+async function sfWaitStopped() {
+  const cap = Math.max(0, Number(CV.SF_MAIN_WAIT_STOP_MS) || 0);
+  if (!cap) return;
+  const ps = ponderCancelling.filter((w) => w.kind === 'sf' && !w.dead && w.cancelP).map((w) => w.cancelP.catch(() => false));
+  if (!ps.length) return;
+  const t0 = Date.now();
+  let timer = null;
+  await Promise.race([Promise.all(ps), new Promise((r) => { timer = setTimeout(r, cap); })]);
+  clearTimeout(timer);
+  sfDbg.mainWaits++; sfDbg.mainWaitMs.push(Date.now() - t0); if (sfDbg.mainWaitMs.length > 20) sfDbg.mainWaitMs.shift();
+}
+
 // The real Stockfish request. `msg` (optional, 7th argument) carries the pondering fields (ponder, sfThreads).
 async function analyzeStockfish(fen, depth, imperfection, maxMs, startFen, moves, msg) {
   aggroThinking++;                     // while a real search runs, no spare ponder worker is made (see ponderTopUp)
@@ -346,6 +398,7 @@ async function analyzeStockfish(fen, depth, imperfection, maxMs, startFen, moves
 }
 async function analyzeStockfishNow(fen, depth, imperfection, maxMs, startFen, moves, msg) {
   const t0 = Date.now();
+  sfHashFrom(msg);
   try { await sfEnsureCurrent(); } catch (e) { return { error: 'Stockfish: could not start (' + ((e && e.message) || e) + ')' }; }
   // 1) a reply already found while pondering wins; anything else stops the ponder workers at once (stop + isready, never waited for)
   if (!msg.ponder) { if (ponderKind === 'sf') ponderCancel(); }
@@ -388,9 +441,11 @@ async function analyzeStockfishNow(fen, depth, imperfection, maxMs, startFen, mo
       }
     }
     ponderCancel();                                                           // miss, late or no entry yet: the ponder workers never delay a real search
+    await sfWaitStopped();                                                    // 2.0.6 (A3): CV.SF_MAIN_WAIT_STOP_MS (0 = 2.0.5: no wait)
   }
   if (msg.sfThreads !== undefined) { try { await sfApplyThreads(msg.sfThreads); } catch (e) { /* keep the engine we have */ } }
   if (!sf) { try { await sfEnsureCurrent(); } catch (e) { return { error: 'Stockfish: could not start (' + ((e && e.message) || e) + ')' }; } }   // 2.0.4: from here to sfStart nothing waits
+  sfApplyHash();                                                              // 2.0.6 (B): only when sfHashMb changed
   const res = await new Promise((resolve) => {
     const imp = Math.max(0, Math.min(100, imperfection || 0));
     const softMs = Math.max(0, Math.min(AGGRO_HARD_MAX_MS, Math.round(Number(msg.softMs)) || 0));
@@ -720,6 +775,7 @@ function stopEngines() {
   ponderSpares = []; ponderActive = []; ponderCancelling = [];
   if (sf) { try { sf.terminate(); } catch (e) { /* ignore */ } }
   sf = null; sfReady = null; sfActive = null; sfCurrent = null; sfNext = null; sfPrevCount = null; sfMultiPvSent = null; sfThreadsSent = SF_THREADS; lastMainPv = null;
+  sfHashSent = null; sfSpin = {};
   if (aggroMain) { aggroMain.kill(); aggroMain = null; }
   sfModuleP.clear(); aggroModuleP = null;                       // compiled again on the next start
   Object.assign(sfModuleInfo, { shared: false, ms: null, how: null, error: null, file: null });
@@ -1467,7 +1523,11 @@ async function runIdleSfJob(msg, token) {
   const rank = { owner: null, next: 0, pending: 0, ended: false };
   let rankedList = null, resolveRanked = null;
   const ranked = new Promise((r) => { resolveRanked = r; });
-  const setRanked = (list) => { if (!rankedList) { rankedList = CV.moveFirst(list, predicted); resolveRanked(); } };
+  const setRanked = (list) => {
+    if (rankedList) return;
+    rankedList = CV.moveFirst(list, predicted);
+    resolveRanked();
+  };
   if (mode === 'single') setRanked(legal.slice());
   let passes = null;
   const getPasses = () => passes || (passes = createReplyPasses({ token, ranked: rankedList, firstSlice: slice, left, until: !!msg.ponderUntilMove,
@@ -1694,6 +1754,7 @@ function migrateAtStart() {
   gameSerial(migrateSavedGames).catch((e) => { gameDbg.migrateError = String((e && e.message) || e); console.error('[ChessVision] saved games migration failed (will retry)', e); });
 }
 
+
 // ======================= Messaging =======================
 api.runtime.onMessage.addListener((msg, sender) => {
   if (msg && msg.type === 'allowlist') return loadAllowlist();
@@ -1703,7 +1764,7 @@ api.runtime.onMessage.addListener((msg, sender) => {
   if (msg && msg.type === 'aggroInvalidate') { ponderWanted = false; ponderCancel(); return Promise.resolve({ ok: true }); }   // also frees the spares
   if (msg && msg.type === 'aggroIdle') return withEngine(async () => { const r = aggroIdle(msg); if (r && r.state === 'started') startIdleStatus(msg, sender); return r; });
   if (msg && msg.type === 'hitTopUp') return withEngine(() => hitFinal(msg.id));
-  if (msg && msg.type === 'warm') return withEngine(() => warmEngine(msg.engine));
+  if (msg && msg.type === 'warm') { sfHashFrom(msg); return withEngine(() => warmEngine(msg.engine)); }
   if (msg && msg.type === 'saveGame') return saveGame(msg.record, msg.max);
   if (msg && msg.type === 'listGames') return listGames();
   if (msg && msg.type === 'clearGames') return clearGames();
@@ -1718,7 +1779,8 @@ api.runtime.onMessage.addListener((msg, sender) => {
       aggroWorkerAlive: !!(aggroMain && !aggroMain.dead), aggroRestarts: aggroDbg.restarts, aggroFailure: aggroFailure ? aggroFailure.message : null,
       ponderPool: { cap: ponderCap, active: ponderActive.filter((w) => !w.dead).length, spares: ponderSpares.filter((w) => !w.dead).length, wanted: ponderWanted },
       module: { ...aggroModuleInfo, sendFailures: aggroDbg.moduleSendFailures }, ponderHashMb, ponderStepped: PONDER_STEPPED, workerStarts: aggroDbg.workerStarts, lastWorkerStart: aggroDbg.lastStart,
-      stockfish: { active: sfActive, relaxedSimd: { probe: sfRelaxedOk, failed: sfDbg.rsimdFailed }, threads: sfThreadsSent, threadedFailed: sfDbg.threadedFailed, threadedStarts: sfDbg.threadedStarts, sab: sfSab, module: { ...sfModuleInfo, sendFailures: sfDbg.moduleSendFailures },
+      stockfish: { active: sfActive, relaxedSimd: { probe: sfRelaxedOk, failed: sfDbg.rsimdFailed }, threads: sfThreadsSent, threadedFailed: sfDbg.threadedFailed, rsimdThreadedFailed: sfDbg.rsimdThreadedFailed, threadedRsimd: !!CV.SF_THREADED_RSIMD, threadedStarts: sfDbg.threadedStarts,
+        hashMb: sfHashSent, hashWanted: sfHashWant, hashChanges: sfDbg.hashChanges, mainWaitStop: { capMs: CV.SF_MAIN_WAIT_STOP_MS, waits: sfDbg.mainWaits, lastMs: sfDbg.mainWaitMs.slice() }, sab: sfSab, module: { ...sfModuleInfo, sendFailures: sfDbg.moduleSendFailures },
         poolKind: ponderKind, cancelling: ponderCancelling.length, harvested: sfDbg.harvested, harvestFailed: sfDbg.harvestFailed, kills: { ...sfDbg.kills }, cancelMs: sfDbg.cancelMs.slice(), claimedWhileStopping: sfDbg.claimedWhileStopping, claimReplaced: sfDbg.claimReplaced, overruns: sfDbg.overruns, lastOverruns: sfDbg.lastOverruns.slice(), workerStarts: sfDbg.workerStarts, lastWorkerStart: sfDbg.lastStart, rankMode: SF_RANK_MODE,
         searchMode: sfLast ? sfLast.mode : null, depthDone: sfLast ? sfLast.depthDone : null, softMs: sfLast ? sfLast.softMs : null, elapsedMs: sfLast ? sfLast.elapsedMs : null,
         lastSearch: sfLast, pvSeeds: sfDbg.pvSeeds, mainWarmMs: sfDbg.mainWarmMs === undefined ? null : sfDbg.mainWarmMs },
@@ -1729,9 +1791,10 @@ api.runtime.onMessage.addListener((msg, sender) => {
         running: { stockfish: !!sfReady, aggro: !!(aggroMain && !aggroMain.dead) } } });
   }
   if (!msg || msg.type !== 'analyze') return;
-  return withEngine(() => (msg.engine === 'stockfish'
+  const run = withEngine(() => (msg.engine === 'stockfish'
     ? analyzeStockfish(msg.fen, msg.depth, msg.imperfection, msg.sfMaxMs, msg.startFen, msg.moves, msg)
     : analyzeAggro(msg)));
+  return run;
 });
 
 migrateAtStart();

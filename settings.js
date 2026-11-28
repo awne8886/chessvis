@@ -52,6 +52,7 @@
     sfPonderWorkers: 1,       // ponder workers sharing the opponent's moves (capped by the CPU count; each costs wasm memory + its hash)
     sfPonderHashMb: 16,       // hash table of each ponder worker in MB (the main worker keeps 32)
     sfThreads: 1,             // search threads of the MAIN worker; above 1 only with the threaded build and only if the browser allows SharedArrayBuffer
+    sfHashMb: 32,             // 2.0.6: hash table of the MAIN worker in MB (32 = 2.0.5; the ponder workers keep sfPonderHashMb)
 
     // --- 2.0.0: speed (both engines unless noted) ---
     earlyPonder: true,        // start pondering the moment our move is decided, not when the board shows it (false = 1.8.0)
@@ -100,7 +101,8 @@
     sfPonderMs: [200, 5000, 100],
     sfPonderWorkers: [1, 7, 1],
     sfPonderHashMb: [4, 64, 4],
-    sfThreads: [1, 4, 1],
+    sfThreads: [1, 7, 1],            // 2.0.6: 7 (was 4); the effective count is still capped at cores - 1
+    sfHashMb: [16, 256, 16],
     ponderMaxMs: [1000, 30000, 500],
     saveSacrificeThreshold: [1, 20, 1],
     maxSavedGames: [5, 200, 1],
@@ -357,7 +359,9 @@
   // ---- Stockfish 1.8.0 helpers (pure; used by background.js and content.js) ----
   // Can this browser context run the threaded Stockfish build? It needs SharedArrayBuffer, Atomics and shared WebAssembly
   // memory. `env` is what the caller sees (globalThis in a browser); a test passes a fake. crossOriginIsolated is reported
-  // but not required: an extension page may have SharedArrayBuffer without it (not verified for Firefox, hence this test).
+  // but not required: an extension page may have SharedArrayBuffer without it. 2.0.6: release Firefox has none in the
+  // extension background page; Firefox Nightly with dom.postMessage.sharedArrayBuffer.bypassCOOP_COEP.insecure.enabled has
+  // it (owner-verified on Android with 2.0.5: sab.ok true, crossOriginIsolated false), hence this test.
   CV.sabSupport = function (env) {
     env = env || {};
     const checks = {
@@ -374,7 +378,7 @@
     return { ok: !failed, reason: failed ? failed + ' missing' : null, checks };
   };
 
-  // Search threads for the main worker: the setting (1-4), at most max(1, hardwareConcurrency - 1) so the page keeps a core,
+  // Search threads for the main worker: the setting (1-7 since 2.0.6), at most max(1, hardwareConcurrency - 1) so the page keeps a core,
   // and 1 whenever the threaded build cannot run (sabOk false). Unknown CPU count -> 1.
   CV.sfThreadCount = function (setting, hardwareConcurrency, sabOk) {
     const lim = CV.LIMITS.sfThreads;
@@ -384,6 +388,22 @@
     const cap = Number.isFinite(hc) && hc > 0 ? Math.min(lim[1], Math.max(1, hc - 1)) : 1;
     return Math.min(want, cap);
   };
+
+  // 2.0.6 (C): the threaded builds to try for the main worker, best first: 'rsimd' (engine/stockfish-19-lite-rsimd.js, the
+  // relaxed-SIMD build, only when the relaxed probe validates and CV.SF_THREADED_RSIMD is on), then 'npm' (the npm
+  // stockfish 19.0.1 threaded build of 2.0.5). A build that failed to start once is left out for good (failed.rsimd /
+  // failed.npm); [] = stay on the single-thread engine. CV.SF_THREADED_RSIMD = false: 2.0.5 (the npm build only).
+  CV.SF_THREADED_RSIMD = true;
+  CV.sfThreadedCandidates = function ({ relaxedOk, failed } = {}) {
+    const f = failed || {};
+    const out = [];
+    if (CV.SF_THREADED_RSIMD && relaxedOk && !f.rsimd && !f.npm) out.push('rsimd');
+    if (!f.npm) out.push('npm');
+    return out;
+  };
+  // 2.0.6 (A3): on a `late` / `miss` the main search may wait until the ponder workers it just stopped answered readyok,
+  // at most this long (0 = 2.0.5: `go` at once). See the 2.0.6 changelog for the measurement behind the value.
+  CV.SF_MAIN_WAIT_STOP_MS = 0;
 
   // The time cap of a Stockfish search (ms, 0 = none): the smaller of the user's cap (sfMaxMs) and the clock budget (soft),
   // ignoring whichever is 0 / unusable. The clock budget is already <= remaining / 4 (clock.js).
@@ -698,6 +718,7 @@
     while (out.length > 1 && total > cap) { const g = out.pop(); dropped.push(g.id); total -= g.bytes + 1; }
     return { list: out, dropped };
   };
+
 
   // ---- allowed pages (allowed-pages.txt) ----
   // Turns the file's text into a list of normalised entries.

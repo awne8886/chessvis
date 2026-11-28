@@ -161,13 +161,15 @@ function makeBackground(opts = {}) {
   const ctx = vm.createContext({
     ...sab,
     ...fakeWasm,
+    // 2.0.6: both fakes together (the relaxed probe and a shareable Memory): the threaded relaxed-SIMD build is tried
+    ...(opts.sab && opts.wasm ? { WebAssembly: { ...fakeWasm.WebAssembly, Memory: WebAssembly.Memory } } : {}),
     console: opts.quiet === false ? console : { log() {}, warn() {}, error() {} },
     // 2.0.4: a long timer (the engines' idle shutdown, 10 min) must not keep a finished test process alive
     setTimeout: (fn, ms, ...rest) => { const t = setTimeout(fn, ms, ...rest); if (ms > 60000 && t.unref) t.unref(); return t; },
     clearTimeout, setInterval, clearInterval,
     navigator: { hardwareConcurrency: opts.cores || 4 },
     Worker: FakeWorker,
-    browser: { runtime: { getURL: (p) => p, onMessage: { addListener(fn) { handler = fn; } }, onConnect: { addListener(fn) { connectHandlers.push(fn); } } },
+    browser: { runtime: { getURL: (p) => p, getManifest: () => ({ version: 'test' }), onMessage: { addListener(fn) { handler = fn; } }, onConnect: { addListener(fn) { connectHandlers.push(fn); } } },
       storage: opts.storage || makeStorage() },
   });
   // 2.0.4: runtime.connect ports (A4). connect(name) -> the page's end: { postMessage, onMessage, onDisconnect, disconnect }
@@ -188,7 +190,9 @@ function makeBackground(opts = {}) {
     for (const fn of connectHandlers) fn(back);
     return page;
   }
-  for (const f of ['settings.js', 'chessmini.js', 'background.js']) {
+  // 2.0.6: ponderstats.js (the temporary ponder-stats recorder) when the tree has it, as in manifest.json
+  const files = ['settings.js', 'chessmini.js', 'ponderstats.js', 'background.js'].filter((f) => f !== 'ponderstats.js' || fs.existsSync(path.join(opts.root || ROOT, f)));
+  for (const f of files) {
     vm.runInContext(fs.readFileSync(path.join(opts.root || ROOT, f), 'utf8'), ctx, { filename: f });
     if (f === 'settings.js' && opts.setup) vm.runInContext(opts.setup, ctx);     // 2.0.4: constants read at load (CV.LAZY_ENGINES)
   }
