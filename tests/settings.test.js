@@ -2,7 +2,7 @@
 'use strict';
 const assert = require('node:assert');
 const { load, runner } = require('./_load');
-const CV = load();
+const CV = load('humanize.js');
 const { test, run } = runner('settings');
 
 const NEW = { earlyPonder: true, boardDebounceMs: 40, sfSearchMode: 'delay', ponderHitFast: true, ponderUntilMove: true, ponderMaxMs: 8000,
@@ -51,6 +51,30 @@ test('the 1.8.0 behaviour is reachable through settings', () => {
   const old = CV.sanitize({ earlyPonder: false, boardDebounceMs: 250, sfSearchMode: 'depth', ponderHitFast: false, ponderUntilMove: false });
   assert.deepStrictEqual(old, { earlyPonder: false, boardDebounceMs: 250, sfSearchMode: 'depth', ponderHitFast: false, ponderUntilMove: false });
   assert.strictEqual(typeof CV.AGGRO_DELAY_MATCH, 'boolean', 'AggroChess pause budget is a constant');
+});
+
+test('2.0.5: up to 7 ponder workers, still capped at cores - 1; delays may be 0', () => {
+  assert.deepStrictEqual(CV.LIMITS.aggroPonderWorkers, [1, 7, 1]);
+  assert.deepStrictEqual(CV.LIMITS.sfPonderWorkers, [1, 7, 1]);
+  assert.strictEqual(CV.ponderWorkerCount(7, 8), 7);       // 8 cores (e.g. Dimensity 9500)
+  assert.strictEqual(CV.ponderWorkerCount(7, 4), 3);       // 4 cores: unchanged from 2.0.4
+  assert.strictEqual(CV.ponderWorkerCount(9, 16), 7);
+  assert.strictEqual(CV.ponderWorkerCount(7, undefined), 1);
+  assert.deepStrictEqual(CV.sanitize({ minDelay: 0, maxDelay: 0, quickMinDelay: 0, quickMaxDelay: 0 }), { minDelay: 0, maxDelay: 0, quickMinDelay: 0, quickMaxDelay: 0 });
+  const cfg = { ...CV.DEFAULTS, minDelay: 0, maxDelay: 0, quickMinDelay: 0, quickMaxDelay: 0 };
+  for (let i = 0; i < 200; i++) {
+    assert.strictEqual(CV.human.delayFor(cfg, {}), 0);
+    assert.strictEqual(CV.human.delayFor(cfg, { fastReply: true }), 0);
+  }
+});
+
+test('2.0.5: the Stockfish ranking covers the moves the deepening passes use', () => {
+  assert.strictEqual(CV.sfRankLines(8, 1), 8);             // 1-4 workers: 8 lines, as before
+  assert.strictEqual(CV.sfRankLines(8, 4), 8);
+  assert.strictEqual(CV.sfRankLines(8, 6), 12);
+  assert.strictEqual(CV.sfRankLines(8, 7), 14);
+  assert.strictEqual(CV.sfRankLines(8, 20), 14);
+  for (let w = 1; w <= 7; w++) assert.ok(CV.sfRankLines(8, w) >= Math.min(CV.SF_RANK_LINES_MAX, Math.max(2, 2 * w)));
 });
 
 run();

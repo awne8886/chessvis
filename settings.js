@@ -86,19 +86,19 @@
     depth: [1, 20, 1],
     sfMaxMs: [0, 10000, 100],
     thinkMs: [200, 5000, 100],
-    minDelay: [100, 3000, 50],
-    maxDelay: [100, 3000, 50],
+    minDelay: [0, 3000, 50],
+    maxDelay: [0, 3000, 50],
     imperfection: [0, 30, 1],
-    quickMinDelay: [40, 1000, 10],
-    quickMaxDelay: [40, 1500, 10],
+    quickMinDelay: [0, 1000, 10],
+    quickMaxDelay: [0, 1500, 10],
     quickThinkMs: [100, 2000, 50],
     watchdogMs: [200, 5000, 100],
     boardDebounceMs: [0, 300, 10],
     aggroPonderMs: [200, 5000, 100],
-    aggroPonderWorkers: [1, 3, 1],
+    aggroPonderWorkers: [1, 7, 1],   // 2.0.5: 7 (was 3); the effective count is still capped at cores - 1
     aggroPonderHashMb: [4, 64, 4],
     sfPonderMs: [200, 5000, 100],
-    sfPonderWorkers: [1, 3, 1],
+    sfPonderWorkers: [1, 7, 1],
     sfPonderHashMb: [4, 64, 4],
     sfThreads: [1, 4, 1],
     ponderMaxMs: [1000, 30000, 500],
@@ -253,7 +253,7 @@
     return 'position fen ' + (typeof startFen === 'string' && startFen && Array.isArray(moves) ? startFen : fen);
   };
 
-  // How many ponder workers may run: the setting (1-3), at most max(1, hardwareConcurrency - 1) so the main worker and the
+  // How many ponder workers may run: the setting (1-7), at most max(1, hardwareConcurrency - 1) so the main worker and the
   // page keep a core. An unknown CPU count (undefined, 0, not a number) counts as 1 core: one worker, the old behaviour.
   CV.ponderWorkerCount = function (setting, hardwareConcurrency) {
     const lim = CV.LIMITS.aggroPonderWorkers;
@@ -261,6 +261,15 @@
     const hc = Math.floor(Number(hardwareConcurrency));
     const cap = Number.isFinite(hc) && hc > 0 ? Math.max(1, hc - 1) : 1;
     return Math.min(want, cap);
+  };
+
+  // 2.0.5: MultiPV lines of the Stockfish ranking search. The deepening passes work on the top max(2, 2 x workers) moves
+  // (CV.ponderDeepenPlan); below the ranked lines the order is just the legal-move order, so with many workers the
+  // ranking covers 2 x workers lines (at least `base`, at most CV.SF_RANK_LINES_MAX: each extra line costs ranking depth).
+  CV.SF_RANK_LINES_MAX = 14;
+  CV.sfRankLines = function (base, workers) {
+    const b = Math.max(1, Math.floor(Number(base)) || 8), w = Math.max(1, Math.floor(Number(workers)) || 1);
+    return Math.min(Math.max(b, CV.SF_RANK_LINES_MAX), Math.max(b, 2 * w));
   };
 
   // Identity of a position by its history: same start and same moves = same key.

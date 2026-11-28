@@ -48,7 +48,7 @@ Temporary add-ons disappear when Firefox restarts. A permanent unsigned install 
  │ content.js   reads the DOM, drives the loop, │   messages    │ background.js                                │
  │              sends pointer events            │ ───────────▶ │   Stockfish main worker  (UCI, wasm)         │
  │ overlay.js   the panel (Shadow DOM)          │ ◀─────────── │   AggroChess main worker (wasm exports)      │
- │                                              │               │   ponder pool: 1-3 extra workers + spares    │
+ │                                              │               │   ponder pool: 1-7 extra workers + spares    │
  │ pure modules (no DOM, unit-testable):        │   port (2.0.4)│   compiles each .wasm ONCE, posts the Module │
  │   boardstate.js  chessmini.js  humanize.js   │ ◀ ─ ─ ─ ─ ─ ─ │   serves allowed-pages.txt, downloads icons  │
  │   clock.js  recorder.js  pgn.js  brilliant.js│ ponder status │   stores the saved games (2.0.4)             │
@@ -148,7 +148,7 @@ Classic pondering guesses **one** opponent move and searches it. Measured in thi
 ### The worker pool
 
 * **Separate workers, never the main one.** The main worker is reserved for the real search, so a real search **never waits** for pondering. A miss cancels the ponder workers and the main search starts immediately.
-* **1-3 ponder workers** (`*PonderWorkers`), capped at `max(1, hardwareConcurrency − 1)` so the main search and the page keep a core.
+* **1-7 ponder workers** (`*PonderWorkers`; 1-3 before 2.0.5), capped at `max(1, hardwareConcurrency − 1)` so the main search and the page keep a core. With more than 4 Stockfish workers the ranking search covers `2 × workers` lines (at most 14, `CV.sfRankLines`), so the deepening passes, which work on the top `2 × workers` moves, deepen ranked moves rather than moves in legal-move order.
 * **Shared queues.** All ponder workers pull from one ranking queue and one reply queue: whichever worker is free takes the next opponent move.
 * **Warm spares.** After a job, replacements are created and warmed up **in advance** (`ponderTopUp`), so the next job starts at once. Spares are only made while pondering is wanted and never while a real search runs (instantiating a worker would steal CPU from it).
 * **Cancelling.** Stockfish workers are cancelled with `stop` + `isready` (~20 ms) and **recycled** with their hash; `terminate()` is only the escape hatch if they do not answer within 1.5 s. Since 2.0.3 a new job takes workers that are still stopping instead of starting new ones (the next job begins right after a hit, a few ms before the last job's workers are free; 2.0.2 started fresh workers and terminated the stopped ones: 0.87 starts per job on a phone, 0.25 now in the page harness). AggroChess workers (2.0.2): an idle one goes back to the spares with its hash; a busy one is stopped and recycled the same way when it is interruptible (JSPI, answer within 150 ms), else terminated and replaced by a warm spare. A new game sends `clear` to a recycled worker; the worker that searched the line that was played gets the next job first.

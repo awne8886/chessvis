@@ -1502,7 +1502,7 @@ async function runIdleSfJob(msg, token) {
       if (mode === 'multipv') {
         if (!rank.owner) {                                      // the first worker that is ready ranks; the others wait for the list
           rank.owner = w;
-          const k = Math.min(legal.length, SF_RANK_LINES), ms = Math.max(30, Math.min(SF_RANK_MS, Math.floor(budget * SF_PONDER_SCAN_SHARE)));
+          const k = Math.min(legal.length, CV.sfRankLines(SF_RANK_LINES, pool.length)), ms = Math.max(30, Math.min(SF_RANK_MS, Math.floor(budget * SF_PONDER_SCAN_SHARE)));
           try {
             const r = await w.search(msg.startFen, msg.moves, 'go movetime ' + ms, 'rank', k);   // not depth-limited: the ranking should use its time
             if (token !== idleToken) return;
@@ -1709,7 +1709,7 @@ api.runtime.onMessage.addListener((msg, sender) => {
   if (msg && msg.type === 'clearGames') return clearGames();
   if (msg && msg.type === 'aggroIdleStatus') return Promise.resolve({ pondering: idleInfo.pondering, evalLine: idleInfo.evalLine, found: ponder.found() });
   if (msg && msg.type === 'aggroDebug') {
-    return Promise.resolve({ ponder: { ...ponder.counters, passes: ponderDbg.lastPasses, maxPasses: ponderDbg.maxPasses, settled: { enabled: !!CV.PONDER_SETTLE, replies: ponderDbg.settled, jobsEnded: ponderDbg.settledJobs }, hitDepths: ponderDbg.hitDepths.slice(), harvestUpgrades: ponderDbg.harvestUpgrades, lateWaits: ponderDbg.lateWaits, lateWaitHits: ponderDbg.lateWaitHits,
+    return Promise.resolve({ cpu: { hardwareConcurrency: typeof navigator !== 'undefined' ? navigator.hardwareConcurrency : null, ponderCap }, ponder: { ...ponder.counters, passes: ponderDbg.lastPasses, maxPasses: ponderDbg.maxPasses, settled: { enabled: !!CV.PONDER_SETTLE, replies: ponderDbg.settled, jobsEnded: ponderDbg.settledJobs }, hitDepths: ponderDbg.hitDepths.slice(), harvestUpgrades: ponderDbg.harvestUpgrades, lateWaits: ponderDbg.lateWaits, lateWaitHits: ponderDbg.lateWaitHits,
       hitTopUp: { started: ponderDbg.topUps, used: ponderDbg.topUpUsed, changed: ponderDbg.hitChanged, depths: ponderDbg.topUpDepths.slice() },
       interrupt: { enabled: !!CV.AGGRO_INTERRUPT, mainInterruptible: !!(aggroMain && aggroMain.interruptible), stops: ponderDbg.stops, ok: ponderDbg.stopsOk, failed: ponderDbg.stopsFailed,
         stopMs: ponderDbg.stopMs.slice(), lateStops: ponderDbg.lateStops, lateStopHits: ponderDbg.lateStopHits, claimedWhileStopping: ponderDbg.claimStopping },
