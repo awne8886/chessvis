@@ -260,7 +260,9 @@ details[open] summary .arrow { transform: rotate(90deg); }
           small('Copy PGN', () => copyOrShow(g.pgn, 'PGN copied'))));
       }
     }
+    let gamesDirty = true;            // 2.0.4 (C2): the list changed while "Game saving" was closed (or was never read)
     async function refreshGames() {
+      gamesDirty = false;
       try { games = (await opts.onListGames()) || []; } catch (e) { games = []; }
       renderGames();
     }
@@ -294,7 +296,9 @@ details[open] summary .arrow { transform: rotate(90deg); }
           el('button', { class: 'btn', type: 'button', onclick: () => { if (games.length) downloadOrCopy('chessvision-games.pgn', games.map((g) => g.pgn).join('\n')); else flashG('No saved games'); } }, 'Download all as one .pgn'),
           clearBtn),
         gmsg));
-    gameDet.addEventListener('toggle', () => { if (gameDet.open) refreshGames(); });
+    gameDet.addEventListener('toggle', () => { if (gameDet.open && gamesDirty) refreshGames(); });
+    // the saved games changed (storage.onChanged in content.js): read them now only while the section is open
+    const gamesChanged = () => { if (gameDet.open) refreshGames(); else gamesDirty = true; };
 
     // ---- body ----
     const depthRow = slider('depth', 'Search depth', (v) => String(v));
@@ -415,6 +419,7 @@ details[open] summary .arrow { transform: rotate(90deg); }
       setEval(text) { evalLine.textContent = text || ''; },
       setWarn(text) { warnLine.textContent = text || ''; },
       refreshGames,
+      gamesChanged,
       setStatus(text, tone) {
         status.textContent = text;
         status.title = text;

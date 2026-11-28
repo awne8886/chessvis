@@ -1532,6 +1532,118 @@ async function loadAllowlist() {
   return allowlistText;
 }
 
+// ======================= Saved games (2.0.4, C2) =======================
+// One storage key per game (CV.SAVED_GAME_PREFIX + id) and an index of ids, newest first (CV.SAVED_GAMES_INDEX). 2.0.3
+// rewrote the whole list (up to maxSavedGames, 200 at most) on every save, from each tab, serialised per tab only, and
+// storage.onChanged carried the old and the new list to every tab. Now the tabs ask the background (saveGame,
+// listGames, clearGames) and the background does one operation at a time: a save writes that game's key and the
+// index in one set() (and removes the keys that fell out). The pruning rules are mergeSaved's (CV.mergeSavedIndex).
+// The sizes of stored games are kept in memory (read once per background start, only when unknown).
+const gameStore = () => api.storage && api.storage.local;
+let gameChain = Promise.resolve();
+const gameSizes = new Map();          // id -> CV.savedGameBytes of the stored record
+function gameSerial(fn) {
+  const p = gameChain.then(fn);
+  gameChain = p.catch(() => {});
+  return p;
+}
+const gameKey = (id) => CV.SAVED_GAME_PREFIX + id;
+async function gameIndex() {
+  const g = await gameStore().get(CV.SAVED_GAMES_INDEX);
+  const ids = g && Array.isArray(g[CV.SAVED_GAMES_INDEX]) ? g[CV.SAVED_GAMES_INDEX] : [];
+  return ids.filter((id, i) => typeof id === 'string' && ids.indexOf(id) === i);
+}
+async function gameSizesFor(ids) {
+  const missing = ids.filter((id) => !gameSizes.has(id));
+  if (!missing.length) return;
+  const got = await gameStore().get(missing.map(gameKey));
+  for (const id of missing) { const r = got[gameKey(id)]; gameSizes.set(id, r ? CV.savedGameBytes(r) : 0); }
+}
+function saveGame(record, max) {
+  return gameSerial(async () => {
+    if (!record || typeof record.id !== 'string' || !record.id) return { ok: false, error: 'no record' };
+    await migrateQuietly();                                     // a failed migration never loses a new game
+    const ids = await gameIndex();
+    await gameSizesFor(ids);
+    const bytes = CV.savedGameBytes(record);
+    const lim = CV.LIMITS.maxSavedGames;
+    const m = Math.min(lim[1], Math.max(lim[0], Math.round(Number(max)) || CV.DEFAULTS.maxSavedGames));
+    const { list, dropped } = CV.mergeSavedIndex(ids.map((id) => ({ id, bytes: gameSizes.get(id) || 0 })), { id: record.id, bytes }, { max: m });
+    const kept = list.some((g) => g.id === record.id);
+    const write = { [CV.SAVED_GAMES_INDEX]: list.map((g) => g.id) };
+    if (kept) write[gameKey(record.id)] = record;
+    await gameStore().set(write);
+    if (kept) gameSizes.set(record.id, bytes);
+    if (dropped.length) { await gameStore().remove(dropped.map(gameKey)); for (const id of dropped) gameSizes.delete(id); }
+    gameDbg.saves++;
+    return { ok: true, kept, dropped: dropped.length, count: list.length };
+  });
+}
+function listGames() {
+  return gameSerial(async () => {
+    await migrateQuietly();
+    const ids = await gameIndex();
+    const got = ids.length ? await gameStore().get(ids.map(gameKey)) : {};
+    const list = ids.map((id) => got[gameKey(id)]).filter((r) => r && typeof r === 'object');
+    if (!gameMigrated) {                                        // the old list is still there: show its games too (older)
+      const old = (await gameStore().get(CV.SAVED_GAMES_LEGACY))[CV.SAVED_GAMES_LEGACY];
+      if (Array.isArray(old)) for (const r of old) if (r && r.id && !list.some((x) => x.id === r.id)) list.push(r);
+    }
+    return list;
+  });
+}
+function clearGames() {
+  return gameSerial(async () => {
+    await migrateQuietly();
+    const ids = await gameIndex();
+    await gameStore().set({ [CV.SAVED_GAMES_INDEX]: [] });
+    if (ids.length) await gameStore().remove(ids.map(gameKey));
+    if (!gameMigrated) { await gameStore().remove(CV.SAVED_GAMES_LEGACY); gameMigrated = true; }   // clear means all of them
+    gameSizes.clear();
+    return { ok: true, cleared: ids.length };
+  });
+}
+// One-way migration of the 2.0.3 list ('savedGames', newest first): every game is written under its own key with the
+// index, read back and compared, and only then is the old list removed. Nothing is pruned here (the next save prunes by
+// the usual rules). Idempotent: a migration interrupted after the write (or stopped by a failed check) is simply done
+// again at the next start; games saved meanwhile under the new keys stay in front (they are newer), and an id in both
+// keeps the per-key record. Runs once per background start, before the first save / list / clear (they wait for it).
+let gameMigrated = false;
+const gameDbg = { saves: 0, migrated: null, migrateError: null };
+async function migrateSavedGames() {
+  if (gameMigrated || !gameStore()) return;
+  const legacyKey = CV.SAVED_GAMES_LEGACY;
+  const got = await gameStore().get(legacyKey);
+  if (!(legacyKey in got)) { gameMigrated = true; return; }
+  const old = Array.isArray(got[legacyKey]) ? got[legacyKey].filter((r) => r && typeof r === 'object' && typeof r.id === 'string' && r.id) : [];
+  const ids = await gameIndex();
+  const cur = ids.length ? await gameStore().get(ids.map(gameKey)) : {};
+  const order = ids.filter((id) => cur[gameKey(id)]);
+  const write = {};
+  for (const r of old) {
+    if (order.includes(r.id)) continue;            // already migrated, or saved again under the new key (newer)
+    order.push(r.id); write[gameKey(r.id)] = r;
+  }
+  write[CV.SAVED_GAMES_INDEX] = order;
+  await gameStore().set(write);
+  const back = await gameStore().get([CV.SAVED_GAMES_INDEX, ...order.map(gameKey)]);
+  const okIndex = Array.isArray(back[CV.SAVED_GAMES_INDEX]) && back[CV.SAVED_GAMES_INDEX].join('\n') === order.join('\n');
+  const okGames = order.every((id) => back[gameKey(id)] && back[gameKey(id)].id === id);
+  if (!okIndex || !okGames) throw new Error('saved games: the migrated copy did not read back; the old list is kept');
+  await gameStore().remove(legacyKey);
+  for (const id of order) gameSizes.set(id, CV.savedGameBytes(back[gameKey(id)]));
+  gameMigrated = true;
+  gameDbg.migrated = { games: order.length, fromList: old.length, at: Date.now() };
+  console.log('[ChessVision] saved games moved to one key per game:', order.length);
+}
+async function migrateQuietly() {
+  try { await migrateSavedGames(); } catch (e) { gameDbg.migrateError = String((e && e.message) || e); }
+}
+function migrateAtStart() {
+  if (!gameStore()) return;
+  gameSerial(migrateSavedGames).catch((e) => { gameDbg.migrateError = String((e && e.message) || e); console.error('[ChessVision] saved games migration failed (will retry)', e); });
+}
+
 // ======================= Messaging =======================
 api.runtime.onMessage.addListener((msg) => {
   if (msg && msg.type === 'allowlist') return loadAllowlist();
@@ -1542,6 +1654,9 @@ api.runtime.onMessage.addListener((msg) => {
   if (msg && msg.type === 'aggroIdle') return withEngine(async () => aggroIdle(msg));
   if (msg && msg.type === 'hitTopUp') return withEngine(() => hitFinal(msg.id));
   if (msg && msg.type === 'warm') return withEngine(() => warmEngine(msg.engine));
+  if (msg && msg.type === 'saveGame') return saveGame(msg.record, msg.max);
+  if (msg && msg.type === 'listGames') return listGames();
+  if (msg && msg.type === 'clearGames') return clearGames();
   if (msg && msg.type === 'aggroIdleStatus') return Promise.resolve({ pondering: idleInfo.pondering, evalLine: idleInfo.evalLine, found: ponder.found() });
   if (msg && msg.type === 'aggroDebug') {
     return Promise.resolve({ ponder: { ...ponder.counters, passes: ponderDbg.lastPasses, maxPasses: ponderDbg.maxPasses, settled: { enabled: !!CV.PONDER_SETTLE, replies: ponderDbg.settled, jobsEnded: ponderDbg.settledJobs }, hitDepths: ponderDbg.hitDepths.slice(), harvestUpgrades: ponderDbg.harvestUpgrades, lateWaits: ponderDbg.lateWaits, lateWaitHits: ponderDbg.lateWaitHits,
@@ -1558,6 +1673,7 @@ api.runtime.onMessage.addListener((msg) => {
         searchMode: sfLast ? sfLast.mode : null, depthDone: sfLast ? sfLast.depthDone : null, softMs: sfLast ? sfLast.softMs : null, elapsedMs: sfLast ? sfLast.elapsedMs : null,
         lastSearch: sfLast, pvSeeds: sfDbg.pvSeeds, mainWarmMs: sfDbg.mainWarmMs === undefined ? null : sfDbg.mainWarmMs },
       aggroLastBudget: aggroDbg.lastBudget || null,
+      savedGames: { saves: gameDbg.saves, migrated: gameDbg.migrated, migrateError: gameDbg.migrateError },
       engines: { lazy: !!CV.LAZY_ENGINES, idleMs: CV.ENGINE_IDLE_MS, starts: { ...engineDbg.starts }, stops: engineDbg.stops, lastStopAt: engineDbg.lastStopAt, ports: enginePorts.size,
         running: { stockfish: !!sfReady, aggro: !!(aggroMain && !aggroMain.dead) } } });
   }
@@ -1567,6 +1683,7 @@ api.runtime.onMessage.addListener((msg) => {
     : analyzeAggro(msg)));
 });
 
+migrateAtStart();
 if (!CV.LAZY_ENGINES) {                 // 2.0.3: both engines start with the background page and are never stopped
   initStockfish();
   initAggro();

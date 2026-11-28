@@ -733,12 +733,12 @@
     rec.setMeta(names ? { myColor: pos.myColor, names } : { myColor: pos.myColor });
   }
 
-  // Stored under savedGames, newest first; saves are serialised so two games ending together cannot overwrite each other.
+  // 2.0.4 (C2): the background stores the game (one key per game + an index, one save at a time for every tab; see
+  // saveGame in background.js). 2.0.3 rewrote the whole savedGames list from here, serialised per tab only.
   function storeGame(record) {
     saveChain = saveChain.then(async () => {
-      const got = await api.storage.local.get({ savedGames: [] });
-      const list = CV.pgn.mergeSaved(Array.isArray(got.savedGames) ? got.savedGames : [], record, { max: cfg.maxSavedGames });
-      await api.storage.local.set({ savedGames: list });
+      const r = await api.runtime.sendMessage({ type: 'saveGame', record, max: cfg.maxSavedGames });
+      if (!r || !r.ok) throw new Error((r && r.error) || 'no answer');
       log('saved game', record.id, record.result, 'sacrifices', record.sacrifices);
     }).catch((e) => console.error('[ChessVision] could not save the game', e));
     return saveChain;
@@ -966,8 +966,8 @@
     onDebug: debugInfo,
     onClearEngines: () => api.runtime.sendMessage({ type: 'clearEngines' }).catch(() => {}),
     onSaveNow: () => saveCurrentNow().catch((e) => 'Could not save: ' + (e && e.message || e)),
-    onListGames: async () => { const g = await api.storage.local.get({ savedGames: [] }); return Array.isArray(g.savedGames) ? g.savedGames : []; },
-    onClearGames: () => api.storage.local.set({ savedGames: [] }),
+    onListGames: async () => { const g = await api.runtime.sendMessage({ type: 'listGames' }); return Array.isArray(g) ? g : []; },
+    onClearGames: () => api.runtime.sendMessage({ type: 'clearGames' }),
     onReset() {
       const keep = { overlayOpen: cfg.overlayOpen, overlayX: cfg.overlayX, overlayY: cfg.overlayY };
       const fresh = { ...CV.DEFAULTS, ...keep };
@@ -986,8 +986,11 @@
     if (document.hidden && (cfg.engine === 'aggro' || cfg.sfPonder)) { idleKey = null; idlePondering = false; idleFound = 0; api.runtime.sendMessage({ type: 'aggroInvalidate' }).catch(() => {}); }
   });
   api.storage.onChanged.addListener((changes) => {
-    if (changes.savedGames && ui) ui.refreshGames();
-    if (Object.keys(changes).every((k) => k === 'savedGames')) return;
+    // 2.0.4 (C2): saved games are 'game:<id>' keys + 'savedGameIds' (and the old 'savedGames' during the migration); the
+    // list is re-read only while "Game saving" is open (else when it is next opened)
+    const keys = Object.keys(changes);
+    if (keys.some(CV.isSavedGameKey) && ui) ui.gamesChanged();
+    if (keys.every(CV.isSavedGameKey)) return;
     const next = {};
     for (const k in changes) next[k] = changes[k].newValue;
     // 2.0.4 (C1): the echo of this tab's own write (every value already equals cfg): nothing to apply or re-render

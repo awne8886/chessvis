@@ -612,6 +612,32 @@
     return 'go wtime ' + w + ' btime ' + b + ' winc ' + n(c.winc) + ' binc ' + n(c.binc);
   };
 
+  // ---- saved games (2.0.4, C2; pure, used by background.js) ----
+  // Saved games live under one storage key per game ('game:' + id) plus a small index of ids, newest first
+  // (SAVED_GAMES_INDEX); the background page writes them, one save at a time. Before 2.0.4 the whole list was one key,
+  // 'savedGames', rewritten on every save; it is migrated once (background.js).
+  CV.SAVED_GAME_PREFIX = 'game:';
+  CV.SAVED_GAMES_INDEX = 'savedGameIds';
+  CV.SAVED_GAMES_LEGACY = 'savedGames';
+  CV.SAVED_GAMES_MAX_BYTES = 4 * 1024 * 1024;   // = pgn.js SAVED_MAX_BYTES: the list is trimmed (oldest first) above this size
+  CV.isSavedGameKey = (k) => k === CV.SAVED_GAMES_INDEX || k === CV.SAVED_GAMES_LEGACY || String(k).startsWith(CV.SAVED_GAME_PREFIX);
+  CV.savedGameBytes = (rec) => JSON.stringify(rec).length;
+  // CV.pgn.mergeSaved's rules on an index of { id, bytes } (bytes = CV.savedGameBytes of the record) instead of the
+  // records: newest first, one entry per id (a re-save replaces it in place), at most `max`, and the JSON of the whole
+  // list at most maxBytes (a JSON array of n records is 2 + sum(bytes) + (n - 1) long). Returns { list, dropped }:
+  // the new index and the ids that fell out, the same ids in the same order as mergeSaved (tests/saved-games.test.js).
+  CV.mergeSavedIndex = function (index, entry, { max, maxBytes } = {}) {
+    const limit = Math.max(1, max || 50), cap = maxBytes || CV.SAVED_GAMES_MAX_BYTES;
+    const out = index.slice();
+    const i = out.findIndex((g) => g.id === entry.id);
+    if (i >= 0) out[i] = entry; else out.unshift(entry);
+    const dropped = [];
+    while (out.length > limit) dropped.push(out.pop().id);
+    let total = 2 + out.reduce((n, g) => n + g.bytes, 0) + Math.max(0, out.length - 1);
+    while (out.length > 1 && total > cap) { const g = out.pop(); dropped.push(g.id); total -= g.bytes + 1; }
+    return { list: out, dropped };
+  };
+
   // ---- allowed pages (allowed-pages.txt) ----
   // Turns the file's text into a list of normalised entries.
   CV.parseAllowlist = function (text) {
