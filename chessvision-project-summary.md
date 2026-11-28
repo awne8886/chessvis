@@ -1,6 +1,6 @@
 # ChessVision: project context
 
-**What it is.** A Firefox (Manifest V2) extension, now version 2.0.4, that plays against chess.com bots automatically. It reads the board from the page, asks a local engine for a move, and plays it with synthetic pointer events. Two engines are available: Stockfish (wasm lite NNUE, with an asm fallback; optional pondering pool and threaded build since 1.8.0) and AggroChess (a small Tal-style wasm engine). Maia-3 was removed in 1.7.8 (file size). There is an on-page panel with the settings. It only runs on pages listed in `allowed-pages.txt`. The author runs it on Firefox for Android.
+**What it is.** A Firefox (Manifest V2) extension, now version 2.0.6, that plays against chess.com bots automatically. It reads the board from the page, asks a local engine for a move, and plays it with synthetic pointer events. Two engines are available: Stockfish (wasm lite NNUE, with an asm fallback; optional pondering pool and threaded build since 1.8.0) and AggroChess (a small Tal-style wasm engine). Maia-3 was removed in 1.7.8 (file size). There is an on-page panel with the settings. It only runs on pages listed in `allowed-pages.txt`. The author runs it on Firefox for Android.
 
 **Architecture (keep this separation).**
 - **Page scripts (`content.js`, `overlay.js`):** DOM reading and the panel only.
@@ -8,6 +8,15 @@
 - **Background page (`background.js`):** engine workers, timeouts, the ponder job, image downloads.
 - **Background page (2.0.4):** engines start on first use and stop when idle; one port per tab (ponder status push, tab presence); saved games (one key per game).
 - **Constraints:** no new runtime dependencies and no build step for the extension (2.0.2: engine binaries are built only by the pinned `tools/build-*.sh` scripts, with sha256 in `engine/NOTICE.txt`). The only manifest changes allowed are the version, new content scripts and, when explicitly approved, a permission. Tests run with plain Node (`for t in tests/*.test.js; do node "$t" || exit 1; done`); CI is described in the 1.8.0 notes but `.github/` is not in the repository.
+
+## What was done in the 2.0.6 work (main-search threads / hash, relaxed-SIMD threaded build, ponder-stats recorder; `docs/OPUS_PROMPT_2.0.6.md`)
+Input: the owner's phone (Dimensity 9500, 8 cores, Firefox Nightly 163 for Android) runs the threaded build with `dom.postMessage.sharedArrayBuffer.bypassCOOP_COEP.insecure.enabled` (Copy debug info: threads 4, `sab.ok true`, `crossOriginIsolated` false). Numbers in `docs/REFERENCE.md` (2.0.6 changelog). 2.0.5 behaviour reachable: `sfThreads` 1 / `sfHashMb` 32 defaults, `CV.SF_THREADED_RSIMD = false`, `CV.SF_MAIN_WAIT_STOP_MS = 0`, `CV.PONDER_STATS = false`.
+- **A** `sfThreads` 1-7 (capped at cores - 1). `CV.SF_MAIN_WAIT_STOP_MS` (main `go` waits for stopping ponder workers): measured in Chromium with real engines, no kills with or without it, the wait only delays the move 30-40 ms: kept at 0. The phone's `no readyok after stop` kills are not explained by that overlap.
+- **B** `sfHashMb` (16-256, default 32), main worker only; `setoption name Hash` right before the next search when changed. No depth gain for 128 vs 32 MB in single searches (Chromium); memory ~ hash size on top of the engine.
+- **C** `engine/stockfish-19-lite-rsimd.js/.wasm` built by `tools/build-stockfish.sh` (the plain threaded build reproduces the npm files byte for byte); candidate chain rsimd threaded -> npm threaded -> single (`CV.sfThreadedCandidates`). Threads 1 signature = 748 260 (Node test). Chromium nps +37 to +49% at 1/2/4/7 threads. `--lean` keeps both threaded builds.
+- **D (temporary)** ponder-stats recorder: `ponderstats.js` + marked `PONDER_STATS (temporary)` blocks; per-game storage keys, one-file export from the panel. Removal steps in REFERENCE ("Temporary: ponder stats"); a stripped copy was checked to pass all tests.
+- **Tests:** 16 files green (new `ponder-stats`; `background-sim` +5, `settings` +3, `engine-signature` +2). Bench: `tests/bench-threads.js` (Chromium, COOP/COEP).
+- **Needs checking on the phone:** threads above 4, the rsimd threaded build in Firefox (`background.stockfish.active`, `rsimdThreadedFailed`), hash memory, the recorder's `.txt` download on Android.
 
 ## What was done in the 2.0.4 work (less idle work, memory, storage writes; `docs/OPUS_PROMPT_2.0.4.md`)
 Same moves, at least as fast, at a lower cost. One commit per task; numbers in `docs/REFERENCE.md` (2.0.4 changelog, measured with the new jsdom harness `tests/bench-content.js` against the 2.0.3 files). Every behaviour change has a `CV.*` constant in `settings.js` whose `false` restores 2.0.3 (table in REFERENCE › Constants), except the one-way saved-games migration. Manifest: version, and the lichess host removed (owner confirmed `allowed-pages.txt` has no lichess entry; no code read a lichess board).
@@ -132,7 +141,7 @@ Real chess.com behaviour: clock and name selectors, the result dialog, the brill
 - **Selector fragility:** all page selectors need a self-test mode that reports what matched.
 - **Settings UI:** the panel is getting long; the AggroChess and saving groups could be separate screens.
 
-- **Stockfish:** swapping ponder and main worker after a hit, SIMD check of the lite wasm, a `sfHashMb` setting (only if a phone shows a gain), enabling `sfThreads` after SharedArrayBuffer is verified in Firefox (needs approval if headers / CSP are required).
+- **Stockfish:** swapping ponder and main worker after a hit, SIMD check of the lite wasm. (Done in 2.0.6: `sfHashMb`, and `sfThreads` up to 7 after the owner verified SharedArrayBuffer on Firefox Nightly with the bypass pref.) Pick the ponder worker count from the 2.0.6 recorder's export, then remove the recorder.
 
 ## Rules for the next model
 - Read `README.md` first and keep it, the changelog and the tests in sync with any change.

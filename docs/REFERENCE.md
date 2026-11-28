@@ -6,7 +6,7 @@ It adds a small control panel to the page where you change the engine, depth and
 
 > **Scope.** ChessVision only acts on pages listed in [`allowed-pages.txt`](#allowed-pages). The shipped list contains chess.com's computer-bot pages (`chess.com/play/computer`, `chess.com/game/computer`); everywhere else it stays paused. Please keep it to bot games: do not use it in games against other people, in rated play, or anywhere engine assistance is not allowed.
 
-- Version: 2.0.5
+- Version: 2.0.6
 - Platform: Firefox, Manifest V2
 - Site: the extension loads on `*://*.chess.com/*` and acts only on the pages in `allowed-pages.txt`
 - Permissions: `storage`, `clipboardWrite` (for the Export and Copy debug info buttons), and access to chess.com. No data collection.
@@ -99,8 +99,9 @@ Shown in the panel only when the engine is Stockfish. Pondering is on by default
 | Ponder time | `sfPonderMs` | 200-5000 ms, step 100 | 1500 | Budget of the pondering job: ranking and first-pass slices are sized from it; it is the ceiling of the whole job when **Keep pondering until the opponent moves** is off. |
 | Ponder as soon as the move is chosen / Keep pondering until the opponent moves / Ponder at most / Deepen a ponder hit during the pause | `earlyPonder`, `ponderUntilMove`, `ponderMaxMs`, `ponderHitTopUp` | see AggroChess options | on / on / 8 s / on | Shared with AggroChess. In Delay / Clock mode the deepening passes have no depth cap (`go movetime`); in Depth mode they keep `go depth N` and stop once every top reply has depth N. |
 | Ponder workers | `sfPonderWorkers` | 1-7 (1-3 before 2.0.5) | 1 | Workers sharing the job; capped at `max(1, navigator.hardwareConcurrency - 1)` (unknown CPU count = 1). Measured in Node: **about 58 MiB per worker with a 16 MB hash** (42 MiB + the hash table; 74 MiB at 32 MB). |
-| Ponder hash | `sfPonderHashMb` | 4-64 MB, step 4 | 16 | Hash table of each ponder worker (the main worker keeps 32). |
-| Search threads | `sfThreads` | 1-4 | 1 | Threads of the **main** worker. Above 1 only if the threaded build (`engine/stockfish-19-lite.js`) can run: a runtime test (`SharedArrayBuffer`, `Atomics`, shared `WebAssembly.Memory`) must pass, the number is capped at `max(1, cores - 1)`, and any failure keeps the single-thread engine. **Not verified in Firefox** (see Not tested). |
+| Ponder hash | `sfPonderHashMb` | 4-64 MB, step 4 | 16 | Hash table of each ponder worker (the main worker has **Search hash**). |
+| Search threads | `sfThreads` | 1-7 (1-4 before 2.0.6) | 1 | Threads of the **main** worker. Above 1 only if a threaded build can run: a runtime test (`SharedArrayBuffer`, `Atomics`, shared `WebAssembly.Memory`) must pass, and the number is capped at `max(1, cores - 1)` (a 4-core device: 3; an 8-core phone: 7). 2.0.6: tried in this order, each failure falling back one step and remembered: `engine/stockfish-19-lite-rsimd.js` (relaxed SIMD, where the relaxed probe validates; `CV.SF_THREADED_RSIMD`), `engine/stockfish-19-lite.js` (npm), the single-thread engine. Release Firefox has no SharedArrayBuffer in extension pages; **Firefox Nightly with `dom.postMessage.sharedArrayBuffer.bypassCOOP_COEP.insecure.enabled = true` runs it** (owner-verified on Android with 2.0.5, 4 threads; above 4 threads and the relaxed threaded build are **unverified** there). The main search runs on our turn, when the ponder workers are idle (a ponder job starts once our move is decided). |
+| Search hash | `sfHashMb` | 16-256 MB, step 16 | 32 (= 2.0.5) | **2.0.6.** Hash table of the **main** worker (single-thread and threaded builds; the ponder workers keep **Ponder hash**). Used when the engine starts; a change is sent as `setoption name Hash` right before the next search (never during one) and clears the table. Both wasm builds can grow their memory to 2 GB, so 256 MB fits (measured in Chromium: 512 MB still worked). Memory: about the hash size on top of the engine (Chromium, Threads 4: 588 / 629 / 696 / 827 MB browser RSS at 32 / 64 / 128 / 256 MB). No depth gain was measured for 128 over 32 MB in single searches (changelog 2.0.6). |
 
 **2.0.0 additions to Stockfish pondering.** The main search's principal variation seeds the table: if you played its first move, its second move (the expected opponent reply) gets its third move as a ready reply at depth - 2 (only from depth 10 up), at zero cost, and is searched first. A reply is never replaced by a shallower one. On a hit, if a deepening pass is searching that very move and is already deeper than the stored reply, it is stopped and its answer used (at most 150 ms wait). AggroChess: the first ready worker searches the reply to AggroChess's own predicted move before ranking; and when the opponent plays a move whose reply search is almost done (it ends within `min(400 ms, half the think budget)`), that search is awaited instead of thinking from scratch (`late` wait, the only case where a real search waits for pondering).
 
@@ -231,6 +232,14 @@ Behaviour that has no panel setting is switched by constants at the top level of
 
 The one-way move of the saved games to one key per game (C2) has no constant.
 
+2.0.6 constants (`false` / `0` restores 2.0.5):
+
+| Constant | Default | What it does (2.0.6) |
+| --- | --- | --- |
+| `SF_THREADED_RSIMD` | true | The relaxed-SIMD threaded build is tried before the npm threaded build (C). |
+| `SF_MAIN_WAIT_STOP_MS` | 0 | On a `late` / `miss` the main `go` waits up to this long for the stopped ponder workers' `readyok` (A3). Measured: no gain, so 0 = 2.0.5. |
+| `PONDER_STATS` | true | **Temporary** ponder-stats recorder (D), see *Temporary: ponder stats*. |
+
 ### Tools & backup
 
 The **Tools & backup** section of the panel has five buttons:
@@ -244,6 +253,25 @@ The **Tools & backup** section of the panel has five buttons:
 | Reset settings | Restores every setting to its default, including turning Auto-play off. The panel's position and open/closed state are kept. |
 
 Export and import skip **Auto-play** (so importing can never start play) and the panel position and open/closed state, which are per device. Saved games are not part of the export.
+
+### Temporary: ponder stats
+
+**2.0.6, temporary** (`CV.PONDER_STATS`, default on in 2.0.6). A recorder that collects the ponder results per ponder-worker count over many games, so the owner can pick the worker count from data. It never changes what the engines search or play (`tests/background-sim.test.js` plays the same simulated game with it on and off: same moves, same speed, the same commands to the main worker; only the storage writes differ).
+
+**What is recorded.** One record per ponder decision of our turn (only while pondering is on): `hit`, `late`, `miss`, `none` (no ponder job for this position, e.g. the first move) and `skipped` (the only legal move, played without asking the engine). Each record has:
+- the **run**: engine, effective ponder workers, the worker setting, effective main threads, `*PonderMs`, `ponderMaxMs` (0 = Keep pondering off), ponder hash, main hash, search mode, the engine build in use (file name); records with any difference in these are separate rows;
+- the **game** number (counted by the recorder, +1 at every new game) and the game's clock in seconds (the first one readable, `-` when no clock was read);
+- the **decision**, whether a `late` reply was harvested (played) and its depth, the reply depth on a hit, the main-search depth on a `late` / `miss` / `none`;
+- **oppThinkMs**: our move seen on the board -> the opponent's move seen (what `late` depends on); **leadMs**: the ponder job's start -> the opponent's move; **rank** of the opponent's move in the job's ranked list (0 = first; empty when there was no list; Stockfish ranks 8-14 MultiPV lines, the moves after them are in legal-move order); **latencyMs**: the opponent's move seen -> our move seen on the board (what a faster setting should improve);
+- **kills**: ponder workers terminated since the previous record, by reason (`background.stockfish.kills`; `aggro killed` = busy AggroChess workers terminated).
+
+**Storage.** `storage.local`, an index under `ponderStats` and one key per game (`ponderStats:g<n>`), format 1. Written at a game end and at most every 10 s, never per move; a write carries the index and the games that changed only (one key for everything would rewrite up to 5 MB, and send it to every chess.com tab in `storage.onChanged`, every 10 s). Finished games leave the background's memory once written. At most 60 000 records or 5 MB: the oldest whole games are dropped first and counted in the file's header. The data survives an extension reload and a browser restart until **Reset stats**; the page's settings listener ignores these keys.
+
+**The panel.** *Tools & backup › Ponder stats (temporary)*: **Download stats** (one file, `chessvision-ponder-stats-<date>.txt`, `text/plain`; if the download fails it is copied instead), **Copy summary** (the summary table only), **Reset stats** (click twice to confirm). The line under the buttons shows records, games and the worker count in effect now.
+
+**The file** (one text file, every run): a header (version, export time, user agent, `hardwareConcurrency`, records, games, dropped); the **summary** table, one row per run sorted by engine then workers, first column the worker count (games, attempts = hit + late + miss, hits, late, misses, none, skipped, hit / late / miss % of attempts, late harvested, median and p90 of the opponent's think time and of our latency, median hit depth, kills); **hit rate by opponent think time** per run, in buckets `<0.5 s`, `0.5-1 s`, `1-2 s`, `2-4 s`, `>4 s` (the fair comparison between worker counts: a faster opponent leaves less time); then one section per run, `=== workers: N (run R, engine ..., setting ..., threads ..., ponderMs ..., ponderMaxMs ..., ponderHash ..., mainHash ..., mode ..., build ...) ===`, with a CSV block: `game,clockSec,ply,decision,lateHarvested,harvestDepth,hitDepth,mainDepth,oppThinkMs,leadMs,rank,latencyMs,kills,at` (kills as `reason=n;reason=n`, `at` in ISO time). `CV.ponderStatsParse` (`ponderstats.js`) reads the sections back (tested as a round trip).
+
+**Removing it.** Delete `ponderstats.js` and `tests/ponder-stats.test.js`, remove `ponderstats.js` from `background.scripts` in `manifest.json`, and in every `.js` file delete each block from a line containing `PONDER_STATS (temporary) begin` to the line containing `PONDER_STATS (temporary) end`, and every other line containing `PONDER_STATS (temporary)` (`background.js`, `content.js`, `overlay.js`, `settings.js`, `tests/background-sim.test.js`, `tests/settings.test.js`, `tests/smoke-board.js`). Checked in 2.0.6: a copy of the tree stripped exactly this way passes `node --check` and every test. Then delete the stored keys once (Reset stats before the update, or `browser.storage.local.remove` of `ponderStats` and `ponderStats:g*` from the background console).
 
 ---
 
@@ -264,7 +292,8 @@ wc-chess-board DOM  --read-->  content.js  --sendMessage-->  background.js
 
 | File | Role |
 | --- | --- |
-| `manifest.json` | Manifest V2. Loads the content scripts below (settings, chessmini, humanize, boardstate, clock, pgn, brilliant, recorder, overlay, content), in order, on chess.com. The background page loads `settings.js`, `chessmini.js` and `background.js`. |
+| `manifest.json` | Manifest V2. Loads the content scripts below (settings, chessmini, humanize, boardstate, clock, pgn, brilliant, recorder, overlay, content), in order, on chess.com. The background page loads `settings.js`, `chessmini.js`, `ponderstats.js` (2.0.6, temporary) and `background.js`. |
+| `ponderstats.js` | **2.0.6, temporary.** The ponder-stats recorder's pure functions: records, trim, merge, summary, the export file and its parser (see *Temporary: ponder stats*). |
 | `settings.js` | Defaults, limits and validation for every setting, plus the parser and matcher for `allowed-pages.txt`. Shared by the page scripts and the popup. |
 | `allowed-pages.txt` | Plain-text list of pages where auto-play is allowed. |
 | `chessmini.js` | Small rules engine: FEN parsing, legal moves, make-move, check, mate and stalemate. Used to recognise obvious moves and finished games; it never chooses moves, but the recorder uses it to reconstruct missed moves. |
@@ -278,7 +307,8 @@ wc-chess-board DOM  --read-->  content.js  --sendMessage-->  background.js
 | `content.js` | Reads the board (DOM only), calls the pure modules, decides when to move, runs the watchdog, detects game over, reads clock and names, performs the move with pointer events (the panel is ignored when picking the target of a synthetic event), saves games, builds the debug report. |
 | `background.js` | Hosts the two engines and answers `analyze` requests. Implements Stockfish MultiPV and imperfection, runs AggroChess in a main worker plus a pool of 1-7 killable ponder workers (start timeout, think timeout, error cooldown; failures reach the panel as `AggroChess: ...`). It compiles the AggroChess `.wasm` once (the SIMD build when the browser validates SIMD, else the plain one) and posts the compiled module to every worker. Also serves the text of `allowed-pages.txt` to the page scripts. |
 | `engine/sf-worker.js` | Small wrapper worker for the **unmodified** Stockfish loader: it receives the compiled `.wasm` Module from `background.js` and lets the loader's own `instantiateStreaming` step use it instead of fetching and compiling again (verified in Node with the real loader in a browser-like vm; the direct path stays as the fallback). GPL-3.0, written for ChessVision. |
-| `engine/stockfish-19-lite.js` + `.wasm` | The **threaded** lite build from the same npm package, byte-identical, used only for `sfThreads` > 1 when the SharedArrayBuffer test passes. |
+| `engine/stockfish-19-lite.js` + `.wasm` | The **threaded** lite build from the same npm package, byte-identical (and reproduced from source by `tools/build-stockfish.sh` since 2.0.6), used only for `sfThreads` > 1 when the SharedArrayBuffer test passes. |
+| `engine/stockfish-19-lite-rsimd.js` + `.wasm` | **2.0.6.** The same threaded build with WebAssembly relaxed SIMD (`tools/build-stockfish.sh`), tried first for `sfThreads` > 1 where the relaxed probe validates; any failure falls back to the npm threaded build. |
 | `popup.html`, `popup.js` | Toolbar popup with the Auto-play switch. |
 | `LICENSE` | GNU GPL v3. |
 | `.github/workflows/tests.yml` | GitHub Action that syntax-checks the scripts and runs the unit tests on every push and pull request. |
@@ -348,7 +378,7 @@ node tests/search-mode.test.js          # sfShouldStop truth table, hard cap, Ag
 node tests/boardstate-signature.test.js # BS.signature for the stable read
 node tests/settings.test.js             # 2.0.0 keys: sanitize, export / import round trip, the 1.8.0 values
 node tests/background-sim.test.js       # the real background.js with fake workers: delay / depth / clock mode, early ponder -> hit, discarded move -> miss, PV seed, deepening passes, late wait, main warm-up
-node tests/engine-signature.test.js     # 2.0.2: both AggroChess builds still search exactly like 4.6.1 (depth-8 bench signature); small budgets
+node tests/engine-signature.test.js     # 2.0.2: both AggroChess builds still search exactly like 4.6.1 (depth-8 bench signature); small budgets; 2.0.6: both threaded Stockfish builds at Threads 1 = the depth-14 signature
 node tests/notice.test.js               # 2.0.3: every file in engine/ has its sha256 in engine/NOTICE.txt
 node tests/ponder-pool.test.js          # 2.0.2: recycled / interruptible AggroChess ponder workers (fake workers)
 node tests/aggro-worker.test.js         # 2.0.2: engine/aggro-worker.js with the real engine in a vm (queue, floor, stop of a queued request)
@@ -358,6 +388,7 @@ node tests/saved-games.test.js          # 2.0.4: saved games per key (= mergeSav
 node tests/clock-select.test.js         # 2.0.4: clock / name selection = the 2.0.3 rules
 node tests/tracker-match.test.js        # 2.0.4: the fast gap matcher = the 2.0.3 one (32 000 random cases); counters() / history()
 node tests/perft.test.js                # 2.0.4: perft, legalMoves identical to 2.0.3 (fingerprint), hasLegalMove, the replay cache
+node tests/ponder-stats.test.js         # 2.0.6 (temporary): the ponder-stats recorder: grouping, buckets, median / p90, trim, merge, the file round trip
 for f in *.js engine/sf-worker.js engine/aggro-worker.js; do node --check "$f"; done
 ```
 
@@ -365,7 +396,7 @@ The 1.8.0 zip did not contain the `tests/` folder its notes mention (`perft`, `h
 
 No build step. Edit the files and reload the add-on from `about:debugging`.
 
-**Packaging (2.0.4):** `tools/package.sh` writes `dist/chessvision-<version>.zip` with the runtime files only: `manifest.json`, every script it lists, `popup.html` and the scripts it loads, `engine/` (with `NOTICE.txt`), `LICENSE` and `allowed-pages.txt` (added by its path; the script never reads it). `tools/package.sh --lean` also leaves out `engine/stockfish-19-asm.js` (the asm.js fallback; Firefox always has WebAssembly) and `engine/stockfish-19-lite.js/.wasm` (the threaded build; Firefox extension pages have no SharedArrayBuffer, so it never runs, and `background.js` keeps the single-thread engine when it cannot start, tested in `background-sim`). After zipping it unpacks the zip into a temporary directory and checks every path the manifest lists, the popup's scripts and every engine file `background.js` names (with each Stockfish loader's `.wasm`), then prints the size: 6.39 MB default, 3.85 MB lean (2.0.4 files). The repository keeps every file, so the 2.0.2 fallback rules hold for the default package.
+**Packaging (2.0.4):** `tools/package.sh` writes `dist/chessvision-<version>.zip` with the runtime files only: `manifest.json`, every script it lists, `popup.html` and the scripts it loads, `engine/` (with `NOTICE.txt`), `LICENSE` and `allowed-pages.txt` (added by its path; the script never reads it). `tools/package.sh --lean` also leaves out `engine/stockfish-19-asm.js` (the asm.js fallback; Firefox always has WebAssembly). 2.0.4 lean also left out the threaded build; **since 2.0.6 lean keeps both threaded builds** (`engine/stockfish-19-lite.js/.wasm`, `engine/stockfish-19-lite-rsimd.js/.wasm`): release Firefox has no SharedArrayBuffer in extension pages, but Firefox Nightly with `dom.postMessage.sharedArrayBuffer.bypassCOOP_COEP.insecure.enabled` runs them (owner-verified on Android, 2.0.5). Without them `background.js` keeps the single-thread engine (tested in `background-sim`). After zipping it unpacks the zip into a temporary directory and checks every path the manifest lists, the popup's scripts and every engine file `background.js` names (with each Stockfish loader's `.wasm`), then prints the size: 2.0.6 7.53 MB default (31 files), 6.12 MB lean (30 files); 2.0.4: 6.39 / 3.85 MB. The repository keeps every file, so the 2.0.2 fallback rules hold for the default package.
 
 ```
 node tests/bench-delay-mode.js [--only delay|warm] [--json]     # 2.0.0: real Stockfish loader under Node (child_process)
@@ -383,7 +414,8 @@ node tests/engine-signature.test.js             # the search must be unchanged (
 node tests/bench-engines.js --diff OLD NEW      # two builds answer identically under a deterministic clock
 node tests/bench-engines.js [--sig12]           # signature, nodes per second, depth at think(100/300/1000), start-up
 node tests/bench-engines.js --stockfish        # Stockfish: depth-14 signature, nodes per second, depth at soft 300/800, start ms
-tools/build-stockfish.sh                        # Stockfish 19 lite single, plain (reproduces the shipped files) + relaxed SIMD
+tools/build-stockfish.sh [--only single|threaded]   # Stockfish 19 lite single + threaded: plain (reproduce the shipped files) + relaxed SIMD
+node tests/bench-threads.js [--only nps|load|hash|mem|stopwait]   # 2.0.6: headless Chromium, COOP/COEP page: threaded builds, hash, the stop overlap
 node tests/bench-ponder-rank.js                 # how often the AggroChess ranking pass puts the opponent's move in its top k
 node tests/bench-delay-mode.js --only hit       # depth of a Stockfish ponder hit with and without the top-up
 node tests/bench-jspi.js                        # headless Chromium (Playwright): JSPI polling overhead and stop latency
@@ -406,6 +438,41 @@ What has been checked, and what has not:
 - **Not tested on the live chess.com site.** Its markup and its handling of synthetic pointer events can differ from the mock, so drag and mixed input in particular should be treated as experimental. Click mode is the one carried over from 1.2.0.
 
 ## Changelog
+
+**2.0.6** (a stronger main Stockfish search on our move, and a temporary ponder-stats recorder. Task: `docs/OPUS_PROMPT_2.0.6.md`. Manifest: the version and `ponderstats.js` in the background scripts. 2.0.5 behaviour stays reachable: `sfThreads` 1 and `sfHashMb` 32 are the defaults, `CV.SF_THREADED_RSIMD = false` restores the npm threaded build, `CV.SF_MAIN_WAIT_STOP_MS` is 0, `CV.PONDER_STATS = false` turns the recorder off. Measurements: headless Chromium 158 through Playwright on a page served with COOP/COEP (`tests/bench-threads.js`), x86-64 container with **4 cores**, so Threads 7 is oversubscribed there.)
+- **A Main search: up to 7 threads.** `CV.LIMITS.sfThreads` = `[1, 7, 1]`; `CV.sfThreadCount` still caps at `max(1, cores - 1)` (a 4-core device: 3) and gives 1 without SharedArrayBuffer. The main search runs on our turn, when the ponder workers are idle (a ponder job starts once our move is decided). **A3, the overlap on `late` / `miss`** (the main `go` while the ponder workers are still answering `stop` + `isready`): new `CV.SF_MAIN_WAIT_STOP_MS` lets the main `go` wait for their `readyok`, at most that long. Measured in Chromium with real engines (rsimd threaded main worker + single-thread ponder workers, each ponder worker searching, then stop + isready for all of them and the main `go`; 12-24 rounds per row):
+
+  | main threads + ponder workers | wait | cancels | over the 1.5 s kill limit | cancel median / max (ms) | main `go` delayed, median / max (ms) |
+  | --- | ---: | ---: | ---: | ---: | ---: |
+  | 3 + 3 | 0 | 36 | 0 | 9 / 48 | 0 / 0 |
+  | 3 + 3 | 40 | 36 | 0 | 29 / 49 | 30 / 40 |
+  | 4 + 6 | 0 | 72 | 0 | 28 / 47 | 0 / 0 |
+  | 4 + 6 | 40 | 72 | 0 | 26 / 50 | 39 / 40 |
+  | 7 + 6 | 0 | 72 | 0 | 26 / 60 | 0 / 0 |
+  | 7 + 6 | 40 | 72 | 0 | 21 / 59 | 39 / 40 |
+
+  No configuration came near a kill (13 threads on 4 cores included), and waiting only delayed the move by 30-40 ms. So **`CV.SF_MAIN_WAIT_STOP_MS` stays 0** (2.0.5). The mechanism is kept and tested with a fake slow stop in `background-sim` (25 ms stop: waited 15-40 ms; 300 ms stop: capped at 40 ms; no kills). The phone's `no readyok after stop` x4 / `start failed` x1 with 6 workers are therefore **not explained by this overlap** as measured here (they need > 1.5 s without `readyok`); the ponder-stats recorder now counts kills per move, which should show when they happen.
+- **B Main hash setting** `sfHashMb` (Search hash; 16-256 MB, step 16, default 32 = 2.0.5), in `sanitize`, export / import, the panel and the settings table. The main worker starts with it (`sfSpawn(..., { hashMb })`, single-thread, threaded and asm.js); a change is sent as `setoption name Hash value N` only when it changed and only right before the next search (never during one; it clears the table). The value comes with `analyze` and `warm`. Ponder workers keep `sfPonderHashMb`. Limits: the engine lists `Hash` max 33 554 432; every wasm build can grow its memory to 2 GB (threaded: shared memory initial 128 MB, maximum 32 768 pages), so 256 MB fits (512 MB was tried and worked). Memory (Chromium, one engine, Threads 4, after a 1 s search; RSS of all browser processes, idle 389 MB): **588 / 629 / 696 / 827 MB at 32 / 64 / 128 / 256 MB**, i.e. about the hash size on top of ~200 MB. Depth and nodes (10 middlegame positions of `bench-delay-mode.js`, Threads 4, rsimd threaded build, empty hash before each search):
+
+  | hash | 1 s: mean / min depth, median nodes | 2.5 s: mean / min depth, median nodes |
+  | --- | --- | --- |
+  | 32 MB | 22.0 / 19, 3.64 M | 24.1 / 21, 9.19 M |
+  | 128 MB | 20.4 / 19, 3.45 M | 24.2 / 21, 9.06 M |
+
+  No gain from a larger table in single searches of this length (the difference at 1 s is within the run-to-run spread of a 4-thread search). A larger table may still help across the moves of a game (the hash is kept within a game); that is not measured. The default stays 32.
+- **C A relaxed-SIMD threaded Stockfish** `engine/stockfish-19-lite-rsimd.js/.wasm`. `tools/build-stockfish.sh` now also builds the threaded lite build (`node build.js --lite --no-split`): the plain one reproduces `engine/stockfish-19-lite.{js,wasm}` (the npm 19.0.1 files) **byte for byte** (the script stops if it does not), then the same with `RELAXED_SIMD=yes`: 48 relaxed dot instructions (byte scan), 1 696 652 bytes; the loader differs from the npm one only in the `.wasm` size it reports. `--only single|threaded` builds one kind; the single builds still reproduce byte for byte. `background.js`: the threaded builds are a candidate list (`CV.sfThreadedCandidates`): rsimd threaded (when `sfRelaxedOk` and `CV.SF_THREADED_RSIMD`) -> npm threaded -> the single-thread engine; a failure falls back one step and is remembered (`stockfish.rsimdThreadedFailed`, `stockfish.threadedFailed` in Copy debug info). Every wasm loader gets the `.wasm` of its own name in `#<url>,worker`; the pthread workers load the loader's own URL, so in Chromium the rsimd threaded loader fetched only `stockfish-19-lite-rsimd.wasm` (`bench-threads.js --only load`). **Signature:** both threaded builds run under Node (worker_threads), and at Threads 1 give the depth-14 signature of the single builds (748 260 nodes, same moves), now in `tests/engine-signature.test.js`. **Nodes per second** (Chromium, `go movetime 1000`, 10 bench positions, empty hash each, median of 2 interleaved rounds; k nodes/s):
+
+  | Threads | npm threaded | rsimd threaded | gain |
+  | ---: | ---: | ---: | ---: |
+  | 1 | 616 | 845 | +37% |
+  | 2 | 1 193 | 1 775 | +49% |
+  | 4 | 2 624 | 3 645 | +39% |
+  | 7 (4 cores) | 2 626 | 3 693 | +41% |
+
+  `tools/package.sh --lean` now keeps both threaded builds and leaves out only the asm.js fallback (7.53 MB default, 6.12 MB lean); the lean test in `background-sim` was updated, and every "extension pages have no SharedArrayBuffer" statement now says: true on release Firefox; on Nightly with `dom.postMessage.sharedArrayBuffer.bypassCOOP_COEP.insecure.enabled` the threaded build runs (owner-verified on Android, 2.0.5).
+- **D Temporary ponder-stats recorder** (`CV.PONDER_STATS`, `ponderstats.js`, marked blocks `PONDER_STATS (temporary) begin/end`): one record per ponder decision with the run's settings, decision, depths, opponent think time, lead time, rank, our latency and kills; stored per game, written at a game end and at most every 10 s, capped at 60 000 records / 5 MB; a panel block with Download stats (one `.txt` file: header, summary per run, hit rate by opponent think time, one CSV section per worker count), Copy summary and Reset stats. See *Temporary: ponder stats* (with the removal steps). `downloadText` takes a MIME type (default PGN). Tests: `tests/ponder-stats.test.js` (grouping, buckets, median / p90, trim, merge, the file round trip) and `background-sim` (records, latency arriving with the next message, one write per game, export / summary / reset, a reload keeps the data and numbers new games after it; on and off play the same moves at the same speed). jsdom smoke run (`smoke-board.js --ponder-stats`): the page's fields arrive (opponent think time, latency per move). Chromium: the panel block, the `.txt` download and the two-click reset work.
+- Tests: 16 test files, all green; `node --check` on every root script and both engine wrappers; `tools/package.sh` and `--lean` pass their zip checks.
+- ***Unverified*** (real Firefox Nightly on the phone): threads above 4; the relaxed-SIMD threaded build (relaxed SIMD in a pthread build on Firefox; Copy debug info `background.stockfish.active` should read `engine/stockfish-19-lite-rsimd.js`, else `rsimdThreadedFailed` says why); the hash's memory and any depth gain on the phone; the recorder's download on Android (if the `.txt` is not saved, Copy summary or the copy fallback); clock readings for the recorder on the real site (the clock selectors are unverified).
 
 **2.0.5** (more cores for pondering). `aggroPonderWorkers` and `sfPonderWorkers` go up to 7 (were 3); the number used is still capped at `max(1, cores - 1)`, so a 4-core device gets at most 3 as before and an 8-core phone up to 7. With more than 4 Stockfish ponder workers the ranking search asks for `2 × workers` MultiPV lines (at most 14, `CV.sfRankLines`), because the deepening passes work on the top `2 × workers` moves and moves past the ranked lines are only in legal-move order. `minDelay`, `maxDelay`, `quickMinDelay` and `quickMaxDelay` may be 0 (floors were 100 and 40, with no reason recorded). Copy debug info shows `background.cpu` (`hardwareConcurrency` as Firefox reports it, and the effective ponder worker count). Not measured on a phone yet.
 

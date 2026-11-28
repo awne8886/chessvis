@@ -1,10 +1,10 @@
 # ChessVision
 
-ChessVision is a Firefox extension (Manifest V2, version 2.0.5) that plays chess against the **computer bots** on chess.com by itself. It reads the board from the page, asks a chess engine that runs locally inside the extension for a move, and plays that move with synthetic pointer events. No server is involved: both engines are WebAssembly binaries that ship in `engine/`.
+ChessVision is a Firefox extension (Manifest V2, version 2.0.6) that plays chess against the **computer bots** on chess.com by itself. It reads the board from the page, asks a chess engine that runs locally inside the extension for a move, and plays that move with synthetic pointer events. No server is involved: both engines are WebAssembly binaries that ship in `engine/`.
 
 > **Scope.** ChessVision only acts on pages listed in [`allowed-pages.txt`](allowed-pages.txt) and is meant for bot games. Do not use it against people, in rated play, or anywhere engine help is not allowed.
 
-This README explains **how the extension is built and why**: every file, the path a move takes from the board to the engine and back, and the tricks that make it fast. The complete settings table, troubleshooting guide and changelog are in [`docs/REFERENCE.md`](docs/REFERENCE.md) (the README that shipped in the 1.8.0 zip, updated for 2.0.0, 2.0.2 and 2.0.4).
+This README explains **how the extension is built and why**: every file, the path a move takes from the board to the engine and back, and the tricks that make it fast. The complete settings table, troubleshooting guide and changelog are in [`docs/REFERENCE.md`](docs/REFERENCE.md) (the README that shipped in the 1.8.0 zip, updated for 2.0.0, 2.0.2, 2.0.4 and 2.0.6).
 
 ---
 
@@ -36,7 +36,7 @@ This README explains **how the extension is built and why**: every file, the pat
 
 Temporary add-ons disappear when Firefox restarts. A permanent unsigned install needs Firefox Developer Edition or Nightly with `xpinstall.signatures.required = false`. The author runs it on Firefox for Android.
 
-**Packaging (2.0.4).** `tools/package.sh` builds `dist/chessvision-<version>.zip` from the runtime files only (manifest, the scripts it lists, the popup, `engine/`, `LICENSE`, `allowed-pages.txt`), without the engine sources, docs, tests and tools, then unpacks it and checks that every file the manifest and `background.js` name is there. `tools/package.sh --lean` also leaves out the asm.js fallback and the threaded Stockfish build, which Firefox never runs (it always has WebAssembly; extension pages have no SharedArrayBuffer): 3.85 MB instead of 6.39 MB.
+**Packaging (2.0.4).** `tools/package.sh` builds `dist/chessvision-<version>.zip` from the runtime files only (manifest, the scripts it lists, the popup, `engine/`, `LICENSE`, `allowed-pages.txt`), without the engine sources, docs, tests and tools, then unpacks it and checks that every file the manifest and `background.js` name is there. `tools/package.sh --lean` also leaves out the asm.js fallback, which Firefox never runs (it always has WebAssembly): 6.12 MB instead of 7.53 MB. Since 2.0.6 `--lean` **keeps** both threaded Stockfish builds: release Firefox has no SharedArrayBuffer in extension pages, but Firefox Nightly with `dom.postMessage.sharedArrayBuffer.bypassCOOP_COEP.insecure.enabled = true` runs them (seen by the owner on Android with 2.0.5). (2.0.4 lean also dropped the threaded build: 3.85 MB.)
 
 ---
 
@@ -91,12 +91,13 @@ What happens between "the opponent moved" and "our piece lands", with the file a
 
 ## The engines
 
-### Stockfish 19 (lite NNUE, WebAssembly, single thread)
+### Stockfish 19 (lite NNUE, WebAssembly; single thread, threaded main search optional)
 
 | Choice | Why |
 | --- | --- |
 | **Lite NNUE build** (`stockfish-19-lite-single.wasm`, ~1.8 MB with the net inside) | The full-size Stockfish net is tens of MB; the lite net keeps the add-on small enough for a phone while keeping NNUE evaluation. |
-| **Single-thread build by default** | The multi-thread build needs `SharedArrayBuffer`, which needs cross-origin isolation. Whether a Firefox extension background page has it is not verified, so it is opt-in (`sfThreads > 1`) and guarded by a runtime test (`CV.sabSupport`); any failure silently keeps the single-thread engine. |
+| **Single-thread build by default, up to 7 main threads opt-in** | The multi-thread build needs `SharedArrayBuffer`. Release Firefox has none in an extension's background page (no cross-origin isolation); Firefox Nightly with `dom.postMessage.sharedArrayBuffer.bypassCOOP_COEP.insecure.enabled = true` does (owner-verified on Android with 2.0.5: `threads 4`, `sab.ok true`, `crossOriginIsolated` still false). So it is opt-in (`sfThreads` 2-7, at most CPU count − 1) for the **main** search only, guarded by a runtime test (`CV.sabSupport`). 2.0.6: the threaded builds are tried best first, **relaxed-SIMD threaded** (`stockfish-19-lite-rsimd.js`, +37 to +49% nodes per second over the npm threaded build in Chromium at 1-7 threads) → npm threaded (`stockfish-19-lite.js`) → single thread; each failure falls back one step and is remembered. The threads search on our turn, when the ponder workers are idle. |
+| **Main hash (2.0.6)** | `sfHashMb` (16-256 MB, default 32 = 2.0.5) for the main worker only; a change is sent as `setoption name Hash` between two searches (it clears the table). Ponder workers keep `sfPonderHashMb`. Measured in Chromium: 128 MB found no deeper search than 32 MB in 1 s or 2.5 s searches from an empty table; memory grows by about the hash size. |
 | **WebAssembly SIMD, and relaxed SIMD since 2.0.2** | The plain build's NNUE is vectorised (`i32x4.dot_i16x8_s`). Since 2.0.2 a second build, `stockfish-19-lite-single-rsimd.js/.wasm`, uses **relaxed SIMD** (`i32x4.relaxed_dot_i8x16_i7x16_add`, Stockfish's own code path, deterministic because the activations are 0..127): the same search (identical depth-14 signature), about 30% more nodes per second (Node 537 → 703 k/s; Chromium 545 → 776 k/s). It is used when `WebAssembly.validate` accepts a one-instruction probe (`RELAXED_PROBE`); any failure to compile or start it falls back to the plain build for good. Both are built from source by `tools/build-stockfish.sh` (the plain one byte for byte as shipped). |
 | **asm.js fallback** (`stockfish-19-asm.js`) | Only for a browser where WebAssembly fails. Much slower, but the bot keeps playing. |
 | **Compiled once, shared** (`sfModuleFor`) | The background compiles the `.wasm` a single time with `WebAssembly.compileStreaming` and posts the compiled `WebAssembly.Module` to each worker. Compiling ~1.8 MB of wasm is the slow part of starting a worker; instantiating an already compiled Module is cheap. This matters because the ponder pool starts several Stockfish workers. |
@@ -234,7 +235,9 @@ AggroChess uses this by default (`aggroUseClock`). For Stockfish it is an option
 | `popup.html` / `popup.js` | The toolbar popup: only the Auto-play switch. |
 | `engine/sf-worker.js` | Wrapper that feeds the shared compiled Module to the unmodified Stockfish loader. |
 | `engine/stockfish-19-lite-single.js/.wasm` | Stockfish.js 19 lite, single thread (default engine build). |
-| `engine/stockfish-19-lite.js/.wasm` | The multi-threaded build (only with `sfThreads > 1` and SharedArrayBuffer). |
+| `engine/stockfish-19-lite.js/.wasm` | The multi-threaded build (only with `sfThreads > 1` and SharedArrayBuffer), the npm files, reproduced byte for byte by `tools/build-stockfish.sh` since 2.0.6. |
+| `engine/stockfish-19-lite-rsimd.js/.wasm` | 2.0.6: the same threaded build with relaxed SIMD (tried first for `sfThreads > 1` where the relaxed probe validates). |
+| `ponderstats.js` | 2.0.6, **temporary**: the ponder-stats recorder's pure functions (records, summary, the export file); see "Temporary: ponder stats" in `docs/REFERENCE.md`. |
 | `engine/stockfish-19-asm.js` | asm.js fallback. |
 | `engine/aggro-worker.js` | AggroChess worker: instantiation, warm-up, the message protocol (`position`, `think`, `analyze`, `ponderMove`, `clear`). |
 | `engine/aggrochess.wasm` / `aggrochess-simd.wasm` | AggroChess 4.6.1, plain and SIMD builds. |
@@ -245,10 +248,11 @@ AggroChess uses this by default (`aggroUseClock`). For Stockfish it is an option
 | `docs/SONNET_PROMPT.md` | The speed / strength improvements, written as an implementation task (planned as 1.9.0, released as 2.0.0). |
 | `docs/OPUS_PROMPT_2.0.2.md` | The 2.0.2 task (engine speed, workers, pondering), with its status. |
 | `engine/stockfish-19-lite-single-rsimd.js/.wasm` | 2.0.2: Stockfish 19 lite single-thread with relaxed SIMD (used where the browser supports it). |
-| `tools/build-aggrochess.sh`, `tools/build-stockfish.sh` | 2.0.2: pinned, reproducible engine builds (Rust 1.100.0 + binaryen 132; emsdk 6.0.9). Not needed to use the extension. |
-| `tools/package.sh` | 2.0.4: the extension zip from the runtime files only (`--lean`: without the asm.js and threaded Stockfish builds), checked after zipping. |
+| `tools/build-aggrochess.sh`, `tools/build-stockfish.sh` | 2.0.2: pinned, reproducible engine builds (Rust 1.100.0 + binaryen 132; emsdk 6.0.9). 2.0.6: `build-stockfish.sh` also builds the threaded builds (`--only single|threaded`). Not needed to use the extension. |
+| `tools/package.sh` | 2.0.4: the extension zip from the runtime files only (`--lean`: without the asm.js fallback; 2.0.6 keeps the threaded builds), checked after zipping. |
+| `docs/OPUS_PROMPT_2.0.6.md` | The 2.0.6 task (main-search threads and hash, the relaxed-SIMD threaded build, the temporary ponder-stats recorder). |
 | `docs/OPUS_PROMPT_2.0.4.md` | The 2.0.4 task (less idle work, memory, storage writes; faster moves in a hidden tab; packaging). |
-| `tests/` | Plain Node tests (`*.test.js`), the fake-worker background harness (`_fakebg.js`), the engine helpers (`_aggro-wasm.js`), and benchmarks: `bench-engines.js` (signatures, speed, `--diff`), `bench-delay-mode.js`, `bench-ponder-rank.js`, `bench-jspi.js` (Chromium via Playwright), `smoke-board.js` (jsdom page harness; jsdom is installed on demand, not a dependency); 2.0.4: `bench-content.js` (jsdom: board reads, DOM queries, layout, messages and storage writes per scenario), `bench-pure.js` (tracker matcher, legal moves, replay), `bench-hittest.js` (Chromium: event targets with the panel over the board). |
+| `tests/` | Plain Node tests (`*.test.js`), the fake-worker background harness (`_fakebg.js`), the engine helpers (`_aggro-wasm.js`), and benchmarks: `bench-engines.js` (signatures, speed, `--diff`), `bench-delay-mode.js`, `bench-ponder-rank.js`, `bench-jspi.js` (Chromium via Playwright), `smoke-board.js` (jsdom page harness; jsdom is installed on demand, not a dependency); 2.0.4: `bench-content.js` (jsdom: board reads, DOM queries, layout, messages and storage writes per scenario), `bench-pure.js` (tracker matcher, legal moves, replay), `bench-hittest.js` (Chromium: event targets with the panel over the board); 2.0.6: `bench-threads.js` (Chromium, COOP/COEP page: threaded nodes per second, hash depth and memory, the stop overlap), `ponder-stats.test.js` (temporary). |
 
 ---
 
