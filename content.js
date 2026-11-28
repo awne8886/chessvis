@@ -6,7 +6,7 @@
   window.__chessvisionLoaded = true;
 
   const DEBUG = true;
-  const FALLBACK_VERSION = '2.0.3';
+  const FALLBACK_VERSION = '2.0.4';
   const VERSION = (() => { try { return api.runtime.getManifest().version || FALLBACK_VERSION; } catch (e) { return FALLBACK_VERSION; } })();
   const log = (...a) => DEBUG && console.log('[ChessVision]', ...a);
   const { FILES } = CV.chess;
@@ -103,18 +103,14 @@
 
   // 'checkmate' | 'stalemate' from the rules, or 'game over' if chess.com's result dialog is showing.
   // 2.0.4 (A1): the plain class selector on every check; the attribute-substring selector (a slower document-wide match)
-  // only in the watchdog's forced check (CV.WATCHDOG_FORCE_MS) or with CV.WATCHDOG_SKIP_UNCHANGED off (2.0.3: both always).
+  // only in the watchdog's forced check (CV.WATCHDOG_FORCE_MS) or with CV.WATCHDOG_SKIP_UNCHANGED off (2.0.3: always).
   function gameOverFor(pos, forced) {
     if (!overCache || overCache.fen !== pos.fen) {
       overCache = { fen: pos.fen, value: CV.chess.gameState(CV.chess.parseFen(pos.fen)) };
     }
     if (overCache.value) return overCache.value;
-    let modal;
-    if (!CV.WATCHDOG_SKIP_UNCHANGED) modal = document.querySelector('.game-over-modal-container, [class*="game-over-modal"]');
-    else {
-      modal = document.querySelector('.game-over-modal-container');
-      if (!(modal && modal.getClientRects().length) && forced) modal = document.querySelector('[class*="game-over-modal"]');
-    }
+    // the forced check (and 2.0.3) asks both in one query; the others only the plain class
+    const modal = document.querySelector(!CV.WATCHDOG_SKIP_UNCHANGED || forced ? '.game-over-modal-container, [class*="game-over-modal"]' : '.game-over-modal-container');
     return modal && modal.getClientRects().length ? 'game over' : null;
   }
 
