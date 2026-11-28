@@ -142,6 +142,68 @@
     return { placement: gridToPlacement(grid), turn, castle: castleString(rights), ep, lastMover, lastTo };
   }
 
+  // ---------- gap matching (the tracker) ----------
+  // Which legal move (matchOne) or two-ply sequence (matchTwo) from `pos` gives the observed placement? Results in
+  // legal-move order: [{ m, next }] / [[{ m, next }, { m, next }]].
+  // 2.0.3 (CV.TRACKER_FAST_MATCH = false): every legal move, and for matchTwo every reply to it (~35 x 35 applies plus a
+  // legalMoves per first move), each move applied twice (in legalMoves and here).
+  function matchOneFull(pos, placement) {
+    const res = [];
+    for (const m of chess().legalMoves(pos)) {
+      const next = chess().apply(pos, m);
+      if (boardToPlacement(next.b) === placement) res.push({ m, next });
+    }
+    return res;
+  }
+  function matchTwoFull(pos, placement) {
+    const res = [];
+    for (const m1 of chess().legalMoves(pos)) {
+      const n1 = chess().apply(pos, m1);
+      for (const m2 of chess().legalMoves(n1)) {
+        const n2 = chess().apply(n1, m2);
+        if (boardToPlacement(n2.b) === placement) res.push([{ m: m1, next: n1 }, { m: m2, next: n2 }]);
+      }
+    }
+    return res;
+  }
+  // 2.0.4 (E1): the same results, faster. In any matching sequence the from-square of every ply holds something else at
+  // the end than at the start: right after a ply its from-square is empty (castling: the king's square), and a later ply
+  // of the other side can only put a piece of the other colour there (also for en passant and promotion). So only moves
+  // from changed squares are tried (chess.legalMovesFrom, which also hands back the position after each move instead of
+  // applying it a second time); a ply changes at most 4 squares (castling), so a first ply that leaves more than 4 squares
+  // different from the target cannot be completed by a second. tests/tracker-match.test.js compares both on random games.
+  function placementBoard(placement) {
+    const b = new Array(64).fill(null);
+    const rows = placement.split('/');
+    for (let i = 0; i < rows.length && i < 8; i++) {
+      let f = 0;
+      for (const ch of rows[i]) { if (ch >= '1' && ch <= '8') f += +ch; else if (f < 8) b[(7 - i) * 8 + f++] = ch; }
+    }
+    return b;
+  }
+  function changedSquares(a, b) {
+    const s = new Set();
+    for (let i = 0; i < 64; i++) if (a[i] !== b[i]) s.add(i);
+    return s;
+  }
+  const sameBoard = (a, b) => { for (let i = 0; i < 64; i++) if (a[i] !== b[i]) return false; return true; };
+  function matchOneFast(pos, placement, target) {
+    const t = target || placementBoard(placement);
+    const ch = changedSquares(pos.b, t);
+    if (!ch.size || ch.size > 4) return [];
+    return chess().legalMovesFrom(pos, ch).filter((x) => sameBoard(x.next.b, t));
+  }
+  function matchTwoFast(pos, placement) {
+    const t = placementBoard(placement);
+    const ch = changedSquares(pos.b, t);
+    if (!ch.size || ch.size > 8) return [];
+    const res = [];
+    for (const first of chess().legalMovesFrom(pos, ch)) {
+      for (const second of matchOneFast(first.next, placement, t)) res.push([first, second]);
+    }
+    return res;
+  }
+
   // ---------- history tracker ----------
   function createTracker() {
     const listeners = [];
@@ -191,25 +253,8 @@
       emit(out, ev);
     }
 
-    const matchOne = (pos, placement) => {
-      const res = [];
-      for (const m of chess().legalMoves(pos)) {
-        const next = chess().apply(pos, m);
-        if (boardToPlacement(next.b) === placement) res.push({ m, next });
-      }
-      return res;
-    };
-    const matchTwo = (pos, placement) => {
-      const res = [];
-      for (const m1 of chess().legalMoves(pos)) {
-        const n1 = chess().apply(pos, m1);
-        for (const m2 of chess().legalMoves(n1)) {
-          const n2 = chess().apply(n1, m2);
-          if (boardToPlacement(n2.b) === placement) res.push([{ m: m1, next: n1 }, { m: m2, next: n2 }]);
-        }
-      }
-      return res;
-    };
+    const matchOne = (pos, placement) => (CV.TRACKER_FAST_MATCH ? matchOneFast : matchOneFull)(pos, placement);
+    const matchTwo = (pos, placement) => (CV.TRACKER_FAST_MATCH ? matchTwoFast : matchTwoFull)(pos, placement);
 
     // obs: { placement, turn, castle, ep, count, highlighted }. Returns the events this observation caused.
     function observe(obs) {
@@ -294,7 +339,7 @@
 
   CV.boardstate = {
     START_PLACEMENT, START_FEN, gridToPlacement, placementToGrid, boardToPlacement, countPieces, assembleFen,
-    analyzeHighlights, signature, mutationRelevant, freshRights, castleString, rightsFromString, updateRights, buildPosition, createTracker, obsFromFen,
+    analyzeHighlights, signature, mutationRelevant, matchOneFull, matchTwoFull, matchOneFast, matchTwoFast, freshRights, castleString, rightsFromString, updateRights, buildPosition, createTracker, obsFromFen,
   };
   if (typeof module !== 'undefined' && module.exports) module.exports = CV.boardstate;
 })(typeof window !== 'undefined' ? window : globalThis);

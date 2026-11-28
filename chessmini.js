@@ -78,7 +78,8 @@
     return k >= 0 && attacked(pos.b, k, color === 'w' ? 'b' : 'w');
   }
 
-  function pseudoMoves(pos) {
+  // froms (2.0.4, optional): a Set of squares; only moves from those squares are generated (same order otherwise).
+  function pseudoMoves(pos, froms) {
     const { b, turn } = pos;
     const me = turn, them = turn === 'w' ? 'b' : 'w';
     const out = [];
@@ -87,6 +88,7 @@
     for (let s = 0; s < 64; s++) {
       const p = b[s];
       if (!p || colorOf(p) !== me) continue;
+      if (froms && !froms.has(s)) continue;
       const t = p.toLowerCase(), f = fileOf(s), r = rankOf(s);
 
       if (t === 'p') {
@@ -130,7 +132,7 @@
 
     // Castling (king and rook on their home squares, path empty, king not passing through check)
     const base = me === 'w' ? 0 : 56, K = me === 'w' ? 'K' : 'k', R = me === 'w' ? 'R' : 'r';
-    if (b[base + 4] === K && !attacked(b, base + 4, them)) {
+    if (b[base + 4] === K && (!froms || froms.has(base + 4)) && !attacked(b, base + 4, them)) {
       if (pos.castle[K] && b[base + 7] === R && !b[base + 5] && !b[base + 6] &&
           !attacked(b, base + 5, them) && !attacked(b, base + 6, them)) add(base + 4, base + 6, '', 'ck');
       const q = me === 'w' ? 'Q' : 'q';
@@ -179,6 +181,22 @@
     return out;
   }
 
+  // 2.0.4 (E1): the legal moves whose from-square is in `froms` (a Set), each with the position after it: [{ m, next }],
+  // the same move objects in the same order as legalMoves(pos) filtered by from-square. The tracker's gap matcher uses it:
+  // a move that explains a board change always starts on a square that changed, and next is computed once, not twice.
+  function legalMovesFrom(pos, froms) {
+    const out = [];
+    for (const m of pseudoMoves(pos, froms)) {
+      const next = apply(pos, m);
+      if (inCheck(next, pos.turn)) continue;
+      m.piece = pos.b[m.from];
+      m.capture = next.captured;
+      m.uci = sqName(m.from) + sqName(m.to) + m.promo;
+      out.push({ m, next });
+    }
+    return out;
+  }
+
   const isMate = (pos) => inCheck(pos) && legalMoves(pos).length === 0;
 
   // 'checkmate' | 'stalemate' | null for the side to move.
@@ -194,6 +212,6 @@
     return n;
   }
 
-  CV.chess = { FILES, idx, fileOf, rankOf, sqName, colorOf, parseFen, attacked, inCheck, legalMoves, apply, isMate, gameState, perft };
+  CV.chess = { FILES, idx, fileOf, rankOf, sqName, colorOf, parseFen, attacked, inCheck, legalMoves, legalMovesFrom, apply, isMate, gameState, perft };
   if (typeof module !== 'undefined' && module.exports) module.exports = CV.chess;
 })(typeof window !== 'undefined' ? window : globalThis);

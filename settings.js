@@ -544,6 +544,9 @@
   // (every read scans the document; my clock and the opponent's are two scans).
   CV.DOM_CACHE = true;
   CV.DOM_CACHE_RESCAN_MS = 30000;
+  // 2.0.4 (E1): the tracker matches a board change only with moves from squares that changed (the same results, see
+  // boardstate.js). false = 2.0.3 (every legal move, and every two-ply sequence for a missed ply).
+  CV.TRACKER_FAST_MATCH = true;
   // 2.0.2 (A7): AggroChess workers that report `interruptible` (JSPI in the browser and a 2.0.2 engine) are stopped
   // instead of terminated: a cancelled job's busy worker is stopped and recycled like a Stockfish one, and a `late`
   // reply search far from done is stopped and its move used from this depth on. false = 2.0.0 (terminate).
