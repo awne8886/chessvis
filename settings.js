@@ -518,6 +518,11 @@
   // check costs two board reads instead of three. Direct checks (schedule(), the retry timer) still read fresh. false =
   // 2.0.3 (check() reads the board again).
   CV.STABLE_READ_REUSE = true;
+  // 2.0.4 (B1): the engines start on first use (a request, or the page's `warm` when Auto-play is on on an allowed page)
+  // and are shut down (main and ponder workers, compiled modules) after ENGINE_IDLE_MS without a request while no
+  // chess.com tab is open. false = 2.0.3 (both main workers start with the background page and never stop).
+  CV.LAZY_ENGINES = true;
+  CV.ENGINE_IDLE_MS = 10 * 60 * 1000;
   // 2.0.2 (A7): AggroChess workers that report `interruptible` (JSPI in the browser and a 2.0.2 engine) are stopped
   // instead of terminated: a cancelled job's busy worker is stopped and recycled like a Stockfish one, and a `late`
   // reply search far from done is stopped and its move used from this depth on. false = 2.0.0 (terminate).

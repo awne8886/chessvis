@@ -638,6 +638,7 @@
     if (!cfg.enabled) { setStatus('off'); return; }
     if (allowed === null) { setStatus('loading page list\u2026'); return; }
     if (!isAllowedPage()) { setStatus('paused \u2013 this page is not in allowed-pages.txt', 'warn'); return; }
+    maybeWarm();                                                 // 2.0.4 (B1): the engine starts before it is needed
     if (busy) {
       if (Date.now() - busySince > BUSY_TIMEOUT_MS) {
         log('busy for too long, abandoning the attempt');
@@ -663,6 +664,32 @@
     if (pos.fen === lastHandledKey) return;
     log('check (' + reason + ') -> our move');
     play(pos);
+  }
+
+  // ---------- Background port and engine start (2.0.4) ----------
+  // One runtime port per tab: while a chess.com tab holds one, the background never shuts the engines down (B1), and it
+  // reconnects when the background page was reloaded. `warm` starts the engine before the first move needs it: sent when
+  // Auto-play is on on an allowed page, and again after the engine setting changed or the port was lost.
+  let port = null, portRetries = 0, warmedFor = null;
+  function connectPort() {
+    if (port) return;
+    let p;
+    try { p = api.runtime.connect({ name: 'chessvision' }); } catch (e) { return; }   // no connect (old browser) or the extension is gone
+    if (!p) return;
+    port = p;
+    const since = Date.now();
+    p.onDisconnect.addListener(() => {
+      if (port === p) port = null;
+      warmedFor = null;
+      if (Date.now() - since > 10000) portRetries = 0;
+      if (++portRetries <= 5) setTimeout(connectPort, 1000 * portRetries);
+    });
+  }
+  function maybeWarm() {
+    if (!CV.LAZY_ENGINES || !cfg.enabled || !isAllowedPage() || warmedFor === cfg.engine) return;
+    const engine = cfg.engine;
+    warmedFor = engine;
+    api.runtime.sendMessage({ type: 'warm', engine }).then((r) => { if (r && r.ok === false && warmedFor === engine) warmedFor = null; }, () => { if (warmedFor === engine) warmedFor = null; });
   }
 
   // ---------- Idle work (opponent's turn): pondering / evaluation line ----------
@@ -862,6 +889,7 @@
       api.runtime.sendMessage({ type: 'aggroInvalidate' }).catch(() => {});
     }
     if (cfg.inputMode + cfg.humanize !== prevInput) dragDisabled = false;
+    if (cfg.engine !== prevCfg.engine && allowed !== null) maybeWarm();   // 2.0.4 (B1): the other engine, before its first move
     if (ui) ui.render(cfg);
     if (cfg.watchdogMs !== prevWatchdog || !watchdogTimer) startWatchdog();
     if (!cfg.enabled) setStatus('off');
@@ -951,6 +979,7 @@
     if (next.enabled !== undefined) setStatus(cfg.enabled ? 'on' : 'off');
   });
 
+  connectPort();
   setInterval(attachTick, 1000); // re-attach if chess.com swaps the board element
   startWatchdog();
   attach();

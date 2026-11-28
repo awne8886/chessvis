@@ -160,19 +160,27 @@ function sfAttach(worker) {
 }
 
 function initStockfish() {
+  const gen = engineGen;
+  engineDbg.starts.stockfish++;
   sfReady = (async () => {
-    let r;
+    let r, file;
     try {
       r = await sfSpawnWasm();
-      sfActive = r.file || SF_FILE;
+      file = r.file || SF_FILE;
     } catch (e) {
+      if (gen !== engineGen) throw e;
       console.error('[ChessVision] Stockfish: ' + SF_FILE + ' did not start (' + ((e && e.message) || e) + '); falling back to ' + SF_FALLBACK_FILE);
       r = await sfSpawn(SF_FALLBACK_FILE);
-      sfActive = SF_FALLBACK_FILE;
+      file = SF_FALLBACK_FILE;
     }
     // 2.0.0 (T10): warm the main worker like the ponder workers before sfReady resolves: the first search of a fresh engine
     // pays for its own lazy set-up. Measured in Node: ~20 ms here, first depth-10 search 56 -> 39 ms. Never fatal.
-    sfDbg.mainWarmMs = await sfWarmMain(r.worker);
+    const warmMs = await sfWarmMain(r.worker);
+    // 2.0.4 (B1): the engines were shut down while this one started (cannot happen while a request waits for it, see
+    // engineIdleCheck): never attach a worker of an older generation
+    if (gen !== engineGen) { try { r.worker.terminate(); } catch (e) { /* ignore */ } throw new Error('the engine was shut down while it started'); }
+    sfActive = file;
+    sfDbg.mainWarmMs = warmMs;
     sfAttach(r.worker);
     sfThreadsSent = SF_THREADS;
     sfDbg.workerStarts++; sfDbg.lastStart = { label: 'main', file: sfActive, how: r.how || 'direct' };
@@ -338,7 +346,7 @@ async function analyzeStockfish(fen, depth, imperfection, maxMs, startFen, moves
 }
 async function analyzeStockfishNow(fen, depth, imperfection, maxMs, startFen, moves, msg) {
   const t0 = Date.now();
-  try { await sfReady; } catch (e) { return { error: 'Stockfish: could not start (' + ((e && e.message) || e) + ')' }; }
+  try { await sfEnsureCurrent(); } catch (e) { return { error: 'Stockfish: could not start (' + ((e && e.message) || e) + ')' }; }
   // 1) a reply already found while pondering wins; anything else stops the ponder workers at once (stop + isready, never waited for)
   if (!msg.ponder) { if (ponderKind === 'sf') ponderCancel(); }
   else {
@@ -382,6 +390,7 @@ async function analyzeStockfishNow(fen, depth, imperfection, maxMs, startFen, mo
     ponderCancel();                                                           // miss, late or no entry yet: the ponder workers never delay a real search
   }
   if (msg.sfThreads !== undefined) { try { await sfApplyThreads(msg.sfThreads); } catch (e) { /* keep the engine we have */ } }
+  if (!sf) { try { await sfEnsureCurrent(); } catch (e) { return { error: 'Stockfish: could not start (' + ((e && e.message) || e) + ')' }; } }   // 2.0.4: from here to sfStart nothing waits
   const res = await new Promise((resolve) => {
     const imp = Math.max(0, Math.min(100, imperfection || 0));
     const softMs = Math.max(0, Math.min(AGGRO_HARD_MAX_MS, Math.round(Number(msg.softMs)) || 0));
@@ -642,6 +651,7 @@ function aggroGet() {
   if (aggroFailure && Date.now() - aggroFailure.at < AGGRO_ERROR_COOLDOWN_MS) throw new Error(aggroFailure.message);
   if (!aggroMain || aggroMain.dead) {
     if (aggroMain) aggroDbg.restarts++;
+    engineDbg.starts.aggro++;
     aggroMain = spawnAggroWorker('main');
     const h = aggroMain;
     h.ready.then(() => { if (aggroFailure) aggroFailure = null; }, (e) => {
@@ -653,6 +663,84 @@ function aggroGet() {
   return aggroMain;
 }
 function initAggro() { try { aggroGet(); } catch (e) { /* cooling down: nothing to start */ } }
+
+// ======================= Engine lifetime (2.0.4, B1) =======================
+// 2.0.3 started both main workers when the browser started (each compiles a ~1.8 MB wasm, allocates its hash and warms
+// up, in a persistent background page, even if chess.com is never opened). Now an engine starts on its first use
+// (ensureStockfish / ensureAggro: analyze, aggroIdle, and the page's `warm` message, sent when Auto-play is on on an
+// allowed page so the first move does not pay for the start), and after CV.ENGINE_IDLE_MS without a request while no
+// tab holds a port (runtime.connect, one per chess.com tab), both main workers and every ponder worker are terminated
+// and the compiled modules dropped. The stop is synchronous and only happens when nothing is in flight (no request
+// waiting, no search, no ponder job, no top-up), so no request can see a half-stopped engine; a request after it
+// starts a fresh engine (engineGen tells an older start that it lost). CV.LAZY_ENGINES = false: 2.0.3 (both start at
+// load, never stop).
+let engineGen = 0, engineInflight = 0, engineIdleTimer = null;
+const enginePorts = new Set();
+const engineDbg = { starts: { stockfish: 0, aggro: 0 }, stops: 0, lastStopAt: null };
+function ensureStockfish() {
+  if (!sfReady) initStockfish();
+  return sfReady;
+}
+// ensureStockfish, again if the engines were shut down while it waited (then `sf` belongs to no one): the caller may use `sf`
+// until its next await.
+async function sfEnsureCurrent() {
+  for (let i = 0; i < 3; i++) {
+    const gen = engineGen;
+    await ensureStockfish();
+    if (gen === engineGen && sf) return;
+  }
+  throw new Error('the engine was restarted while starting');
+}
+function ensureAggro() {
+  try { return aggroGet().ready; } catch (e) { return Promise.reject(e); }     // cooling down after a failed start: its error
+}
+// A request that may use an engine: counted while it runs; the idle clock restarts when it ends.
+async function withEngine(fn) {
+  engineInflight++;
+  clearTimeout(engineIdleTimer); engineIdleTimer = null;
+  try { return await fn(); } finally { engineInflight--; armEngineIdle(); }
+}
+function armEngineIdle() {
+  if (!CV.LAZY_ENGINES) return;
+  clearTimeout(engineIdleTimer);
+  engineIdleTimer = enginePorts.size || engineInflight ? null : setTimeout(engineIdleCheck, CV.ENGINE_IDLE_MS);
+}
+const enginesRunning = () => !!(sf || sfReady || (aggroMain && !aggroMain.dead) || ponderSpares.length || ponderActive.length || ponderCancelling.length);
+function engineIdleCheck() {
+  engineIdleTimer = null;
+  if (!CV.LAZY_ENGINES || enginePorts.size || !enginesRunning()) return;
+  if (engineInflight || aggroThinking || sfCurrent || sfNext || ponderActive.length || idleInfo.pondering || hitJobs.size) { armEngineIdle(); return; }
+  stopEngines();
+}
+function stopEngines() {
+  engineGen++;
+  ponderWanted = false;                                         // B2: no spares are made again until a new idle job
+  ponderCancel();
+  for (const w of [...ponderSpares, ...ponderActive, ...ponderCancelling]) w.kill('engines idle');
+  ponderSpares = []; ponderActive = []; ponderCancelling = [];
+  if (sf) { try { sf.terminate(); } catch (e) { /* ignore */ } }
+  sf = null; sfReady = null; sfActive = null; sfCurrent = null; sfNext = null; sfPrevCount = null; sfMultiPvSent = null; sfThreadsSent = SF_THREADS; lastMainPv = null;
+  if (aggroMain) { aggroMain.kill(); aggroMain = null; }
+  sfModuleP.clear(); aggroModuleP = null;                       // compiled again on the next start
+  Object.assign(sfModuleInfo, { shared: false, ms: null, how: null, error: null, file: null });
+  Object.assign(aggroModuleInfo, { shared: false, ms: null, how: null, error: null, file: null, simd: false });
+  engineDbg.stops++; engineDbg.lastStopAt = Date.now();
+  console.log('[ChessVision] engines stopped after ' + CV.ENGINE_IDLE_MS + ' ms without a request');
+}
+// `warm` from the page: start the engine of that name now (the first move then finds it ready).
+function warmEngine(engine) {
+  return (engine === 'stockfish' ? ensureStockfish() : ensureAggro()).then(() => ({ ok: true }), (e) => ({ ok: false, error: String((e && e.message) || e) }));
+}
+// One port per chess.com tab (content.js): while any tab holds one, the engines are never shut down.
+if (api.runtime.onConnect) {
+  api.runtime.onConnect.addListener((port) => {
+    if (!port || port.name !== 'chessvision') return;
+    enginePorts.add(port);
+    clearTimeout(engineIdleTimer); engineIdleTimer = null;
+    port.onDisconnect.addListener(() => { enginePorts.delete(port); onPortGone(port); });
+  });
+}
+function onPortGone() { armEngineIdle(); }
 
 // What think wants: the fen/moves of the request (history when reliable, else the bare FEN as a set-up position).
 function aggroPosition(msg) {
@@ -1142,8 +1230,9 @@ async function analyzeAggroNow(msg) {
       }
       ponderCancel();                                          // miss, late or no entry yet: the ponder workers never delay a real think
     }
-    const h = aggroGet();
+    let h = aggroGet();
     await h.ready;
+    if (h.dead) { h = aggroGet(); await h.ready; }               // 2.0.4: shut down while it waited (B1): a fresh one
     // 2) older requests' results would be stale
     for (const [id, p] of h.pending) { if (p.think) { h.pending.delete(id); clearTimeout(p.timer); p.resolve({ type: 'bestmove', uci: null }); if (h.interruptible && CV.AGGRO_INTERRUPT) h.stop(id); } }
     const warn = msg.verify ? await aggroVerifyPosition(h, msg) : null;
@@ -1450,8 +1539,9 @@ api.runtime.onMessage.addListener((msg) => {
   if (msg && msg.type === 'aggroClear') { aggroClear(); return Promise.resolve({ ok: true }); }
   if (msg && msg.type === 'clearEngines') { clearEngines(); return Promise.resolve({ ok: true }); }
   if (msg && msg.type === 'aggroInvalidate') { ponderWanted = false; ponderCancel(); return Promise.resolve({ ok: true }); }   // also frees the spares
-  if (msg && msg.type === 'aggroIdle') return Promise.resolve(aggroIdle(msg));
-  if (msg && msg.type === 'hitTopUp') return hitFinal(msg.id);
+  if (msg && msg.type === 'aggroIdle') return withEngine(async () => aggroIdle(msg));
+  if (msg && msg.type === 'hitTopUp') return withEngine(() => hitFinal(msg.id));
+  if (msg && msg.type === 'warm') return withEngine(() => warmEngine(msg.engine));
   if (msg && msg.type === 'aggroIdleStatus') return Promise.resolve({ pondering: idleInfo.pondering, evalLine: idleInfo.evalLine, found: ponder.found() });
   if (msg && msg.type === 'aggroDebug') {
     return Promise.resolve({ ponder: { ...ponder.counters, passes: ponderDbg.lastPasses, maxPasses: ponderDbg.maxPasses, settled: { enabled: !!CV.PONDER_SETTLE, replies: ponderDbg.settled, jobsEnded: ponderDbg.settledJobs }, hitDepths: ponderDbg.hitDepths.slice(), harvestUpgrades: ponderDbg.harvestUpgrades, lateWaits: ponderDbg.lateWaits, lateWaitHits: ponderDbg.lateWaitHits,
@@ -1467,13 +1557,17 @@ api.runtime.onMessage.addListener((msg) => {
         poolKind: ponderKind, cancelling: ponderCancelling.length, harvested: sfDbg.harvested, harvestFailed: sfDbg.harvestFailed, kills: { ...sfDbg.kills }, cancelMs: sfDbg.cancelMs.slice(), claimedWhileStopping: sfDbg.claimedWhileStopping, claimReplaced: sfDbg.claimReplaced, overruns: sfDbg.overruns, lastOverruns: sfDbg.lastOverruns.slice(), workerStarts: sfDbg.workerStarts, lastWorkerStart: sfDbg.lastStart, rankMode: SF_RANK_MODE,
         searchMode: sfLast ? sfLast.mode : null, depthDone: sfLast ? sfLast.depthDone : null, softMs: sfLast ? sfLast.softMs : null, elapsedMs: sfLast ? sfLast.elapsedMs : null,
         lastSearch: sfLast, pvSeeds: sfDbg.pvSeeds, mainWarmMs: sfDbg.mainWarmMs === undefined ? null : sfDbg.mainWarmMs },
-      aggroLastBudget: aggroDbg.lastBudget || null });
+      aggroLastBudget: aggroDbg.lastBudget || null,
+      engines: { lazy: !!CV.LAZY_ENGINES, idleMs: CV.ENGINE_IDLE_MS, starts: { ...engineDbg.starts }, stops: engineDbg.stops, lastStopAt: engineDbg.lastStopAt, ports: enginePorts.size,
+        running: { stockfish: !!sfReady, aggro: !!(aggroMain && !aggroMain.dead) } } });
   }
   if (!msg || msg.type !== 'analyze') return;
-  return msg.engine === 'stockfish'
+  return withEngine(() => (msg.engine === 'stockfish'
     ? analyzeStockfish(msg.fen, msg.depth, msg.imperfection, msg.sfMaxMs, msg.startFen, msg.moves, msg)
-    : analyzeAggro(msg);
+    : analyzeAggro(msg)));
 });
 
-initStockfish();
-initAggro();
+if (!CV.LAZY_ENGINES) {                 // 2.0.3: both engines start with the background page and are never stopped
+  initStockfish();
+  initAggro();
+}

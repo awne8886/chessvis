@@ -156,7 +156,9 @@ function makeBackground(opts = {}) {
   const ctx = vm.createContext({
     ...fakeWasm,
     console: opts.quiet === false ? console : { log() {}, warn() {}, error() {} },
-    setTimeout, clearTimeout, setInterval, clearInterval,
+    // 2.0.4: a long timer (the engines' idle shutdown, 10 min) must not keep a finished test process alive
+    setTimeout: (fn, ms, ...rest) => { const t = setTimeout(fn, ms, ...rest); if (ms > 60000 && t.unref) t.unref(); return t; },
+    clearTimeout, setInterval, clearInterval,
     navigator: { hardwareConcurrency: opts.cores || 4 },
     Worker: FakeWorker,
     browser: { runtime: { getURL: (p) => p, onMessage: { addListener(fn) { handler = fn; } }, onConnect: { addListener(fn) { connectHandlers.push(fn); } } },
@@ -180,7 +182,10 @@ function makeBackground(opts = {}) {
     for (const fn of connectHandlers) fn(back);
     return page;
   }
-  for (const f of ['settings.js', 'chessmini.js', 'background.js']) vm.runInContext(fs.readFileSync(path.join(opts.root || ROOT, f), 'utf8'), ctx, { filename: f });
+  for (const f of ['settings.js', 'chessmini.js', 'background.js']) {
+    vm.runInContext(fs.readFileSync(path.join(opts.root || ROOT, f), 'utf8'), ctx, { filename: f });
+    if (f === 'settings.js' && opts.setup) vm.runInContext(opts.setup, ctx);     // 2.0.4: constants read at load (CV.LAZY_ENGINES)
+  }
   return {
     send: (msg, sender) => Promise.resolve(handler(msg, sender || { tab: { id: 1 } })),
     get: (expr) => vm.runInContext(expr, ctx),
