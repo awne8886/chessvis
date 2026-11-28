@@ -1,7 +1,7 @@
 {
   "manifest_version": 2,
   "name": "ChessVision",
-  "version": "2.0.3",
+  "version": "2.0.4",
   "description": "Auto-plays chess against chess.com bots using local Stockfish or the Tal-style AggroChess engine, with an on-page control panel.",
   "browser_specific_settings": {
     "gecko": {
