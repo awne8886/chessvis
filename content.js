@@ -896,15 +896,21 @@
     else if (next.enabled !== undefined || fromStorage) { lastHandledKey = null; schedule(100, 'settings'); }
   }
 
-  function onUiChange(patch) {
+  function cleanPatch(patch) {
     const clean = CV.fixRanges({ ...cfg, ...CV.sanitize(patch) });
     const out = {};
     for (const k of Object.keys(patch)) if (k in clean) out[k] = clean[k];
     // range fixes may have moved the partner value too
     for (const k of ['minDelay', 'maxDelay', 'quickMinDelay', 'quickMaxDelay']) if (clean[k] !== cfg[k]) out[k] = clean[k];
+    return out;
+  }
+  function onUiChange(patch) {
+    const out = cleanPatch(patch);
     applyCfg(out, false);
     api.storage.local.set(out);
   }
+  // 2.0.4 (C1): a slider being dragged: this tab follows at once, the value is stored once on release (onUiChange).
+  function onUiPreview(patch) { applyCfg(cleanPatch(patch), false); }
 
   // Text for "Copy debug info": state only, no page content, no account data.
   async function debugInfo() {
@@ -946,6 +952,7 @@
   ui = CV.createOverlay({
     version: VERSION,
     onChange: onUiChange,
+    onPreview: onUiPreview,
     onExport: () => CV.exportSettings(cfg),
     onImport: importFromText,
     onDebug: debugInfo,
@@ -975,6 +982,8 @@
     if (Object.keys(changes).every((k) => k === 'savedGames')) return;
     const next = {};
     for (const k in changes) next[k] = changes[k].newValue;
+    // 2.0.4 (C1): the echo of this tab's own write (every value already equals cfg): nothing to apply or re-render
+    if (CV.SETTINGS_FEWER_WRITES) { const clean = CV.sanitize(next); if (Object.keys(clean).every((k) => clean[k] === cfg[k])) return; }
     applyCfg(next, false);
     if (next.enabled !== undefined) setStatus(cfg.enabled ? 'on' : 'off');
   });

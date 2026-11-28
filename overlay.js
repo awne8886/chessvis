@@ -78,7 +78,7 @@ details[open] summary .arrow { transform: rotate(90deg); }
     return n;
   };
 
-  // opts: { onChange(patch), onReset() }
+  // opts: { onChange(patch), onPreview(patch) (2.0.4: apply in this tab without storing), onReset(), ... }
   CV.createOverlay = function (opts) {
     const host = el('div');
     const shadow = host.attachShadow({ mode: 'open' });
@@ -110,7 +110,14 @@ details[open] summary .arrow { transform: rotate(90deg); }
       const [lo, hi, step] = CV.LIMITS[key];
       const val = el('span', { class: 'val' });
       const input = el('input', { type: 'range', min: lo, max: hi, step: step, 'aria-label': label });
-      input.addEventListener('input', () => { val.textContent = fmt(+input.value); opts.onChange({ [key]: +input.value }); });
+      // 2.0.4 (C1): while the thumb moves only the label and this tab's settings follow (onPreview); the value is stored
+      // once, on release ('change'). Every stored value reaches every chess.com tab (re-render, layout). CV.SETTINGS_FEWER_WRITES
+      // = false: stored on every step (2.0.3).
+      input.addEventListener('input', () => {
+        val.textContent = fmt(+input.value);
+        if (CV.SETTINGS_FEWER_WRITES && opts.onPreview) opts.onPreview({ [key]: +input.value }); else opts.onChange({ [key]: +input.value });
+      });
+      input.addEventListener('change', () => { if (CV.SETTINGS_FEWER_WRITES && opts.onPreview) opts.onChange({ [key]: +input.value }); });
       const wrapEl = el('div', { class: 'sl' }, el('div', { class: 'row' }, el('span', { class: 'lab' }, label), val), input);
       sync.push((c) => { input.value = c[key]; val.textContent = fmt(c[key]); });
       return wrapEl;
@@ -355,7 +362,9 @@ details[open] summary .arrow { transform: rotate(90deg); }
       wrap.style.right = wrap.style.bottom = 'auto';
       return [nx, ny];
     }
+    let placed = null;                // 2.0.4 (C1): the overlayX / overlayY / overlayOpen the panel was last placed with
     function applyPosition() {
+      placed = cfg.overlayX + ',' + cfg.overlayY + ',' + cfg.overlayOpen;
       if (cfg.overlayX === null || cfg.overlayY === null) {
         wrap.style.left = 'auto'; wrap.style.top = 'auto'; wrap.style.right = '12px'; wrap.style.bottom = '12px';
       } else place(cfg.overlayX, cfg.overlayY);
@@ -399,7 +408,9 @@ details[open] summary .arrow { transform: rotate(90deg); }
         depthRow.style.display = sfMaxRow.style.display = sfMaxNote.style.display = cfg.engine === 'stockfish' ? '' : 'none';
         aggroDet.style.display = cfg.engine === 'aggro' ? '' : 'none';      // AggroChess options only for AggroChess
         sfDet.style.display = cfg.engine === 'stockfish' ? '' : 'none';
-        applyOpen(); applyPosition();
+        applyOpen();
+        // 2.0.4 (C1): place() forces a layout; only when the position or the open state changed (or always: 2.0.3)
+        if (!CV.SETTINGS_FEWER_WRITES || placed !== cfg.overlayX + ',' + cfg.overlayY + ',' + cfg.overlayOpen) applyPosition();
       },
       setEval(text) { evalLine.textContent = text || ''; },
       setWarn(text) { warnLine.textContent = text || ''; },

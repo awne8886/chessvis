@@ -523,6 +523,10 @@
   // chess.com tab is open. false = 2.0.3 (both main workers start with the background page and never stop).
   CV.LAZY_ENGINES = true;
   CV.ENGINE_IDLE_MS = 10 * 60 * 1000;
+  // 2.0.4 (C1): a slider stores its value once, on release (while it moves only the label and this tab follow); a tab
+  // ignores the storage echo of a write whose values it already has; the panel is re-placed (a forced layout) only when
+  // its position or open state changed. false = 2.0.3 (a write per slider step, every tab re-renders and re-places).
+  CV.SETTINGS_FEWER_WRITES = true;
   // 2.0.2 (A7): AggroChess workers that report `interruptible` (JSPI in the browser and a 2.0.2 engine) are stopped
   // instead of terminated: a cancelled job's busy worker is stopped and recycled like a Stockfish one, and a `late`
   // reply search far from done is stopped and its move used from this depth on. false = 2.0.0 (terminate).

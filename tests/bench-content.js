@@ -171,12 +171,30 @@ async function cycle() {
   return { ...r, move: ours, reactMs, saveMsg: msg, pgn, history: dbg.history, unstableReads: dbg.state.unstableReads };
 }
 
+// 2.0.4 (C1): one drag of the "Min delay" slider from 300 to 800 ms in 11 steps, then the release (the panel placed at
+// 100,100: every re-placement is a getBoundingClientRect).
+async function slider() {
+  const p = await openPage({ settings: { engine: 'stockfish', sfPonder: false, overlayOpen: true, overlayX: 100, overlayY: 100 }, moves: OPENING });
+  await sleep(1500);
+  p.reset();
+  const host = [...p.window.document.documentElement.children].find((e) => e.shadowRoot);
+  const input = host.shadowRoot.querySelector('input[aria-label="Min delay"]');
+  for (let v = 300; v <= 800; v += 50) { input.value = String(v); input.dispatchEvent(new p.window.Event('input', { bubbles: true })); await sleep(16); }
+  input.dispatchEvent(new p.window.Event('change', { bubbles: true }));
+  await sleep(300);
+  const r = p.reset();
+  const dbg = JSON.parse(await p.overlay().onDebug());
+  await p.close();
+  return { ...r, stored: p.storage.data.minDelay, cfgMinDelay: dbg.settings.minDelay, cfgMaxDelay: dbg.settings.maxDelay };
+}
+
 async function main() {
-  const only = opt('--only', 'idle,ponder,cycle').split(',');
+  const only = opt('--only', 'idle,ponder,cycle,slider').split(',');
   const out = {};
   if (only.includes('idle')) out.idle = await idle(false);
   if (only.includes('ponder')) out.ponder = await idle(true);
   if (only.includes('cycle')) out.cycle = await cycle();
+  if (only.includes('slider')) out.slider = await slider();
   if (args.includes('--json')) { console.log(JSON.stringify(out, null, 2)); process.exit(0); }
   console.log('root ' + ROOT + ', idle ' + SECONDS + ' s');
   const rows = {};
@@ -186,6 +204,7 @@ async function main() {
   }
   console.table(rows);
   for (const [k, r] of Object.entries(out)) console.log(k, 'messages by type:', JSON.stringify(r.byType));
+  if (out.slider) console.log('slider: stored minDelay', out.slider.stored, 'cfg', out.slider.cfgMinDelay, '/', out.slider.cfgMaxDelay);
   if (out.cycle) console.log('cycle: move', out.cycle.move, 'react', out.cycle.reactMs, 'ms;', out.cycle.saveMsg, '; history', JSON.stringify(out.cycle.history), '\n' + out.cycle.pgn);
   process.exit(0);
 }
