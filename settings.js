@@ -536,6 +536,9 @@
   // 2.0.4 (B2): when the last chess.com tab disconnects, pondering is no longer wanted: the job is cancelled and the warm
   // spares are terminated (a tab that closed during its own job cancels that job). false = 2.0.3 (spares kept while wanted).
   CV.PONDER_RELEASE_ON_DISCONNECT = true;
+  // 2.0.4 (D1): in a hidden tab (timers clamped to ~1 s by Firefox) the cursor path's events are sent without a wait per
+  // step. false = 2.0.3 (a timer per step, also when hidden).
+  CV.HIDDEN_NO_STEP_WAIT = true;
   // 2.0.2 (A7): AggroChess workers that report `interruptible` (JSPI in the browser and a 2.0.2 engine) are stopped
   // instead of terminated: a cancelled job's busy worker is stopped and recycled like a Stockfish one, and a `late`
   // reply search far from done is stopped and its move used from this depth on. false = 2.0.0 (terminate).

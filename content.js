@@ -256,7 +256,12 @@
     if (mouse.x === x && mouse.y === y) return;                  // already there (aimMove glided during the pause): no empty path
     const smooth = hum() && cfg.mouseMove;
     const path = CV.human.buildPath(mouse.x, mouse.y, x, y, smooth ? { speed: fast ? 2.2 : 1 } : { linear: true, steps: linearSteps });
-    for (const p of path) { moveTo(p.x, p.y, buttons); await sleep(p.dt); }
+    // 2.0.4 (D1): Firefox clamps timers in a background tab to about 1 s, so a path of 8-38 steps with a sleep per step took
+    // tens of seconds there (and could run into BUSY_TIMEOUT_MS). While the tab is hidden the path's events are sent
+    // without the per-step waits; nobody sees the cursor. The pause before the move is one timer and stays.
+    // CV.HIDDEN_NO_STEP_WAIT = false: always wait (2.0.3).
+    const noWait = !!CV.HIDDEN_NO_STEP_WAIT && document.hidden;
+    for (const p of path) { moveTo(p.x, p.y, buttons); if (!noWait) await sleep(p.dt); }
   }
 
   async function pressAt(x, y) {

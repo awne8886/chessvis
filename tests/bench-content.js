@@ -38,7 +38,7 @@ function newCounters() {
 }
 
 // opens the page with the given settings and the given moves already played (one-step renders)
-async function openPage({ settings, moves }) {
+async function openPage({ settings, moves, hidden }) {
   const storage = makeStorage();
   const bg = makeBackground({ stepMs: 3, aggroStartMs: 30, storage, root: ROOT });
   const c = { now: newCounters() };
@@ -46,6 +46,14 @@ async function openPage({ settings, moves }) {
   const { window } = dom;
   const { document } = window;
   window.innerWidth = 1200; window.innerHeight = 900;
+  if (hidden) {
+    // a background tab: document.hidden, and Firefox's clamping of every timer to >= 1 s
+    Object.defineProperty(document, 'hidden', { get: () => true, configurable: true });
+    Object.defineProperty(document, 'visibilityState', { get: () => 'hidden', configurable: true });
+    const st = window.setTimeout.bind(window);
+    window.setTimeout = (fn, ms, ...a) => { c.now.timers = (c.now.timers || 0) + 1; return st(fn, Math.max(1000, Number(ms) || 0), ...a); };
+    window.requestAnimationFrame = () => 0;                    // rAF does not run in a hidden tab
+  }
   const board = document.createElement('wc-chess-board');
   board.className = 'board';
   document.body.appendChild(board);
@@ -149,15 +157,15 @@ async function idle(ponder) {
   return r;
 }
 
-async function cycle() {
-  const p = await openPage({ settings: { engine: 'stockfish' }, moves: OPENING });
-  await sleep(3000);
+async function cycle(hidden) {
+  const p = await openPage({ settings: { engine: 'stockfish' }, moves: OPENING, hidden });
+  await sleep(hidden ? 6000 : 3000);
   let ours = null, at = 0;
   p.onOurMove((u) => { ours = u; at = Date.now(); });
   p.reset();
   const t0 = Date.now();
   p.botPlay('b8c6');
-  while (!ours && Date.now() - t0 < 15000) await sleep(20);
+  while (!ours && Date.now() - t0 < 60000) await sleep(20);
   const reactMs = ours ? at - t0 : null;
   if (ours) await sleep(2500);
   const r = p.reset();
@@ -217,6 +225,7 @@ async function main() {
   if (only.includes('cycle')) out.cycle = await cycle();
   if (only.includes('slider')) out.slider = await slider();
   if (only.includes('hover')) out.hover = await hover();
+  if (only.includes('hidden')) out.hidden = await cycle(true);     // D1: one move cycle in a hidden tab (timers clamped to 1 s)
   if (args.includes('--json')) { console.log(JSON.stringify(out, null, 2)); process.exit(0); }
   console.log('root ' + ROOT + ', idle ' + SECONDS + ' s');
   const rows = {};
@@ -227,6 +236,7 @@ async function main() {
   console.table(rows);
   for (const [k, r] of Object.entries(out)) console.log(k, 'messages by type:', JSON.stringify(r.byType));
   if (out.slider) console.log('slider: stored minDelay', out.slider.stored, 'cfg', out.slider.cfgMinDelay, '/', out.slider.cfgMaxDelay);
+  if (out.hidden) console.log('hidden tab: move', out.hidden.move, 'played', out.hidden.reactMs, 'ms after the opponent\'s move;', out.hidden.timers, 'timers');
   if (out.cycle) console.log('cycle: move', out.cycle.move, 'react', out.cycle.reactMs, 'ms;', out.cycle.saveMsg, '; history', JSON.stringify(out.cycle.history), '\n' + out.cycle.pgn);
   process.exit(0);
 }
