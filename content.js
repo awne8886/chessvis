@@ -32,6 +32,9 @@
   let lastHandledKey = null, attempts = 0;
   let unstableReads = 0, unstableRun = 0, stableSeq = 0;   // stable-read debounce (2.0.0): total / in a row / cancels an outdated check
   let stableArmed = false;                       // 2.0.2: a stable read is scheduled or under way (the watchdog then skips its tick)
+  let lastCheckSig = null, lastCheckAt = 0;      // 2.0.4 (A1): signature of the board the last check() used, and when it ran
+  let retryWaiting = false;                      // 2.0.4 (A1): play()'s move-confirmation timer is pending
+  let attachSkips = 0;                           // 2.0.4 (A1): re-attach ticks skipped while the board is still in the page
   let rights = BS.freshRights();
   const tracker = BS.createTracker();            // the one game-tracking mechanism (history, new game, takeback)
   const rec = CV.createRecorder();               // records every ply the tracker reports
@@ -96,12 +99,19 @@
   }
 
   // 'checkmate' | 'stalemate' from the rules, or 'game over' if chess.com's result dialog is showing.
-  function gameOverFor(pos) {
+  // 2.0.4 (A1): the plain class selector on every check; the attribute-substring selector (a slower document-wide match)
+  // only in the watchdog's forced check (CV.WATCHDOG_FORCE_MS) or with CV.WATCHDOG_SKIP_UNCHANGED off (2.0.3: both always).
+  function gameOverFor(pos, forced) {
     if (!overCache || overCache.fen !== pos.fen) {
       overCache = { fen: pos.fen, value: CV.chess.gameState(CV.chess.parseFen(pos.fen)) };
     }
     if (overCache.value) return overCache.value;
-    const modal = document.querySelector('.game-over-modal-container, [class*="game-over-modal"]');
+    let modal;
+    if (!CV.WATCHDOG_SKIP_UNCHANGED) modal = document.querySelector('.game-over-modal-container, [class*="game-over-modal"]');
+    else {
+      modal = document.querySelector('.game-over-modal-container');
+      if (!(modal && modal.getClientRects().length) && forced) modal = document.querySelector('[class*="game-over-modal"]');
+    }
     return modal && modal.getClientRects().length ? 'game over' : null;
   }
 
@@ -128,7 +138,7 @@
       const record = rec.build(abandoned, { cfg, result: '*' });
       if (CV.pgn.shouldSave(cfg, record)) storeGame(record);
     }
-    return { st, p };
+    return { st, p, sig: BS.signature(st.grid, st.highlights) };
   }
 
   function handleTrackerEvent(ev) {
@@ -590,7 +600,9 @@
     }
     if (token !== playToken) return;
     // If the move didn't register, retry a few times
+    retryWaiting = true;
     setTimeout(() => {
+      retryWaiting = false;
       if (token !== playToken || busy) return;
       const now = buildFen();
       if (cfg.enabled && isAllowedPage() && now && now.fen === pos.fen) {
@@ -604,11 +616,14 @@
     }, RETRY_AFTER_MS);
   }
 
-  function check(reason) {
+  // opt (2.0.4): { forced } = the watchdog's forced check (CV.WATCHDOG_FORCE_MS).
+  function check(reason, opt) {
+    const forced = !!(opt && opt.forced);
     let obs;
     if (board && allowed !== null && isAllowedPage()) {          // observe before anything can return early
       try { obs = observeBoard() || undefined; } catch (e) { console.error('[ChessVision] observe failed', e); }
     }
+    if (CV.WATCHDOG_SKIP_UNCHANGED) { lastCheckAt = Date.now(); lastCheckSig = obs ? obs.sig : boardSignature(); }   // A1: what the next watchdog ticks compare with
     if (!cfg.enabled) { setStatus('off'); return; }
     if (allowed === null) { setStatus('loading page list\u2026'); return; }
     if (!isAllowedPage()) { setStatus('paused \u2013 this page is not in allowed-pages.txt', 'warn'); return; }
@@ -620,7 +635,7 @@
     }
     const pos = buildFen(obs);                                   // the observation above: no second board read
     if (!pos) { setStatus('no board found', 'warn'); return; }
-    const over = gameOverFor(pos);
+    const over = gameOverFor(pos, forced);
     if (over) {
       attempts = 0;
       setStatus((over === 'game over' ? '' : 'game over: ') + over + (over === 'checkmate' ? (pos.turn === pos.myColor ? ' \u2013 you lost' : ' \u2013 you won') : ''), 'warn');
@@ -760,7 +775,7 @@
     try { requestAnimationFrame(go); } catch (e) { /* no rAF */ }
     setTimeout(go, 100);
   });
-  function scheduleStable(ms, reason) {
+  function scheduleStable(ms, reason, forced) {
     clearTimeout(debounceTimer);
     const seq = ++stableSeq;
     stableArmed = true;
@@ -770,9 +785,9 @@
       await sleep(STABLE_GAP_MS);
       if (seq !== stableSeq) return;                             // a newer mutation (or schedule) took over
       const b = boardSignature();
-      if (a === b || unstableRun >= UNSTABLE_MAX) { unstableRun = 0; stableArmed = false; check(reason); return; }
+      if (a === b || unstableRun >= UNSTABLE_MAX) { unstableRun = 0; stableArmed = false; check(reason, { forced }); return; }
       unstableReads++; unstableRun++;
-      scheduleStable(cfg.boardDebounceMs, 'unstable');
+      scheduleStable(cfg.boardDebounceMs, 'unstable', forced);
     }, ms);
   }
 
@@ -782,12 +797,32 @@
   // in the middle of a board update made of two DOM steps fed the tracker a half-updated board (a gap, then a ponder
   // miss). When a stable read is already scheduled or running, the tick has nothing to add. CV.WATCHDOG_STABLE_READ =
   // false: the 2.0.0 direct read.
+  // 2.0.4 (A1): a tick reads the board ONCE. Same signature as the board the last check() used, and nothing pending (no
+  // move in progress, no re-check, no move-confirmation timer): the tick ends there. A changed board gets the stable read
+  // as before. Every CV.WATCHDOG_FORCE_MS without a check a full check runs anyway (a result popup or an SPA navigation
+  // changes nothing on the board); when the board is unchanged it needs no stable read (it equals the last checked board).
   function startWatchdog() {
     clearInterval(watchdogTimer);
-    watchdogTimer = setInterval(() => {
-      if (!CV.WATCHDOG_STABLE_READ) { check('watchdog'); return; }
-      if (!stableArmed) scheduleStable(0, 'watchdog');
-    }, cfg.watchdogMs);
+    watchdogTimer = setInterval(watchdogTick, cfg.watchdogMs);
+  }
+  function watchdogTick() {
+    if (!CV.WATCHDOG_STABLE_READ) { check('watchdog', { forced: true }); return; }
+    if (stableArmed) return;
+    if (!CV.WATCHDOG_SKIP_UNCHANGED) { scheduleStable(0, 'watchdog'); return; }
+    const forced = Date.now() - lastCheckAt >= CV.WATCHDOG_FORCE_MS;
+    const same = boardSignature() === lastCheckSig;
+    if (same && !forced && !busy && !recheckPending && !retryWaiting) return;
+    if (same && forced && !busy) { check('watchdog (forced)', { forced: true }); return; }
+    scheduleStable(0, forced ? 'watchdog (forced)' : 'watchdog', forced);
+  }
+
+  // The 1-second re-attach timer. 2.0.4 (A1): while the board it is attached to is still in the page, the document is
+  // searched only every CV.ATTACH_FULL_EVERY ticks (chess.com could put a new board in beside it); a board that left the
+  // page is replaced at the next tick. CV.ATTACH_LAZY = false: every tick (2.0.3).
+  function attachTick() {
+    if (CV.ATTACH_LAZY && board && observer && board.isConnected && ++attachSkips < CV.ATTACH_FULL_EVERY) return;
+    attachSkips = 0;
+    attach();
   }
 
   function attach() {
@@ -905,7 +940,7 @@
     if (next.enabled !== undefined) setStatus(cfg.enabled ? 'on' : 'off');
   });
 
-  setInterval(attach, 1000); // re-attach if chess.com swaps the board element
+  setInterval(attachTick, 1000); // re-attach if chess.com swaps the board element
   startWatchdog();
   attach();
 })();

@@ -502,6 +502,18 @@
   // The watchdog's board read goes through the stable read (two reads a frame + 20 ms apart must agree), like a
   // mutation's. false = 2.0.0: the watchdog reads the board directly (content.js).
   CV.WATCHDOG_STABLE_READ = true;
+  // 2.0.4 (A1): a watchdog tick reads the board ONCE and ends there when its signature equals the board the last check()
+  // used and nothing is pending (no move in progress, no re-check, no move-confirmation timer). Every WATCHDOG_FORCE_MS a
+  // full check runs anyway (a result popup without a board change, a status change, an SPA navigation); only that forced
+  // check also looks for the result dialog with the attribute-substring selector. false = 2.0.3 (every tick: a stable
+  // read, a check() and the result-dialog query).
+  CV.WATCHDOG_SKIP_UNCHANGED = true;
+  CV.WATCHDOG_FORCE_MS = 5000;
+  // 2.0.4 (A1): the 1-second board re-attach timer searches the document only every ATTACH_FULL_EVERY ticks while the
+  // board it is attached to is still in the page (a detached board is replaced at the next tick, as before). false =
+  // 2.0.3 (findBoard every second).
+  CV.ATTACH_LAZY = true;
+  CV.ATTACH_FULL_EVERY = 5;
   // 2.0.2 (A7): AggroChess workers that report `interruptible` (JSPI in the browser and a 2.0.2 engine) are stopped
   // instead of terminated: a cancelled job's busy worker is stopped and recycled like a Stockfish one, and a `late`
   // reply search far from done is stopped and its move used from this depth on. false = 2.0.0 (terminate).
