@@ -90,6 +90,33 @@
     return gridToPlacement(grid) + '|' + hl;
   }
 
+  // ---------- board mutations worth a read (2.0.4, A3) ----------
+  // A MutationObserver on the board reports hover squares, drag ghosts, arrows, coordinates and the board's reaction to
+  // our own synthetic pointer moves as well as real moves. Only these can change what readPosition() sees: a `class`
+  // change on an element that has (or, by attributeOldValue, had) the class `piece` or `highlight`; a `class` change on
+  // the board element itself (`flipped`); a child list change that adds or removes an element that is, or contains, a
+  // `.piece` or `.highlight`. Works on real MutationRecords and on plain objects of the same shape (tests).
+  const WATCH = ['piece', 'highlight'];
+  const hasCls = (el, c) => !!el && (el.classList && typeof el.classList.contains === 'function' ? el.classList.contains(c)
+    : (' ' + (typeof el.className === 'string' ? el.className : (el.className && el.className.baseVal) || '') + ' ').includes(' ' + c + ' '));
+  const tokens = (v) => String(v || '').split(/\s+/);
+  const watched = (el) => !!el && el.nodeType === 1 && (WATCH.some((c) => hasCls(el, c)) ||
+    (typeof el.querySelector === 'function' && !!el.querySelector('.piece, .highlight')));
+  function mutationRelevant(records, board) {
+    for (const r of records || []) {
+      if (r.type === 'attributes') {
+        if (r.attributeName && r.attributeName !== 'class') continue;
+        if (r.target === board) return true;
+        if (WATCH.some((c) => hasCls(r.target, c))) return true;
+        if (r.oldValue !== undefined && r.oldValue !== null && tokens(r.oldValue).some((t) => WATCH.includes(t))) return true;
+      } else if (r.type === 'childList') {
+        for (const n of r.addedNodes || []) if (watched(n)) return true;
+        for (const n of r.removedNodes || []) if (watched(n)) return true;
+      }
+    }
+    return false;
+  }
+
   // ---------- castling rights (inferred from the page) ----------
   const freshRights = () => ({ K: true, Q: true, k: true, q: true });
   const castleString = (r) => ['K', 'Q', 'k', 'q'].filter((k) => r[k]).join('') || '-';
@@ -113,6 +140,68 @@
     const { lastMover, ep, lastTo } = analyzeHighlights(grid, highlights);
     const turn = lastMover ? (lastMover === 'w' ? 'b' : 'w') : 'w';
     return { placement: gridToPlacement(grid), turn, castle: castleString(rights), ep, lastMover, lastTo };
+  }
+
+  // ---------- gap matching (the tracker) ----------
+  // Which legal move (matchOne) or two-ply sequence (matchTwo) from `pos` gives the observed placement? Results in
+  // legal-move order: [{ m, next }] / [[{ m, next }, { m, next }]].
+  // 2.0.3 (CV.TRACKER_FAST_MATCH = false): every legal move, and for matchTwo every reply to it (~35 x 35 applies plus a
+  // legalMoves per first move), each move applied twice (in legalMoves and here).
+  function matchOneFull(pos, placement) {
+    const res = [];
+    for (const m of chess().legalMoves(pos)) {
+      const next = chess().apply(pos, m);
+      if (boardToPlacement(next.b) === placement) res.push({ m, next });
+    }
+    return res;
+  }
+  function matchTwoFull(pos, placement) {
+    const res = [];
+    for (const m1 of chess().legalMoves(pos)) {
+      const n1 = chess().apply(pos, m1);
+      for (const m2 of chess().legalMoves(n1)) {
+        const n2 = chess().apply(n1, m2);
+        if (boardToPlacement(n2.b) === placement) res.push([{ m: m1, next: n1 }, { m: m2, next: n2 }]);
+      }
+    }
+    return res;
+  }
+  // 2.0.4 (E1): the same results, faster. In any matching sequence the from-square of every ply holds something else at
+  // the end than at the start: right after a ply its from-square is empty (castling: the king's square), and a later ply
+  // of the other side can only put a piece of the other colour there (also for en passant and promotion). So only moves
+  // from changed squares are tried (chess.legalMovesFrom, which also hands back the position after each move instead of
+  // applying it a second time); a ply changes at most 4 squares (castling), so a first ply that leaves more than 4 squares
+  // different from the target cannot be completed by a second. tests/tracker-match.test.js compares both on random games.
+  function placementBoard(placement) {
+    const b = new Array(64).fill(null);
+    const rows = placement.split('/');
+    for (let i = 0; i < rows.length && i < 8; i++) {
+      let f = 0;
+      for (const ch of rows[i]) { if (ch >= '1' && ch <= '8') f += +ch; else if (f < 8) b[(7 - i) * 8 + f++] = ch; }
+    }
+    return b;
+  }
+  function changedSquares(a, b) {
+    const s = new Set();
+    for (let i = 0; i < 64; i++) if (a[i] !== b[i]) s.add(i);
+    return s;
+  }
+  const sameBoard = (a, b) => { for (let i = 0; i < 64; i++) if (a[i] !== b[i]) return false; return true; };
+  function matchOneFast(pos, placement, target) {
+    const t = target || placementBoard(placement);
+    const ch = changedSquares(pos.b, t);
+    if (!ch.size || ch.size > 4) return [];
+    return chess().legalMovesFrom(pos, ch).filter((x) => sameBoard(x.next.b, t));
+  }
+  function matchTwoFast(pos, placement) {
+    const t = placementBoard(placement);
+    const ch = changedSquares(pos.b, t);
+    if (!ch.size || ch.size > 8) return [];
+    const res = [];
+    for (const first of chess().legalMovesFrom(pos, ch)) {
+      for (const second of matchOneFast(first.next, placement, t)) res.push([first, second]);
+    }
+    return res;
   }
 
   // ---------- history tracker ----------
@@ -164,25 +253,8 @@
       emit(out, ev);
     }
 
-    const matchOne = (pos, placement) => {
-      const res = [];
-      for (const m of chess().legalMoves(pos)) {
-        const next = chess().apply(pos, m);
-        if (boardToPlacement(next.b) === placement) res.push({ m, next });
-      }
-      return res;
-    };
-    const matchTwo = (pos, placement) => {
-      const res = [];
-      for (const m1 of chess().legalMoves(pos)) {
-        const n1 = chess().apply(pos, m1);
-        for (const m2 of chess().legalMoves(n1)) {
-          const n2 = chess().apply(n1, m2);
-          if (boardToPlacement(n2.b) === placement) res.push([{ m: m1, next: n1 }, { m: m2, next: n2 }]);
-        }
-      }
-      return res;
-    };
+    const matchOne = (pos, placement) => (CV.TRACKER_FAST_MATCH ? matchOneFast : matchOneFull)(pos, placement);
+    const matchTwo = (pos, placement) => (CV.TRACKER_FAST_MATCH ? matchTwoFast : matchTwoFull)(pos, placement);
 
     // obs: { placement, turn, castle, ep, count, highlighted }. Returns the events this observation caused.
     function observe(obs) {
@@ -248,6 +320,14 @@
           repetitionCount: entries.filter((x) => x.rep === e.rep).length, plies: moves.length, resets, turn: e.pos.turn,
         };
       },
+      // 2.0.4 (E3): the two counters the FEN needs, without info()'s copy of the move list and its repetition scan.
+      counters() {
+        const e = lastEntry();
+        return e ? { halfmove: e.halfmove, fullmove: e.fullmove } : { halfmove: 0, fullmove: 1 };
+      },
+      // 2.0.4 (E3): { startFen, moves } for an engine message. `moves` is the tracker's own list (no copy): use it at once
+      // (a message copies it when it is sent); copy it to keep it.
+      history() { return { startFen, moves }; },
       // True when the tracked history ends exactly at the given FEN's placement and side to move,
       // i.e. startFen + moves can be handed to an engine instead of the bare FEN.
       matches(fen) {
@@ -267,7 +347,7 @@
 
   CV.boardstate = {
     START_PLACEMENT, START_FEN, gridToPlacement, placementToGrid, boardToPlacement, countPieces, assembleFen,
-    analyzeHighlights, signature, freshRights, castleString, rightsFromString, updateRights, buildPosition, createTracker, obsFromFen,
+    analyzeHighlights, signature, mutationRelevant, matchOneFull, matchTwoFull, matchOneFast, matchTwoFast, freshRights, castleString, rightsFromString, updateRights, buildPosition, createTracker, obsFromFen,
   };
   if (typeof module !== 'undefined' && module.exports) module.exports = CV.boardstate;
 })(typeof window !== 'undefined' ? window : globalThis);

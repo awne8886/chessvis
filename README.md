@@ -1,10 +1,10 @@
 # ChessVision
 
-ChessVision is a Firefox extension (Manifest V2, version 2.0.3) that plays chess against the **computer bots** on chess.com by itself. It reads the board from the page, asks a chess engine that runs locally inside the extension for a move, and plays that move with synthetic pointer events. No server is involved: both engines are WebAssembly binaries that ship in `engine/`.
+ChessVision is a Firefox extension (Manifest V2, version 2.0.4) that plays chess against the **computer bots** on chess.com by itself. It reads the board from the page, asks a chess engine that runs locally inside the extension for a move, and plays that move with synthetic pointer events. No server is involved: both engines are WebAssembly binaries that ship in `engine/`.
 
 > **Scope.** ChessVision only acts on pages listed in [`allowed-pages.txt`](allowed-pages.txt) and is meant for bot games. Do not use it against people, in rated play, or anywhere engine help is not allowed.
 
-This README explains **how the extension is built and why**: every file, the path a move takes from the board to the engine and back, and the tricks that make it fast. The complete settings table, troubleshooting guide and changelog are in [`docs/REFERENCE.md`](docs/REFERENCE.md) (the README that shipped in the 1.8.0 zip, updated for 2.0.0 and 2.0.2).
+This README explains **how the extension is built and why**: every file, the path a move takes from the board to the engine and back, and the tricks that make it fast. The complete settings table, troubleshooting guide and changelog are in [`docs/REFERENCE.md`](docs/REFERENCE.md) (the README that shipped in the 1.8.0 zip, updated for 2.0.0, 2.0.2 and 2.0.4).
 
 ---
 
@@ -36,6 +36,8 @@ This README explains **how the extension is built and why**: every file, the pat
 
 Temporary add-ons disappear when Firefox restarts. A permanent unsigned install needs Firefox Developer Edition or Nightly with `xpinstall.signatures.required = false`. The author runs it on Firefox for Android.
 
+**Packaging (2.0.4).** `tools/package.sh` builds `dist/chessvision-<version>.zip` from the runtime files only (manifest, the scripts it lists, the popup, `engine/`, `LICENSE`, `allowed-pages.txt`), without the engine sources, docs, tests and tools, then unpacks it and checks that every file the manifest and `background.js` name is there. `tools/package.sh --lean` also leaves out the asm.js fallback and the threaded Stockfish build, which Firefox never runs (it always has WebAssembly; extension pages have no SharedArrayBuffer): 3.85 MB instead of 6.39 MB.
+
 ---
 
 ## Architecture at a glance
@@ -47,9 +49,10 @@ Temporary add-ons disappear when Firefox restarts. A permanent unsigned install 
  │              sends pointer events            │ ───────────▶ │   Stockfish main worker  (UCI, wasm)         │
  │ overlay.js   the panel (Shadow DOM)          │ ◀─────────── │   AggroChess main worker (wasm exports)      │
  │                                              │               │   ponder pool: 1-3 extra workers + spares    │
- │ pure modules (no DOM, unit-testable):        │               │   compiles each .wasm ONCE, posts the Module │
- │   boardstate.js  chessmini.js  humanize.js   │               │   serves allowed-pages.txt, downloads icons  │
- │   clock.js  recorder.js  pgn.js  brilliant.js│               └──────────────────────────────────────────────┘
+ │ pure modules (no DOM, unit-testable):        │   port (2.0.4)│   compiles each .wasm ONCE, posts the Module │
+ │   boardstate.js  chessmini.js  humanize.js   │ ◀ ─ ─ ─ ─ ─ ─ │   serves allowed-pages.txt, downloads icons  │
+ │   clock.js  recorder.js  pgn.js  brilliant.js│ ponder status │   stores the saved games (2.0.4)             │
+ │                                              │               └──────────────────────────────────────────────┘
  │   settings.js (shared with the background)   │                        │ new Worker(...)
  └──────────────────────────────────────────────┘                        ▼
                                                     engine/sf-worker.js → stockfish-19-lite-single.js/.wasm
@@ -62,10 +65,10 @@ The split is deliberate and is the main rule of the project:
 | --- | --- | --- |
 | **Page scripts** | `content.js`, `overlay.js` | Only they touch the chess.com DOM. Everything that depends on chess.com's markup (selectors, events) lives here, so a site change breaks one place. |
 | **Pure modules** | `boardstate.js`, `chessmini.js`, `humanize.js`, `clock.js`, `recorder.js`, `pgn.js`, `brilliant.js`, helpers in `settings.js` | No DOM, no storage. They run unchanged under Node, so the logic (FEN building, move tracking, delays, clock budgets, PGN, ponder state) can be unit-tested without a browser. |
-| **Background page** | `background.js` | Engines live here, not in the tab: a page reload or SPA navigation on chess.com does not kill a warmed-up engine, its hash table, or the ponder pool, and only one copy of each engine exists however many tabs are open. |
+| **Background page** | `background.js` | Engines live here, not in the tab: a page reload or SPA navigation on chess.com does not kill a warmed-up engine, its hash table, or the ponder pool, and only one copy of each engine exists however many tabs are open. Since 2.0.4 an engine starts on first use and is shut down after 10 minutes without a request once no chess.com tab is open (below). |
 | **Workers** | `engine/*.js` | WebAssembly search blocks the thread it runs on. Running it in a Worker keeps the background page and the tab responsive, and lets several searches run in parallel on different cores. |
 
-Communication is **pull-based**: the tab asks (`runtime.sendMessage`), the background answers. The background never pushes to the tab, which is why the extension does not need the `tabs` permission. Ponder progress is polled by the watchdog tick.
+Communication is mostly **pull-based**: the tab asks (`runtime.sendMessage`), the background answers. Since 2.0.4 each tab also holds one `runtime.connect` port: the background pushes the ponder status (pondering, evaluation line, replies found) on the port of the tab that started the job, only when it changes and at most 4 times a second (2.0.3 polled it on every watchdog tick), and the open ports tell it that a chess.com tab is still there (see *Engine start-up* below). A port needs no `tabs` permission either.
 
 ---
 
@@ -73,7 +76,7 @@ Communication is **pull-based**: the tab asks (`runtime.sendMessage`), the backg
 
 What happens between "the opponent moved" and "our piece lands", with the file and function responsible:
 
-1. **Mutation seen** — `content.js › attach()` installs a `MutationObserver` on the board element (child list + `class` attributes). Every change calls `scheduleStable(boardDebounceMs)` (default 80 ms): after the debounce the board is read twice, one animation frame + 20 ms apart, and `check()` runs only when both reads agree (`boardstate.js › signature`), so a half-updated board never reaches the tracker. A **watchdog** (`startWatchdog`, default every 1000 ms) calls `check()` directly in case a mutation was missed.
+1. **Mutation seen** — `content.js › attach()` installs a `MutationObserver` on the board element (child list + `class` attributes). A change that can alter a board read (2.0.4: `boardstate.js › mutationRelevant` — a piece or highlight changed, added or removed, or the board's own class; hover squares, arrows and the board's reaction to our cursor are ignored) calls `scheduleStable(boardDebounceMs)` (default 40 ms): after the debounce the board is read twice, one animation frame + 20 ms apart, and `check()` runs only when both reads agree (`boardstate.js › signature`), so a half-updated board never reaches the tracker; since 2.0.4 `check()` uses the second read instead of reading a third time. A **watchdog** (`startWatchdog`, default every 1000 ms) catches a missed mutation: since 2.0.4 each tick reads the board once and stops there when nothing changed since the last check (every 5 s a full check runs anyway, for a result popup that changes nothing on the board).
 2. **Board read** — `readPosition()` collects every `.piece` element (`wp`, `bk`, … classes and `square-XY`) into an 8×8 grid plus the highlighted last-move squares. `boardstate.js › buildPosition` turns that into a placement, side to move (from which colour moved onto the highlighted square), castling rights and en-passant square.
 3. **Tracking** — `boardstate.js › createTracker().observe()` compares the new placement with the last known one and finds the legal move (or two) that explains it. It keeps the full **move history from the start position**, which is why the engines get `position fen <start> moves …` instead of a bare FEN: they then see threefold repetition and the 50-move counter. It also detects takebacks and new games.
 4. **Our turn?** — `check()`: if it is the opponent's turn, `idleWork()` starts pondering (see below) and the status shows `WFO`. If it is our turn and this position was not handled yet, `play(pos)` runs.
@@ -114,6 +117,10 @@ What happens between "the opponent moved" and "our piece lands", with the file a
 | **Source in the repository** (`engine-src/aggrochess/`, built by `tools/build-aggrochess.sh`) | AggroChess 4.6.1 (GitHub tag `v4.6.1`) plus the web wrapper, which 2.0.2 reconstructed from the shipped binaries and checked call for call against them, and ChessVision's changes (`upstream.diff`): the clock is polled every 256 nodes instead of 1024 (a search overran its budget by ~50 ms in wasm, where reading the clock is a call into JavaScript); the exports `set_tt_mb` (hash size per worker) and `think_depth` (one depth step at a time); since 2.0.2 `analyze_floor` / `think_floor` (short searches that stay short: the ranking scans), `last_info` (benchmarks), the `js_poll` import (interruption) and the speed changes. The build is pinned (Rust 1.100.0, `Cargo.lock`, binaryen 132) and byte-reproducible. |
 | **Clock-sized search** | `think_clock(soft, hard)` is fed from your chess.com clock (`clock.js`), so the engine spends more time when it has it and never risks flagging. |
 | **Interruptible where the browser has JSPI (2.0.2)** | A wasm `think()` call blocks its worker until it returns. Since 2.0.2 the engine asks the page every 8 ms (`js_poll`) whether to stop; with JavaScript Promise Integration (`WebAssembly.Suspending` / `promising`, feature-detected) that question lets the worker receive a `stop`, and the search ends with its last completed depth (Chromium: median 6 ms after the stop, no measurable cost). Without JSPI (Firefox before ~153, unverified) a search still runs to its time limit and the only way to cancel it is `Worker.terminate()`, which shapes the AggroChess pondering design below. |
+
+### Engine start-up and shutdown (2.0.4)
+
+Until 2.0.3 both main workers started with the background page, that is when Firefox started, even if chess.com was never opened (each compiles a ~1.8 MB wasm, allocates its hash and runs a warm-up). Now an engine starts when it is first needed: a search, a ponder job, or the page's `warm` message, which a tab sends when Auto-play is on on an allowed page (and again when the engine setting changes), so the first move is not slower than before. Every chess.com tab holds a port to the background; when no tab has been connected for 10 minutes and no request came, both main workers, every ponder worker and the compiled modules are released (`CV.ENGINE_IDLE_MS`). When the last tab closes, the ponder job and the warm spare workers are released at once. The constant `CV.LAZY_ENGINES = false` restores the 2.0.3 start-up.
 
 ### Why two engines
 
@@ -160,7 +167,7 @@ With `ponderUntilMove` (default on) the job no longer stops at the ponder time: 
 
 ## Reading the board and tracking the game
 
-* **Board element**: `wc-chess-board`, `chess-board` or `.board`; re-attached every second in case chess.com swaps it (it is a single-page app).
+* **Board element**: `wc-chess-board`, `chess-board` or `.board`; re-attached in case chess.com swaps it (it is a single-page app): checked every second, and since 2.0.4 the document is searched again only every 5 s while the board is still in the page (a removed board is replaced at the next second).
 * **Side to move** comes from the last-move highlight squares: whichever colour sits on a highlighted square moved last. The untouched start position (no highlights) is White to move.
 * **Castling rights** are tracked over the whole game (`updateRights`): once a king or rook leaves its square, the right is gone, even if it comes back.
 * **The tracker** (`boardstate.js`) is the **one** game-tracking mechanism: it explains each new board by one legal move (or two, if one board read was missed, and only if the observed side to move agrees), recognises takebacks (the board matches an earlier position) and new games (the untouched start position, or more pieces than before), and reports a gap instead of guessing.
@@ -198,13 +205,13 @@ AggroChess uses this by default (`aggroUseClock`). For Stockfish it is an option
 * A think request that takes more than `3 × budget + 4 s` declares the AggroChess worker stuck; it is terminated and re-created.
 * Stockfish start order: wrapper + shared Module → loader directly → asm.js. Each step has its own timeout.
 * A move that does not register is retried (drag → click fallback). A move attempt stuck for 45 s is abandoned.
-* The watchdog re-reads the board every second whatever the DOM says, so a missed mutation can never stall the game.
+* The watchdog re-reads the board every second whatever the DOM says, so a missed mutation can never stall the game (2.0.4: one read per tick; the full check only when the board changed, and every 5 s).
 
 ---
 
 ## Game recording
 
-`recorder.js` keeps every distinct board position it ever sees (from any source: the bot, the opponent, or your own manual moves while paused). Only at the end of the game does it rebuild the move list, filling gaps of up to 6 plies with a legal-move search that uses all later positions as context. This is more reliable than guessing on the spot. `pgn.js` writes a plain PGN with correct SAN; sacrifices are counted from AggroChess's flag; `brilliant.js` makes a best-effort count of chess.com's "brilliant" icons (unverified selectors, three detection layers). Saved games live in `storage.local`.
+`recorder.js` keeps every distinct board position it ever sees (from any source: the bot, the opponent, or your own manual moves while paused). Only at the end of the game does it rebuild the move list, filling gaps of up to 6 plies with a legal-move search that uses all later positions as context. This is more reliable than guessing on the spot. `pgn.js` writes a plain PGN with correct SAN; sacrifices are counted from AggroChess's flag; `brilliant.js` makes a best-effort count of chess.com's "brilliant" icons (unverified selectors, three detection layers). Saved games live in `storage.local`: since 2.0.4 one key per game (`game:<id>`) plus an index of ids (`savedGameIds`), written by the background page one save at a time (2.0.3 rewrote the whole list from each tab on every save, and every tab re-read it). The 2.0.3 list (`savedGames`) is moved over once, at the first start of 2.0.4, and removed only after the copy has been read back.
 
 ---
 
@@ -212,7 +219,7 @@ AggroChess uses this by default (`aggroUseClock`). For Stockfish it is an option
 
 | File | Role |
 | --- | --- |
-| `manifest.json` | MV2 manifest: permissions (`storage`, `clipboardWrite`, chess.com / chesscomfiles / lichess hosts), background scripts, content scripts, CSP allowing `wasm-unsafe-eval` for the engines. |
+| `manifest.json` | MV2 manifest: permissions (`storage`, `clipboardWrite`, chess.com / chesscomfiles hosts; 2.0.4: lichess removed, no code ever read a lichess board), background scripts, content scripts, CSP allowing `wasm-unsafe-eval` for the engines. |
 | `allowed-pages.txt` | The pages where auto-play is allowed (one entry per line, `*` wildcard). |
 | `background.js` | Engines, the ponder pool, shared-Module compilation, timeouts and restarts, allowlist and icon downloads, the message router. |
 | `content.js` | The main loop on chess.com: board observer, watchdog, board reading, engine requests, delays, pointer input, game-over handling, saving, debug info. |
@@ -239,7 +246,9 @@ AggroChess uses this by default (`aggroUseClock`). For Stockfish it is an option
 | `docs/OPUS_PROMPT_2.0.2.md` | The 2.0.2 task (engine speed, workers, pondering), with its status. |
 | `engine/stockfish-19-lite-single-rsimd.js/.wasm` | 2.0.2: Stockfish 19 lite single-thread with relaxed SIMD (used where the browser supports it). |
 | `tools/build-aggrochess.sh`, `tools/build-stockfish.sh` | 2.0.2: pinned, reproducible engine builds (Rust 1.100.0 + binaryen 132; emsdk 6.0.9). Not needed to use the extension. |
-| `tests/` | Plain Node tests (`*.test.js`), the fake-worker background harness (`_fakebg.js`), the engine helpers (`_aggro-wasm.js`), and benchmarks: `bench-engines.js` (signatures, speed, `--diff`), `bench-delay-mode.js`, `bench-ponder-rank.js`, `bench-jspi.js` (Chromium via Playwright), `smoke-board.js` (jsdom page harness; jsdom is installed on demand, not a dependency). |
+| `tools/package.sh` | 2.0.4: the extension zip from the runtime files only (`--lean`: without the asm.js and threaded Stockfish builds), checked after zipping. |
+| `docs/OPUS_PROMPT_2.0.4.md` | The 2.0.4 task (less idle work, memory, storage writes; faster moves in a hidden tab; packaging). |
+| `tests/` | Plain Node tests (`*.test.js`), the fake-worker background harness (`_fakebg.js`), the engine helpers (`_aggro-wasm.js`), and benchmarks: `bench-engines.js` (signatures, speed, `--diff`), `bench-delay-mode.js`, `bench-ponder-rank.js`, `bench-jspi.js` (Chromium via Playwright), `smoke-board.js` (jsdom page harness; jsdom is installed on demand, not a dependency); 2.0.4: `bench-content.js` (jsdom: board reads, DOM queries, layout, messages and storage writes per scenario), `bench-pure.js` (tracker matcher, legal moves, replay), `bench-hittest.js` (Chromium: event targets with the panel over the board). |
 
 ---
 
@@ -267,6 +276,8 @@ From the project's own benchmarks (Node 22, x86-64 container with 4 cores; each 
 
 A phone is typically several times slower than these figures. None of this has been measured in real Firefox or on real chess.com bots yet (the JSPI and relaxed-SIMD numbers come from headless Chromium 157).
 
+**2.0.4, the page side** (`tests/bench-content.js`, jsdom mock page, 2.0.3 vs 2.0.4): a minute with nothing happening on the board costs 59 board reads instead of 180 and 32 document queries instead of 167; while pondering, 0 status messages instead of 60 (pushed on change); a move cycle 13 board reads instead of 17 and 1 board rect instead of 5; a slider drag 1 storage write instead of 11; one saved game writes ~2 KB instead of the whole list (~81 KB with 50 games); a move in a hidden tab (timers clamped to 1 s) 8 s instead of 36-47 s. Details in [`docs/REFERENCE.md`](docs/REFERENCE.md#changelog).
+
 ---
 
 ## Where the time actually goes, and what could be faster
@@ -283,7 +294,7 @@ With the default settings (Stockfish, Search depth 10 as a minimum, human-like p
 
 Measured (`tests/bench-delay-mode.js`, real Stockfish loader in Node, 10 middlegame positions): `go depth 10` reaches depth 10 in 16 ms (median); a delay-matched search with a 300 ms pause reaches depth 15.8 on average, with 800 ms depth 18.1. The table is in [`docs/REFERENCE.md`](docs/REFERENCE.md#changelog).
 
-What is left: everything above was measured in Node, in headless Chromium and in a jsdom mock of the page, not in Firefox or on chess.com (see `chessvision-project-summary.md` for the list of real-browser checks). [`docs/SONNET_PROMPT.md`](docs/SONNET_PROMPT.md) (2.0.0) and [`docs/OPUS_PROMPT_2.0.2.md`](docs/OPUS_PROMPT_2.0.2.md) (2.0.2) are the task descriptions these changes were implemented from.
+What is left: everything above was measured in Node, in headless Chromium and in a jsdom mock of the page, not in Firefox or on chess.com (see `chessvision-project-summary.md` for the list of real-browser checks). [`docs/SONNET_PROMPT.md`](docs/SONNET_PROMPT.md) (2.0.0), [`docs/OPUS_PROMPT_2.0.2.md`](docs/OPUS_PROMPT_2.0.2.md) (2.0.2) and [`docs/OPUS_PROMPT_2.0.4.md`](docs/OPUS_PROMPT_2.0.4.md) (2.0.4: idle work, memory, storage, packaging) are the task descriptions these changes were implemented from.
 
 ---
 
@@ -296,6 +307,8 @@ What is left: everything above was measured in Node, in headless Chromium and in
 * Tests run with plain Node: `for t in tests/*.test.js; do node "$t" || exit 1; done`. The 1.8.0 zip did not contain the `tests/` folder or `.github/` its notes mention; `tests/` was recreated in 2.0.0 (see `docs/REFERENCE.md › Development`).
 * Keep `docs/REFERENCE.md` (settings + changelog), the tests and `chessvision-project-summary.md` in sync with every change.
 * Mark anything that depends on the real chess.com site as unverified until it has been checked.
+* Ship with `tools/package.sh` (2.0.4): the zip holds the runtime files only and is checked after it is built.
+* Since 2.0.4 every behaviour change of a speed / efficiency release has a constant in `settings.js` whose `false` restores the previous version (listed in `docs/REFERENCE.md` › Settings reference › Constants).
 
 ---
 

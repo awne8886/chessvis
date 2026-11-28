@@ -1,2 +1,5 @@
 # build work directories (tools/build-*.sh)
 .build/
+
+# tools/package.sh output
+dist/

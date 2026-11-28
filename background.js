@@ -160,19 +160,27 @@ function sfAttach(worker) {
 }
 
 function initStockfish() {
+  const gen = engineGen;
+  engineDbg.starts.stockfish++;
   sfReady = (async () => {
-    let r;
+    let r, file;
     try {
       r = await sfSpawnWasm();
-      sfActive = r.file || SF_FILE;
+      file = r.file || SF_FILE;
     } catch (e) {
+      if (gen !== engineGen) throw e;
       console.error('[ChessVision] Stockfish: ' + SF_FILE + ' did not start (' + ((e && e.message) || e) + '); falling back to ' + SF_FALLBACK_FILE);
       r = await sfSpawn(SF_FALLBACK_FILE);
-      sfActive = SF_FALLBACK_FILE;
+      file = SF_FALLBACK_FILE;
     }
     // 2.0.0 (T10): warm the main worker like the ponder workers before sfReady resolves: the first search of a fresh engine
     // pays for its own lazy set-up. Measured in Node: ~20 ms here, first depth-10 search 56 -> 39 ms. Never fatal.
-    sfDbg.mainWarmMs = await sfWarmMain(r.worker);
+    const warmMs = await sfWarmMain(r.worker);
+    // 2.0.4 (B1): the engines were shut down while this one started (cannot happen while a request waits for it, see
+    // engineIdleCheck): never attach a worker of an older generation
+    if (gen !== engineGen) { try { r.worker.terminate(); } catch (e) { /* ignore */ } throw new Error('the engine was shut down while it started'); }
+    sfActive = file;
+    sfDbg.mainWarmMs = warmMs;
     sfAttach(r.worker);
     sfThreadsSent = SF_THREADS;
     sfDbg.workerStarts++; sfDbg.lastStart = { label: 'main', file: sfActive, how: r.how || 'direct' };
@@ -250,12 +258,17 @@ function sfStart(job) {
 function sfCheckStop(job, by) {
   if (by === 'soft timer' || by === 'hard timer') {
     const late = Date.now() - job.startedAt - (by === 'soft timer' ? job.softMs : job.hardMs);
-    job[by === 'soft timer' ? 'softLateMs' : 'hardLateMs'] = late;
+    job[by === 'soft timer' ? 'softLateMs' : 'hardLateMs'] = Math.max(0, late);   // 2.0.4: >= 0 (a timer may fire 1 ms "early")
   }
   if (sfCurrent !== job || job.stopSent) return;
-  if (job.mode === 'clock') { if (Date.now() - job.startedAt >= job.hardMs) sfSendStop(job, by); return; }
+  // 2.0.4: a timer can fire a millisecond before Date.now() says its time is up (clock rounding); a timer that fired has
+  // reached its time (seen as a flaky test: the hard timer did not stop the search, the next info line did)
+  let elapsedMs = Date.now() - job.startedAt;
+  if (by === 'hard timer') elapsedMs = Math.max(elapsedMs, job.hardMs);
+  else if (by === 'soft timer') elapsedMs = Math.max(elapsedMs, job.softMs);
+  if (job.mode === 'clock') { if (elapsedMs >= job.hardMs) sfSendStop(job, by); return; }
   if (job.mode !== 'delay') return;
-  if (CV.sfShouldStop({ elapsedMs: Date.now() - job.startedAt, softMs: job.softMs, depthDone: job.depthDone, minDepth: job.depth, hardMs: job.hardMs })) sfSendStop(job, by);
+  if (CV.sfShouldStop({ elapsedMs, softMs: job.softMs, depthDone: job.depthDone, minDepth: job.depth, hardMs: job.hardMs })) sfSendStop(job, by);
 }
 // 2.0.3: `stop` to the main worker, noting why and when (ms after the search started) for the debug info.
 function sfSendStop(job, by) {
@@ -333,7 +346,7 @@ async function analyzeStockfish(fen, depth, imperfection, maxMs, startFen, moves
 }
 async function analyzeStockfishNow(fen, depth, imperfection, maxMs, startFen, moves, msg) {
   const t0 = Date.now();
-  try { await sfReady; } catch (e) { return { error: 'Stockfish: could not start (' + ((e && e.message) || e) + ')' }; }
+  try { await sfEnsureCurrent(); } catch (e) { return { error: 'Stockfish: could not start (' + ((e && e.message) || e) + ')' }; }
   // 1) a reply already found while pondering wins; anything else stops the ponder workers at once (stop + isready, never waited for)
   if (!msg.ponder) { if (ponderKind === 'sf') ponderCancel(); }
   else {
@@ -377,6 +390,7 @@ async function analyzeStockfishNow(fen, depth, imperfection, maxMs, startFen, mo
     ponderCancel();                                                           // miss, late or no entry yet: the ponder workers never delay a real search
   }
   if (msg.sfThreads !== undefined) { try { await sfApplyThreads(msg.sfThreads); } catch (e) { /* keep the engine we have */ } }
+  if (!sf) { try { await sfEnsureCurrent(); } catch (e) { return { error: 'Stockfish: could not start (' + ((e && e.message) || e) + ')' }; } }   // 2.0.4: from here to sfStart nothing waits
   const res = await new Promise((resolve) => {
     const imp = Math.max(0, Math.min(100, imperfection || 0));
     const softMs = Math.max(0, Math.min(AGGRO_HARD_MAX_MS, Math.round(Number(msg.softMs)) || 0));
@@ -637,6 +651,7 @@ function aggroGet() {
   if (aggroFailure && Date.now() - aggroFailure.at < AGGRO_ERROR_COOLDOWN_MS) throw new Error(aggroFailure.message);
   if (!aggroMain || aggroMain.dead) {
     if (aggroMain) aggroDbg.restarts++;
+    engineDbg.starts.aggro++;
     aggroMain = spawnAggroWorker('main');
     const h = aggroMain;
     h.ready.then(() => { if (aggroFailure) aggroFailure = null; }, (e) => {
@@ -648,6 +663,126 @@ function aggroGet() {
   return aggroMain;
 }
 function initAggro() { try { aggroGet(); } catch (e) { /* cooling down: nothing to start */ } }
+
+// ======================= Engine lifetime (2.0.4, B1) =======================
+// 2.0.3 started both main workers when the browser started (each compiles a ~1.8 MB wasm, allocates its hash and warms
+// up, in a persistent background page, even if chess.com is never opened). Now an engine starts on its first use
+// (ensureStockfish / ensureAggro: analyze, aggroIdle, and the page's `warm` message, sent when Auto-play is on on an
+// allowed page so the first move does not pay for the start), and after CV.ENGINE_IDLE_MS without a request while no
+// tab holds a port (runtime.connect, one per chess.com tab), both main workers and every ponder worker are terminated
+// and the compiled modules dropped. The stop is synchronous and only happens when nothing is in flight (no request
+// waiting, no search, no ponder job, no top-up), so no request can see a half-stopped engine; a request after it
+// starts a fresh engine (engineGen tells an older start that it lost). CV.LAZY_ENGINES = false: 2.0.3 (both start at
+// load, never stop).
+let engineGen = 0, engineInflight = 0, engineIdleTimer = null;
+const enginePorts = new Set();
+const engineDbg = { starts: { stockfish: 0, aggro: 0 }, stops: 0, lastStopAt: null };
+function ensureStockfish() {
+  if (!sfReady) initStockfish();
+  return sfReady;
+}
+// ensureStockfish, again if the engines were shut down while it waited (then `sf` belongs to no one): the caller may use `sf`
+// until its next await.
+async function sfEnsureCurrent() {
+  for (let i = 0; i < 3; i++) {
+    const gen = engineGen;
+    await ensureStockfish();
+    if (gen === engineGen && sf) return;
+  }
+  throw new Error('the engine was restarted while starting');
+}
+function ensureAggro() {
+  try { return aggroGet().ready; } catch (e) { return Promise.reject(e); }     // cooling down after a failed start: its error
+}
+// A request that may use an engine: counted while it runs; the idle clock restarts when it ends.
+async function withEngine(fn) {
+  engineInflight++;
+  clearTimeout(engineIdleTimer); engineIdleTimer = null;
+  try { return await fn(); } finally { engineInflight--; armEngineIdle(); }
+}
+function armEngineIdle() {
+  if (!CV.LAZY_ENGINES) return;
+  clearTimeout(engineIdleTimer);
+  engineIdleTimer = enginePorts.size || engineInflight ? null : setTimeout(engineIdleCheck, CV.ENGINE_IDLE_MS);
+}
+const enginesRunning = () => !!(sf || sfReady || (aggroMain && !aggroMain.dead) || ponderSpares.length || ponderActive.length || ponderCancelling.length);
+function engineIdleCheck() {
+  engineIdleTimer = null;
+  if (!CV.LAZY_ENGINES || enginePorts.size || !enginesRunning()) return;
+  if (engineInflight || aggroThinking || sfCurrent || sfNext || ponderActive.length || idleInfo.pondering || hitJobs.size) { armEngineIdle(); return; }
+  stopEngines();
+}
+function stopEngines() {
+  engineGen++;
+  ponderWanted = false;                                         // B2: no spares are made again until a new idle job
+  ponderCancel();
+  for (const w of [...ponderSpares, ...ponderActive, ...ponderCancelling]) w.kill('engines idle');
+  ponderSpares = []; ponderActive = []; ponderCancelling = [];
+  if (sf) { try { sf.terminate(); } catch (e) { /* ignore */ } }
+  sf = null; sfReady = null; sfActive = null; sfCurrent = null; sfNext = null; sfPrevCount = null; sfMultiPvSent = null; sfThreadsSent = SF_THREADS; lastMainPv = null;
+  if (aggroMain) { aggroMain.kill(); aggroMain = null; }
+  sfModuleP.clear(); aggroModuleP = null;                       // compiled again on the next start
+  Object.assign(sfModuleInfo, { shared: false, ms: null, how: null, error: null, file: null });
+  Object.assign(aggroModuleInfo, { shared: false, ms: null, how: null, error: null, file: null, simd: false });
+  engineDbg.stops++; engineDbg.lastStopAt = Date.now();
+  console.log('[ChessVision] engines stopped after ' + CV.ENGINE_IDLE_MS + ' ms without a request');
+}
+// `warm` from the page: start the engine of that name now (the first move then finds it ready).
+function warmEngine(engine) {
+  return (engine === 'stockfish' ? ensureStockfish() : ensureAggro()).then(() => ({ ok: true }), (e) => ({ ok: false, error: String((e && e.message) || e) }));
+}
+// One port per chess.com tab (content.js): while any tab holds one, the engines are never shut down.
+if (api.runtime.onConnect) {
+  api.runtime.onConnect.addListener((port) => {
+    if (!port || port.name !== 'chessvision') return;
+    enginePorts.add(port);
+    clearTimeout(engineIdleTimer); engineIdleTimer = null;
+    port.onDisconnect.addListener(() => { enginePorts.delete(port); onPortGone(port); });
+  });
+}
+// 2.0.4 (B2): the last tab is gone: nobody needs a ponder job or warm spares any more (kept indefinitely before, while
+// ponderWanted). A tab that started the running idle job and closed: the job is cancelled (other tabs keep the spares).
+// CV.PONDER_RELEASE_ON_DISCONNECT = false: 2.0.3 (nothing happens). The engines themselves stop after CV.ENGINE_IDLE_MS (B1).
+function onPortGone(port) {
+  const tab = portTab(port);
+  if (CV.PONDER_RELEASE_ON_DISCONNECT) {
+    if (!enginePorts.size) { ponderWanted = false; ponderCancel(); }
+    else if (idleStatus.tab !== null && idleStatus.tab === tab && !portForTab(tab)) ponderCancel();
+  }
+  if (idleStatus.tab === tab && !portForTab(tab)) stopIdleStatus();
+  armEngineIdle();
+}
+const portTab = (port) => (port && port.sender && port.sender.tab && port.sender.tab.id !== undefined ? port.sender.tab.id : null);
+const portForTab = (tab) => { for (const p of enginePorts) if (portTab(p) === tab) return p; return null; };
+
+// ======================= Ponder status pushed to the tab (2.0.4, A4) =======================
+// 2.0.3: the page asked for { pondering, evalLine, found } on every watchdog tick (aggroIdleStatus, one message a second
+// for the whole opponent's turn). Now the background pushes it on the port of the tab that started the idle job, only
+// when a value changed and at most every IDLE_STATUS_MIN_MS; the 250 ms check runs only while a job is reported.
+// aggroIdleStatus still answers (debug use, and pages without a port). CV.IDLE_STATUS_PUSH = false: 2.0.3.
+const IDLE_STATUS_MIN_MS = 250;
+const idleStatus = { tab: null, key: null, timer: null, last: null, pushes: 0 };
+const idleSnapshot = () => ({ pondering: !!idleInfo.pondering, evalLine: idleInfo.evalLine || null, found: ponder.found() });
+function startIdleStatus(msg, sender) {
+  if (!CV.IDLE_STATUS_PUSH) return;
+  const tab = sender && sender.tab && sender.tab.id !== undefined ? sender.tab.id : null;
+  idleStatus.tab = tab; idleStatus.key = CV.ponderKey(msg.startFen, msg.moves); idleStatus.last = null;
+  if (!idleStatus.timer) idleStatus.timer = setInterval(pushIdleStatus, IDLE_STATUS_MIN_MS);
+  pushIdleStatus();
+}
+function stopIdleStatus() { clearInterval(idleStatus.timer); idleStatus.timer = null; idleStatus.tab = null; idleStatus.key = null; }
+function pushIdleStatus() {
+  const port = idleStatus.tab === null ? null : portForTab(idleStatus.tab);
+  if (!port) { stopIdleStatus(); return; }
+  const snap = idleSnapshot();
+  const same = idleStatus.last && idleStatus.last.pondering === snap.pondering && idleStatus.last.evalLine === snap.evalLine && idleStatus.last.found === snap.found;
+  if (!same) {
+    idleStatus.last = snap;
+    idleStatus.pushes++;
+    try { port.postMessage({ type: 'idleStatus', key: idleStatus.key, ...snap }); } catch (e) { stopIdleStatus(); return; }
+  }
+  if (!snap.pondering && !idleJobs) { clearInterval(idleStatus.timer); idleStatus.timer = null; }   // the job ended and its last state is out
+}
 
 // What think wants: the fen/moves of the request (history when reliable, else the bare FEN as a set-up position).
 function aggroPosition(msg) {
@@ -920,10 +1055,17 @@ function ourScore(a, myColor) {
   return a.kind === 'mate' ? (v > 0 ? 100000 - Math.abs(a.value) : -100000 + Math.abs(a.value)) : v;
 }
 
+// 2.0.4 (E2): every ponder job replayed the whole game (CV.replayUci); the next job's moves extend the last job's by two
+// plies, so only those are applied (CV.createReplayCache, the same result). CV.REPLAY_CACHE = false: 2.0.3.
+const jobReplay = CV.createReplayCache();
+const replayForJob = (startFen, moves) => (CV.REPLAY_CACHE ? jobReplay.replay(startFen, moves) : CV.replayUci(startFen, moves));
+
 // The idle job: after our move, while the opponent thinks. Runs detached; every step re-checks its token.
+let idleJobs = 0;                // 2.0.4: idle jobs whose code is still running (the status push runs while one does)
 async function runIdle(msg, token) {
   if (msg.ponder) idleInfo.pondering = true;                   // the job has started (the workers may still be loading)
-  try { await runIdleJob(msg, token); } finally { if (token === idleToken) idleInfo.pondering = false; }
+  idleJobs++;
+  try { await runIdleJob(msg, token); } finally { idleJobs--; if (token === idleToken) idleInfo.pondering = false; }
 }
 async function runIdleJob(msg, token) {
   const t0 = Date.now();
@@ -939,7 +1081,7 @@ async function runIdleJob(msg, token) {
     predicted = r.uci && r.uci !== 'none' ? r.uci : null;      // a hint for ranking only
   } catch (e) { predicted = null; }
   if (token !== idleToken) return;
-  const after = CV.replayUci(msg.startFen, msg.moves);
+  const after = replayForJob(msg.startFen, msg.moves);
   if (!after.ok) return;
   const legal = CV.chess.legalMoves(after.pos);                // the opponent's possible moves
 
@@ -1137,8 +1279,9 @@ async function analyzeAggroNow(msg) {
       }
       ponderCancel();                                          // miss, late or no entry yet: the ponder workers never delay a real think
     }
-    const h = aggroGet();
+    let h = aggroGet();
     await h.ready;
+    if (h.dead) { h = aggroGet(); await h.ready; }               // 2.0.4: shut down while it waited (B1): a fresh one
     // 2) older requests' results would be stale
     for (const [id, p] of h.pending) { if (p.think) { h.pending.delete(id); clearTimeout(p.timer); p.resolve({ type: 'bestmove', uci: null }); if (h.interruptible && CV.AGGRO_INTERRUPT) h.stop(id); } }
     const warn = msg.verify ? await aggroVerifyPosition(h, msg) : null;
@@ -1291,14 +1434,15 @@ async function sfRelease(w) {
 // The idle job for Stockfish: after our move, while the opponent thinks. Detached; every step re-checks its token.
 async function runIdleSf(msg, token) {
   idleInfo.pondering = true;
-  try { await runIdleSfJob(msg, token); } finally { if (token === idleToken) idleInfo.pondering = false; }
+  idleJobs++;
+  try { await runIdleSfJob(msg, token); } finally { idleJobs--; if (token === idleToken) idleInfo.pondering = false; }
 }
 async function runIdleSfJob(msg, token) {
   const t0 = Date.now();
   const budget = Math.max(200, Math.min(AGGRO_HARD_MAX_MS, Number(msg.ponderMs) || 1500));
   const deadline = t0 + ponderCeiling(msg, budget), left = () => deadline - Date.now();   // 2.0.0: up to ponderMaxMs with ponderUntilMove
   ponderDbg.lastPasses = 0;
-  const after = CV.replayUci(msg.startFen, msg.moves);
+  const after = replayForJob(msg.startFen, msg.moves);
   if (!after.ok) return;
   const legal = CV.chess.legalMoves(after.pos).map((m) => m.uci);          // the opponent's possible moves
   if (!legal.length) return;
@@ -1438,15 +1582,131 @@ async function loadAllowlist() {
   return allowlistText;
 }
 
+// ======================= Saved games (2.0.4, C2) =======================
+// One storage key per game (CV.SAVED_GAME_PREFIX + id) and an index of ids, newest first (CV.SAVED_GAMES_INDEX). 2.0.3
+// rewrote the whole list (up to maxSavedGames, 200 at most) on every save, from each tab, serialised per tab only, and
+// storage.onChanged carried the old and the new list to every tab. Now the tabs ask the background (saveGame,
+// listGames, clearGames) and the background does one operation at a time: a save writes that game's key and the
+// index in one set() (and removes the keys that fell out). The pruning rules are mergeSaved's (CV.mergeSavedIndex).
+// The sizes of stored games are kept in memory (read once per background start, only when unknown).
+const gameStore = () => api.storage && api.storage.local;
+let gameChain = Promise.resolve();
+const gameSizes = new Map();          // id -> CV.savedGameBytes of the stored record
+function gameSerial(fn) {
+  const p = gameChain.then(fn);
+  gameChain = p.catch(() => {});
+  return p;
+}
+const gameKey = (id) => CV.SAVED_GAME_PREFIX + id;
+async function gameIndex() {
+  const g = await gameStore().get(CV.SAVED_GAMES_INDEX);
+  const ids = g && Array.isArray(g[CV.SAVED_GAMES_INDEX]) ? g[CV.SAVED_GAMES_INDEX] : [];
+  return ids.filter((id, i) => typeof id === 'string' && ids.indexOf(id) === i);
+}
+async function gameSizesFor(ids) {
+  const missing = ids.filter((id) => !gameSizes.has(id));
+  if (!missing.length) return;
+  const got = await gameStore().get(missing.map(gameKey));
+  for (const id of missing) { const r = got[gameKey(id)]; gameSizes.set(id, r ? CV.savedGameBytes(r) : 0); }
+}
+function saveGame(record, max) {
+  return gameSerial(async () => {
+    if (!record || typeof record.id !== 'string' || !record.id) return { ok: false, error: 'no record' };
+    await migrateQuietly();                                     // a failed migration never loses a new game
+    const ids = await gameIndex();
+    await gameSizesFor(ids);
+    const bytes = CV.savedGameBytes(record);
+    const lim = CV.LIMITS.maxSavedGames;
+    const m = Math.min(lim[1], Math.max(lim[0], Math.round(Number(max)) || CV.DEFAULTS.maxSavedGames));
+    const { list, dropped } = CV.mergeSavedIndex(ids.map((id) => ({ id, bytes: gameSizes.get(id) || 0 })), { id: record.id, bytes }, { max: m });
+    const kept = list.some((g) => g.id === record.id);
+    const write = { [CV.SAVED_GAMES_INDEX]: list.map((g) => g.id) };
+    if (kept) write[gameKey(record.id)] = record;
+    await gameStore().set(write);
+    if (kept) gameSizes.set(record.id, bytes);
+    if (dropped.length) { await gameStore().remove(dropped.map(gameKey)); for (const id of dropped) gameSizes.delete(id); }
+    gameDbg.saves++;
+    return { ok: true, kept, dropped: dropped.length, count: list.length };
+  });
+}
+function listGames() {
+  return gameSerial(async () => {
+    await migrateQuietly();
+    const ids = await gameIndex();
+    const got = ids.length ? await gameStore().get(ids.map(gameKey)) : {};
+    const list = ids.map((id) => got[gameKey(id)]).filter((r) => r && typeof r === 'object');
+    if (!gameMigrated) {                                        // the old list is still there: show its games too (older)
+      const old = (await gameStore().get(CV.SAVED_GAMES_LEGACY))[CV.SAVED_GAMES_LEGACY];
+      if (Array.isArray(old)) for (const r of old) if (r && r.id && !list.some((x) => x.id === r.id)) list.push(r);
+    }
+    return list;
+  });
+}
+function clearGames() {
+  return gameSerial(async () => {
+    await migrateQuietly();
+    const ids = await gameIndex();
+    await gameStore().set({ [CV.SAVED_GAMES_INDEX]: [] });
+    if (ids.length) await gameStore().remove(ids.map(gameKey));
+    if (!gameMigrated) { await gameStore().remove(CV.SAVED_GAMES_LEGACY); gameMigrated = true; }   // clear means all of them
+    gameSizes.clear();
+    return { ok: true, cleared: ids.length };
+  });
+}
+// One-way migration of the 2.0.3 list ('savedGames', newest first): every game is written under its own key with the
+// index, read back and compared, and only then is the old list removed. Nothing is pruned here (the next save prunes by
+// the usual rules). Idempotent: a migration interrupted after the write (or stopped by a failed check) is simply done
+// again at the next start; games saved meanwhile under the new keys stay in front (they are newer), and an id in both
+// keeps the per-key record. Runs once per background start, before the first save / list / clear (they wait for it).
+let gameMigrated = false;
+const gameDbg = { saves: 0, migrated: null, migrateError: null };
+async function migrateSavedGames() {
+  if (gameMigrated || !gameStore()) return;
+  const legacyKey = CV.SAVED_GAMES_LEGACY;
+  const got = await gameStore().get(legacyKey);
+  if (!(legacyKey in got)) { gameMigrated = true; return; }
+  const old = Array.isArray(got[legacyKey]) ? got[legacyKey].filter((r) => r && typeof r === 'object' && typeof r.id === 'string' && r.id) : [];
+  const ids = await gameIndex();
+  const cur = ids.length ? await gameStore().get(ids.map(gameKey)) : {};
+  const order = ids.filter((id) => cur[gameKey(id)]);
+  const write = {};
+  for (const r of old) {
+    if (order.includes(r.id)) continue;            // already migrated, or saved again under the new key (newer)
+    order.push(r.id); write[gameKey(r.id)] = r;
+  }
+  write[CV.SAVED_GAMES_INDEX] = order;
+  await gameStore().set(write);
+  const back = await gameStore().get([CV.SAVED_GAMES_INDEX, ...order.map(gameKey)]);
+  const okIndex = Array.isArray(back[CV.SAVED_GAMES_INDEX]) && back[CV.SAVED_GAMES_INDEX].join('\n') === order.join('\n');
+  const okGames = order.every((id) => back[gameKey(id)] && back[gameKey(id)].id === id);
+  if (!okIndex || !okGames) throw new Error('saved games: the migrated copy did not read back; the old list is kept');
+  await gameStore().remove(legacyKey);
+  for (const id of order) gameSizes.set(id, CV.savedGameBytes(back[gameKey(id)]));
+  gameMigrated = true;
+  gameDbg.migrated = { games: order.length, fromList: old.length, at: Date.now() };
+  console.log('[ChessVision] saved games moved to one key per game:', order.length);
+}
+async function migrateQuietly() {
+  try { await migrateSavedGames(); } catch (e) { gameDbg.migrateError = String((e && e.message) || e); }
+}
+function migrateAtStart() {
+  if (!gameStore()) return;
+  gameSerial(migrateSavedGames).catch((e) => { gameDbg.migrateError = String((e && e.message) || e); console.error('[ChessVision] saved games migration failed (will retry)', e); });
+}
+
 // ======================= Messaging =======================
-api.runtime.onMessage.addListener((msg) => {
+api.runtime.onMessage.addListener((msg, sender) => {
   if (msg && msg.type === 'allowlist') return loadAllowlist();
   if (msg && msg.type === 'fetchImage') return fetchImage(msg.url);
   if (msg && msg.type === 'aggroClear') { aggroClear(); return Promise.resolve({ ok: true }); }
   if (msg && msg.type === 'clearEngines') { clearEngines(); return Promise.resolve({ ok: true }); }
   if (msg && msg.type === 'aggroInvalidate') { ponderWanted = false; ponderCancel(); return Promise.resolve({ ok: true }); }   // also frees the spares
-  if (msg && msg.type === 'aggroIdle') return Promise.resolve(aggroIdle(msg));
-  if (msg && msg.type === 'hitTopUp') return hitFinal(msg.id);
+  if (msg && msg.type === 'aggroIdle') return withEngine(async () => { const r = aggroIdle(msg); if (r && r.state === 'started') startIdleStatus(msg, sender); return r; });
+  if (msg && msg.type === 'hitTopUp') return withEngine(() => hitFinal(msg.id));
+  if (msg && msg.type === 'warm') return withEngine(() => warmEngine(msg.engine));
+  if (msg && msg.type === 'saveGame') return saveGame(msg.record, msg.max);
+  if (msg && msg.type === 'listGames') return listGames();
+  if (msg && msg.type === 'clearGames') return clearGames();
   if (msg && msg.type === 'aggroIdleStatus') return Promise.resolve({ pondering: idleInfo.pondering, evalLine: idleInfo.evalLine, found: ponder.found() });
   if (msg && msg.type === 'aggroDebug') {
     return Promise.resolve({ ponder: { ...ponder.counters, passes: ponderDbg.lastPasses, maxPasses: ponderDbg.maxPasses, settled: { enabled: !!CV.PONDER_SETTLE, replies: ponderDbg.settled, jobsEnded: ponderDbg.settledJobs }, hitDepths: ponderDbg.hitDepths.slice(), harvestUpgrades: ponderDbg.harvestUpgrades, lateWaits: ponderDbg.lateWaits, lateWaitHits: ponderDbg.lateWaitHits,
@@ -1462,13 +1722,20 @@ api.runtime.onMessage.addListener((msg) => {
         poolKind: ponderKind, cancelling: ponderCancelling.length, harvested: sfDbg.harvested, harvestFailed: sfDbg.harvestFailed, kills: { ...sfDbg.kills }, cancelMs: sfDbg.cancelMs.slice(), claimedWhileStopping: sfDbg.claimedWhileStopping, claimReplaced: sfDbg.claimReplaced, overruns: sfDbg.overruns, lastOverruns: sfDbg.lastOverruns.slice(), workerStarts: sfDbg.workerStarts, lastWorkerStart: sfDbg.lastStart, rankMode: SF_RANK_MODE,
         searchMode: sfLast ? sfLast.mode : null, depthDone: sfLast ? sfLast.depthDone : null, softMs: sfLast ? sfLast.softMs : null, elapsedMs: sfLast ? sfLast.elapsedMs : null,
         lastSearch: sfLast, pvSeeds: sfDbg.pvSeeds, mainWarmMs: sfDbg.mainWarmMs === undefined ? null : sfDbg.mainWarmMs },
-      aggroLastBudget: aggroDbg.lastBudget || null });
+      aggroLastBudget: aggroDbg.lastBudget || null,
+      idleStatus: { push: !!CV.IDLE_STATUS_PUSH, pushes: idleStatus.pushes, tab: idleStatus.tab },
+      savedGames: { saves: gameDbg.saves, migrated: gameDbg.migrated, migrateError: gameDbg.migrateError },
+      engines: { lazy: !!CV.LAZY_ENGINES, idleMs: CV.ENGINE_IDLE_MS, starts: { ...engineDbg.starts }, stops: engineDbg.stops, lastStopAt: engineDbg.lastStopAt, ports: enginePorts.size,
+        running: { stockfish: !!sfReady, aggro: !!(aggroMain && !aggroMain.dead) } } });
   }
   if (!msg || msg.type !== 'analyze') return;
-  return msg.engine === 'stockfish'
+  return withEngine(() => (msg.engine === 'stockfish'
     ? analyzeStockfish(msg.fen, msg.depth, msg.imperfection, msg.sfMaxMs, msg.startFen, msg.moves, msg)
-    : analyzeAggro(msg);
+    : analyzeAggro(msg)));
 });
 
-initStockfish();
-initAggro();
+migrateAtStart();
+if (!CV.LAZY_ENGINES) {                 // 2.0.3: both engines start with the background page and are never stopped
+  initStockfish();
+  initAggro();
+}

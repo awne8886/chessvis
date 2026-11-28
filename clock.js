@@ -69,6 +69,28 @@
     return Math.min(delayMs, Math.max(CLOCK_DELAY_FLOOR_MS, Math.round(rem * CLOCK_DELAY_FRAC)));
   }
 
-  CV.clock = { parseClock, parseIncrement, clockBudget, delayCap, CLOCK_LOW_MS, CLOCK_FLOOR_MS };
+  // ---- 2.0.4 (D3): which page clock is mine / the opponent's (the rules content.js used in 2.0.3, now pure) ----
+  // cands: [{ ms, cls }] in document order, each element once (cls = its lower-case class string). That colour's clock
+  // first ('clock-white' / 'clock-black'; works with a flipped board), then a class with that colour and not the other,
+  // then the clock at the bottom (mine) / top (the opponent's). Returns the candidate or null.
+  function pickClock(cands, myColor, which) {
+    const mineC = myColor === 'w' ? 'white' : 'black', otherC = myColor === 'w' ? 'black' : 'white';
+    const [want, avoid, side] = which === 'opp' ? [otherC, mineC, 'top'] : [mineC, otherC, 'bottom'];
+    const sideRe = new RegExp('(^|[\\s-])' + side + '($|[\\s-])');
+    return cands.find((c) => c.cls.includes('clock-' + want)) ||
+           cands.find((c) => c.cls.includes(want) && !c.cls.includes(avoid)) ||
+           cands.find((c) => sideRe.test(c.cls)) || null;
+  }
+  // Both clocks from ONE candidate list: { me, opp } (each a candidate or null).
+  const pickClocks = (cands, myColor) => ({ me: pickClock(cands, myColor, 'me'), opp: pickClock(cands, myColor, 'opp') });
+  // Player names: found = [{ t, top }] (distinct texts, document order); the topmost is the opponent, the lowest is me.
+  // null with fewer than two. (Sort is stable: equal tops keep document order, as before.)
+  function pickNames(found) {
+    if (!found || found.length < 2) return null;
+    const s = found.slice().sort((x, y) => x.top - y.top);
+    return { opp: s[0].t, me: s[s.length - 1].t };
+  }
+
+  CV.clock = { parseClock, parseIncrement, clockBudget, delayCap, pickClock, pickClocks, pickNames, CLOCK_LOW_MS, CLOCK_FLOOR_MS };
   if (typeof module !== 'undefined' && module.exports) module.exports = CV.clock;
 })(typeof window !== 'undefined' ? window : globalThis);

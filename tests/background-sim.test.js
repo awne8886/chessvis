@@ -350,4 +350,189 @@ test('2.0.3: a new Stockfish ponder job takes the workers that are still stoppin
   assert.ok(off.started >= 6 && off.kills['pool full after cancel'] >= 6, '2.0.2: new workers each job: ' + JSON.stringify(off));
 });
 
+// ---- 2.0.4 B1: engines start on first use and stop when idle ----
+const aggroAnalyze = (bg, moves) => bg.send({ type: 'analyze', engine: 'aggro', fen: START, startFen: START, moves, ms: 100, ponder: false });
+const alive = (bg, kind) => bg.workers.filter((w) => w.kind === kind && !w.dead).length;
+
+test('B1: nothing starts with the background page; an engine starts on its first request', async () => {
+  const bg = makeBackground({ stepMs: 2 });
+  await sleep(50);
+  assert.strictEqual(bg.workers.length, 0, 'no worker at load');
+  const r = await analyzeSf(bg, [], { sfSearchMode: 'depth' });
+  assert.ok(r && r.uci);
+  assert.strictEqual(alive(bg, 'sf'), 1, 'the Stockfish main worker');
+  assert.strictEqual(alive(bg, 'aggro'), 0, 'AggroChess was not needed');
+  const w = await bg.send({ type: 'warm', engine: 'aggro' });
+  assert.strictEqual(w.ok, true);
+  assert.strictEqual(alive(bg, 'aggro'), 1);
+  const dbg = await bg.send({ type: 'aggroDebug' });
+  assert.strictEqual(JSON.stringify(dbg.engines.starts), JSON.stringify({ stockfish: 1, aggro: 1 }));
+  // 2.0.3: both start at load
+  const old = makeBackground({ stepMs: 2, setup: 'CV.LAZY_ENGINES = false' });
+  await sleep(50);
+  assert.strictEqual(alive(old, 'sf'), 1); assert.strictEqual(alive(old, 'aggro'), 1);
+});
+
+test('B1: stop after CV.ENGINE_IDLE_MS without a request and without a port; a port keeps them; counters survive', async () => {
+  const bg = makeBackground({ stepMs: 2 });
+  bg.get('CV.ENGINE_IDLE_MS = 150');
+  const port = bg.connect('chessvision');
+  await analyzeSf(bg, [], { sfSearchMode: 'depth' });
+  await bg.send({ type: 'warm', engine: 'aggro' });
+  await sleep(300);
+  assert.strictEqual(alive(bg, 'sf') + alive(bg, 'aggro'), 2, 'a connected tab keeps the engines');
+  const starts = bg.get('sfDbg.workerStarts');
+  port.disconnect();
+  await sleep(80);
+  assert.strictEqual(alive(bg, 'sf') + alive(bg, 'aggro'), 2, 'not before the idle time');
+  await sleep(200);
+  assert.strictEqual(alive(bg, 'sf') + alive(bg, 'aggro'), 0, 'all workers terminated');
+  assert.strictEqual(bg.get('sf'), null); assert.strictEqual(bg.get('sfReady'), null); assert.strictEqual(bg.get('aggroModuleP'), null);
+  assert.strictEqual(bg.get('engineDbg.stops'), 1);
+  assert.strictEqual(bg.get('sfDbg.workerStarts'), starts, 'debug counters are kept');
+  const r = await analyzeSf(bg, ['e2e4', 'e7e5'], { sfSearchMode: 'depth' });   // a fresh start
+  assert.ok(r && r.uci && !r.error);
+  assert.strictEqual(alive(bg, 'sf'), 1);
+  assert.strictEqual(bg.get('engineDbg.starts.stockfish'), 2);
+  assert.ok(bg.log.some((l) => l.w === bg.workers.filter((w) => w.kind === 'sf').pop().id && l.cmd === 'ucinewgame'), 'the new engine starts a new game');
+});
+
+test('B1: nothing is stopped under a running search or ponder job; a request right after the stop gets a fresh engine', async () => {
+  const bg = makeBackground({ stepMs: 10, aggroStartMs: 5 });
+  bg.get('CV.ENGINE_IDLE_MS = 60');
+  const long = analyzeSf(bg, [], { sfSearchMode: 'delay', softMs: 300 });   // longer than the idle time
+  await sleep(150);
+  assert.strictEqual(bg.get('engineDbg.stops'), 0);
+  assert.ok((await long).uci);
+  await bg.send({ type: 'aggroIdle', startFen: START, moves: ['e2e4'], ponder: true, ponderMs: 400, ponderWorkers: 1, ponderHashMb: 32, myColor: 'w', ponderUntilMove: false });
+  await sleep(250);
+  assert.strictEqual(bg.get('engineDbg.stops'), 0, 'the ponder job keeps them');
+  assert.ok(bg.get('idleInfo.pondering'));
+  await sleep(600);
+  assert.strictEqual(bg.get('engineDbg.stops'), 1, 'stopped once the job ended');
+  assert.strictEqual(alive(bg, 'aggro') + alive(bg, 'sf'), 0);
+  // a stop forced while a request waits for its engine (the idle stop never does this): both requests still get a move
+  await analyzeSf(bg, [], { sfSearchMode: 'depth' });
+  bg.get('CV.ENGINE_IDLE_MS = 600000');
+  const p = analyzeSf(bg, ['d2d4'], { sfSearchMode: 'depth' });
+  bg.get('stopEngines()');
+  const q = analyzeSf(bg, ['d2d4', 'd7d5'], { sfSearchMode: 'depth' });
+  const [a, b] = await Promise.all([p, q]);
+  // two requests on one main worker: the later one supersedes the earlier (null), as for any two requests
+  assert.ok([a, b].filter((x) => x && x.uci && !x.error).length === 1 && [a, b].every((x) => x === null || (x.uci && !x.error)), JSON.stringify([a, b]));
+  assert.strictEqual(alive(bg, 'sf'), 1, 'exactly one main worker');
+});
+
+test('B1: an engine switch starts the other engine; after an idle stop both restart on demand', async () => {
+  const bg = makeBackground({ stepMs: 2, aggroStartMs: 5 });
+  bg.get('CV.ENGINE_IDLE_MS = 100');
+  await bg.send({ type: 'warm', engine: 'aggro' });
+  assert.strictEqual(alive(bg, 'aggro'), 1); assert.strictEqual(alive(bg, 'sf'), 0);
+  await bg.send({ type: 'warm', engine: 'stockfish' });                  // the engine setting changed
+  assert.strictEqual(alive(bg, 'sf'), 1);
+  assert.ok((await aggroAnalyze(bg, ['e2e4'])).uci);
+  await sleep(250);
+  assert.strictEqual(alive(bg, 'aggro') + alive(bg, 'sf'), 0);
+  const r = await aggroAnalyze(bg, ['e2e4', 'e7e5']);
+  assert.ok(r && r.uci && !r.error);
+  assert.strictEqual(JSON.stringify(bg.get('engineDbg.starts')), JSON.stringify({ stockfish: 1, aggro: 2 }));
+});
+
+test('B1 gate: first-move latency after `warm` matches 2.0.3 (engines started at load)', async () => {
+  const time = async (bg) => { const t0 = Date.now(); await analyzeSf(bg, [], { sfSearchMode: 'depth' }); return Date.now() - t0; };
+  const med = (a) => a.sort((x, y) => x - y)[a.length >> 1];
+  const old = [], lazy = [], cold = [];
+  for (let i = 0; i < 5; i++) {
+    const a = makeBackground({ stepMs: 2, setup: 'CV.LAZY_ENGINES = false' }); await sleep(60); old.push(await time(a));
+    const b = makeBackground({ stepMs: 2 }); await b.send({ type: 'warm', engine: 'stockfish' }); lazy.push(await time(b));
+    const c = makeBackground({ stepMs: 2 }); cold.push(await time(c));
+  }
+  if (process.env.SHOW) console.log({ old, lazy, cold });
+  assert.ok(Math.abs(med(lazy) - med(old)) <= 8, 'warm ' + med(lazy) + ' ms vs 2.0.3 ' + med(old) + ' ms');
+  assert.ok(med(cold) >= med(old), 'without warm the first request pays the start: ' + med(cold));
+});
+
+// ---- 2.0.4 A4 + B2: the ponder status is pushed on the tab's port; the last tab gone releases the ponder workers ----
+test('A4: the status is pushed to the tab that started the job, only on change, at most 4 a second; no polling needed', async () => {
+  const bg = makeBackground({ stepMs: 5 });
+  const mine = bg.connect('chessvision', { tab: { id: 7 } }), other = bg.connect('chessvision', { tab: { id: 8 } });
+  const got = [], otherGot = [];
+  mine.onMessage.addListener((m) => got.push({ ...m, at: Date.now() }));
+  other.onMessage.addListener((m) => otherGot.push(m));
+  const moves = ['e2e4', 'e7e5', 'g1f3'];
+  await bg.send(sfIdle(moves, { ponderWorkers: 1, ponderMs: 600, ponderUntilMove: false }), { tab: { id: 7 } });
+  await sleep(1400);
+  assert.ok(got.length >= 2, 'pushes: ' + got.length);
+  assert.ok(got.every((m) => m.type === 'idleStatus' && m.key === CV.ponderKey(START, moves)));
+  for (let i = 1; i < got.length; i++) {
+    const a = got[i - 1], b = got[i];
+    assert.ok(a.pondering !== b.pondering || a.found !== b.found || a.evalLine !== b.evalLine, 'only changes');
+    assert.ok(b.at - a.at >= 200, 'at most 4 a second: ' + (b.at - a.at));
+  }
+  assert.strictEqual(got[got.length - 1].pondering, false, 'the end of the job is pushed');
+  assert.ok(got[got.length - 1].found > 0);
+  assert.strictEqual(otherGot.length, 0, 'only to the tab that started it');
+  assert.strictEqual(bg.get('idleStatus.timer'), null, 'the check stops with the job');
+  const n = got.length;
+  await sleep(600);
+  assert.strictEqual(got.length, n, 'nothing more once it ended');
+  bg.get('CV.IDLE_STATUS_PUSH = false');
+  await bg.send(sfIdle(['e2e4', 'e7e5', 'g1f3', 'b8c6', 'f1b5'], { ponderWorkers: 1, ponderMs: 300, ponderUntilMove: false }), { tab: { id: 7 } });
+  await sleep(400);
+  assert.strictEqual(got.length, n, '2.0.3: no push');
+  const st = await bg.send({ type: 'aggroIdleStatus' });
+  assert.ok(st && typeof st.found === 'number', 'the poll still answers');
+  await bg.send({ type: 'aggroInvalidate' });
+});
+
+test('B2: the last tab disconnects -> the job is cancelled and the spares are released; a tab closing during its own job cancels it', async () => {
+  const bg = makeBackground({ stepMs: 5, aggroStartMs: 5 });
+  const port = bg.connect('chessvision', { tab: { id: 3 } });
+  await bg.send(sfIdle(['e2e4'], { ponderWorkers: 2, ponderMs: 300, ponderUntilMove: false }), { tab: { id: 3 } });
+  await sleep(700);
+  assert.ok(!bg.get('idleInfo.pondering'));
+  assert.ok(bg.get('ponderSpares.length') >= 1, 'warm spares after the job');
+  port.disconnect();
+  await sleep(50);
+  assert.strictEqual(bg.get('ponderWanted'), false);
+  assert.strictEqual(bg.get('ponderSpares.length'), 0);
+  assert.strictEqual(bg.workers.filter((w) => w.kind === 'sf' && !w.dead).length, 0, 'no Stockfish worker left (no main was started)');
+  // a new idle job makes them again
+  const p2 = bg.connect('chessvision', { tab: { id: 4 } }), p3 = bg.connect('chessvision', { tab: { id: 5 } });
+  await bg.send(sfIdle(['e2e4', 'e7e5'], { ponderWorkers: 1, ponderMs: 3000, ponderUntilMove: true }), { tab: { id: 4 } });
+  await sleep(200);
+  assert.ok(bg.get('idleInfo.pondering'));
+  p2.disconnect();                                     // the tab of the running job closes; another tab stays
+  await sleep(50);
+  assert.ok(!bg.get('idleInfo.pondering'), 'its job was cancelled');
+  assert.strictEqual(bg.get('ponderWanted'), true, 'the other tab may still ponder');
+  p3.disconnect();
+  await sleep(50);
+  assert.strictEqual(bg.get('ponderWanted'), false);
+  // 2.0.3: nothing happens on a disconnect
+  const old = makeBackground({ stepMs: 5 });
+  old.get('CV.PONDER_RELEASE_ON_DISCONNECT = false');
+  const q = old.connect('chessvision', { tab: { id: 1 } });
+  await old.send(sfIdle(['e2e4'], { ponderWorkers: 1, ponderMs: 300, ponderUntilMove: false }), { tab: { id: 1 } });
+  await sleep(600);
+  q.disconnect();
+  await sleep(50);
+  assert.ok(old.get('ponderSpares.length') >= 1);
+  await old.send({ type: 'aggroInvalidate' });
+});
+
+// ---- 2.0.4 F1: the lean package (tools/package.sh --lean) has no threaded Stockfish build and no asm.js fallback ----
+test('F1: without engine/stockfish-19-lite.js the threaded start fails once and the single-thread engine keeps playing', async () => {
+  const bg = makeBackground({ stepMs: 2, sab: true, cores: 4, missing: ['engine/stockfish-19-lite.js', 'engine/stockfish-19-asm.js'] });
+  assert.strictEqual(bg.get('sfSab.ok'), true, 'the SharedArrayBuffer test passes, so the threaded build is tried');
+  const r = await analyzeSf(bg, [], { sfSearchMode: 'depth', sfThreads: 2 });
+  assert.ok(r && r.uci && !r.error, JSON.stringify(r));
+  assert.ok(/not found/.test(bg.get('sfDbg.threadedFailed')), 'remembered: ' + bg.get('sfDbg.threadedFailed'));
+  assert.strictEqual(bg.get('sfActive'), 'engine/stockfish-19-lite-single.js');
+  const tries = bg.workers.filter((w) => w.missing).length;
+  const r2 = await analyzeSf(bg, ['e2e4', 'e7e5'], { sfSearchMode: 'depth', sfThreads: 2 });
+  assert.ok(r2 && r2.uci);
+  assert.strictEqual(bg.workers.filter((w) => w.missing).length, tries, 'not tried again');
+});
+
 run();

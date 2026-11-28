@@ -215,6 +215,35 @@
     return { ok: true, pos };
   };
 
+  // 2.0.4 (E2): replayUci with a memory of the last successful replay { startFen, moves, pos }: a request whose moves
+  // extend it (the next ponder job: two more plies) applies only the new moves. Positions are never modified after they
+  // are made (chess.apply returns a new one), so the cached one can be shared. The result is the same as replayUci's
+  // (tests/perft.test.js), including { ok: false, pos, failedAt } with failedAt counted from the start.
+  CV.createReplayCache = function () {
+    let last = null;
+    return {
+      replay(startFen, moves) {
+        const list = moves || [];
+        let i = 0, pos;
+        if (last && last.startFen === startFen && last.moves.length <= list.length && last.moves.every((m, k) => list[k] === m)) { i = last.moves.length; pos = last.pos; }
+        else pos = CV.chess.parseFen(startFen);
+        for (; i < list.length; i++) {
+          const r = CV.applyUci(pos, list[i]);
+          if (!r) return { ok: false, pos, failedAt: i };
+          pos = r.pos;
+        }
+        last = { startFen, moves: list.slice(), pos };
+        return { ok: true, pos };
+      },
+      clear() { last = null; },
+    };
+  };
+  // 2.0.4 (E2): the background's ponder jobs replay the game through CV.createReplayCache (false = 2.0.3: CV.replayUci,
+  // the whole game every job). chessmini's gameState / isMate stop at the first legal move (CV.CHESS_EARLY_EXIT; false =
+  // they list every legal move).
+  CV.REPLAY_CACHE = true;
+  CV.CHESS_EARLY_EXIT = true;
+
   // The Stockfish `position` command. With a usable history: `position fen <startFen> moves m1 m2 ...`
   // (so the engine sees repetitions and the 50-move counter); without: the old `position fen <fen>`.
   CV.sfPositionCommand = function (fen, startFen, moves) {
@@ -502,6 +531,57 @@
   // The watchdog's board read goes through the stable read (two reads a frame + 20 ms apart must agree), like a
   // mutation's. false = 2.0.0: the watchdog reads the board directly (content.js).
   CV.WATCHDOG_STABLE_READ = true;
+  // 2.0.4 (A1): a watchdog tick reads the board ONCE and ends there when its signature equals the board the last check()
+  // used and nothing is pending (no move in progress, no re-check, no move-confirmation timer). Every WATCHDOG_FORCE_MS a
+  // full check runs anyway (a result popup without a board change, a status change, an SPA navigation); only that forced
+  // check also looks for the result dialog with the attribute-substring selector. false = 2.0.3 (every tick: a stable
+  // read, a check() and the result-dialog query).
+  CV.WATCHDOG_SKIP_UNCHANGED = true;
+  CV.WATCHDOG_FORCE_MS = 5000;
+  // 2.0.4 (A1): the 1-second board re-attach timer searches the document only every ATTACH_FULL_EVERY ticks while the
+  // board it is attached to is still in the page (a detached board is replaced at the next tick, as before). false =
+  // 2.0.3 (findBoard every second).
+  CV.ATTACH_LAZY = true;
+  CV.ATTACH_FULL_EVERY = 5;
+  // 2.0.4 (A2): the stable read's second read (and a forced watchdog check's read) is the one check() uses: one stable
+  // check costs two board reads instead of three. Direct checks (schedule(), the retry timer) still read fresh. false =
+  // 2.0.3 (check() reads the board again).
+  CV.STABLE_READ_REUSE = true;
+  // 2.0.4 (B1): the engines start on first use (a request, or the page's `warm` when Auto-play is on on an allowed page)
+  // and are shut down (main and ponder workers, compiled modules) after ENGINE_IDLE_MS without a request while no
+  // chess.com tab is open. false = 2.0.3 (both main workers start with the background page and never stop).
+  CV.LAZY_ENGINES = true;
+  CV.ENGINE_IDLE_MS = 10 * 60 * 1000;
+  // 2.0.4 (C1): a slider stores its value once, on release (while it moves only the label and this tab follow); a tab
+  // ignores the storage echo of a write whose values it already has; the panel is re-placed (a forced layout) only when
+  // its position or open state changed. false = 2.0.3 (a write per slider step, every tab re-renders and re-places).
+  CV.SETTINGS_FEWER_WRITES = true;
+  // 2.0.4 (A3): a board mutation schedules a stable read only when it can change what a read sees (CV.boardstate.
+  // mutationRelevant: pieces, highlights, the board's own class). false = 2.0.3 (every mutation under the board).
+  CV.MUTATION_FILTER = true;
+  // 2.0.4 (A4): the background pushes the ponder status (pondering, evaluation line, replies found) on the tab's port when it
+  // changes, at most 4 times a second; the page no longer asks on every watchdog tick. false = 2.0.3 (aggroIdleStatus polls).
+  CV.IDLE_STATUS_PUSH = true;
+  // 2.0.4 (B2): when the last chess.com tab disconnects, pondering is no longer wanted: the job is cancelled and the warm
+  // spares are terminated (a tab that closed during its own job cancels that job). false = 2.0.3 (spares kept while wanted).
+  CV.PONDER_RELEASE_ON_DISCONNECT = true;
+  // 2.0.4 (D1): in a hidden tab (timers clamped to ~1 s by Firefox) the cursor path's events are sent without a wait per
+  // step. false = 2.0.3 (a timer per step, also when hidden).
+  CV.HIDDEN_NO_STEP_WAIT = true;
+  // 2.0.4 (D3): the clock and name elements found on the page are cached and read again directly while they are in the
+  // page and still valid (a fresh scan at least every DOM_CACHE_RESCAN_MS); both clocks come from one scan. false = 2.0.3
+  // (every read scans the document; my clock and the opponent's are two scans).
+  CV.DOM_CACHE = true;
+  CV.DOM_CACHE_RESCAN_MS = 30000;
+  // 2.0.4 (E1): the tracker matches a board change only with moves from squares that changed (the same results, see
+  // boardstate.js). false = 2.0.3 (every legal move, and every two-ply sequence for a missed ply).
+  CV.TRACKER_FAST_MATCH = true;
+  // 2.0.4 (D2): the target of a synthetic event is document.elementFromPoint unless that is the panel (or nothing), and
+  // the board's rect is read once per move. false = 2.0.3 (elementsFromPoint for every event, the rect for every point).
+  CV.CHEAP_HIT_TEST = true;
+  // 2.0.4 (E3): a check reads the tracker's halfmove / fullmove counters and its history directly (tracker.counters(),
+  // tracker.history()) instead of info(), which copies the moves and counts repetitions. false = 2.0.3 (info()).
+  CV.TRACKER_COUNTERS = true;
   // 2.0.2 (A7): AggroChess workers that report `interruptible` (JSPI in the browser and a 2.0.2 engine) are stopped
   // instead of terminated: a cancelled job's busy worker is stopped and recycled like a Stockfish one, and a `late`
   // reply search far from done is stopped and its move used from this depth on. false = 2.0.0 (terminate).
@@ -582,6 +662,32 @@
     const w = n(c.wtime), b = n(c.btime);
     if (!(w > 0) || !(b > 0)) return null;
     return 'go wtime ' + w + ' btime ' + b + ' winc ' + n(c.winc) + ' binc ' + n(c.binc);
+  };
+
+  // ---- saved games (2.0.4, C2; pure, used by background.js) ----
+  // Saved games live under one storage key per game ('game:' + id) plus a small index of ids, newest first
+  // (SAVED_GAMES_INDEX); the background page writes them, one save at a time. Before 2.0.4 the whole list was one key,
+  // 'savedGames', rewritten on every save; it is migrated once (background.js).
+  CV.SAVED_GAME_PREFIX = 'game:';
+  CV.SAVED_GAMES_INDEX = 'savedGameIds';
+  CV.SAVED_GAMES_LEGACY = 'savedGames';
+  CV.SAVED_GAMES_MAX_BYTES = 4 * 1024 * 1024;   // = pgn.js SAVED_MAX_BYTES: the list is trimmed (oldest first) above this size
+  CV.isSavedGameKey = (k) => k === CV.SAVED_GAMES_INDEX || k === CV.SAVED_GAMES_LEGACY || String(k).startsWith(CV.SAVED_GAME_PREFIX);
+  CV.savedGameBytes = (rec) => JSON.stringify(rec).length;
+  // CV.pgn.mergeSaved's rules on an index of { id, bytes } (bytes = CV.savedGameBytes of the record) instead of the
+  // records: newest first, one entry per id (a re-save replaces it in place), at most `max`, and the JSON of the whole
+  // list at most maxBytes (a JSON array of n records is 2 + sum(bytes) + (n - 1) long). Returns { list, dropped }:
+  // the new index and the ids that fell out, the same ids in the same order as mergeSaved (tests/saved-games.test.js).
+  CV.mergeSavedIndex = function (index, entry, { max, maxBytes } = {}) {
+    const limit = Math.max(1, max || 50), cap = maxBytes || CV.SAVED_GAMES_MAX_BYTES;
+    const out = index.slice();
+    const i = out.findIndex((g) => g.id === entry.id);
+    if (i >= 0) out[i] = entry; else out.unshift(entry);
+    const dropped = [];
+    while (out.length > limit) dropped.push(out.pop().id);
+    let total = 2 + out.reduce((n, g) => n + g.bytes, 0) + Math.max(0, out.length - 1);
+    while (out.length > 1 && total > cap) { const g = out.pop(); dropped.push(g.id); total -= g.bytes + 1; }
+    return { list: out, dropped };
   };
 
   // ---- allowed pages (allowed-pages.txt) ----
