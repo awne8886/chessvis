@@ -212,7 +212,7 @@ AggroChess uses this by default (`aggroUseClock`). For Stockfish it is an option
 
 | File | Role |
 | --- | --- |
-| `manifest.json` | MV2 manifest: permissions (`storage`, `clipboardWrite`, chess.com / chesscomfiles / lichess hosts), background scripts, content scripts, CSP allowing `wasm-unsafe-eval` for the engines. |
+| `manifest.json` | MV2 manifest: permissions (`storage`, `clipboardWrite`, chess.com / chesscomfiles hosts; 2.0.4: lichess removed, no code ever read a lichess board), background scripts, content scripts, CSP allowing `wasm-unsafe-eval` for the engines. |
 | `allowed-pages.txt` | The pages where auto-play is allowed (one entry per line, `*` wildcard). |
 | `background.js` | Engines, the ponder pool, shared-Module compilation, timeouts and restarts, allowlist and icon downloads, the message router. |
 | `content.js` | The main loop on chess.com: board observer, watchdog, board reading, engine requests, delays, pointer input, game-over handling, saving, debug info. |

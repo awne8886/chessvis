@@ -17,8 +17,7 @@
     "storage",
     "clipboardWrite",
     "*://*.chess.com/*",
-    "*://*.chesscomfiles.com/*",
-    "*://*.lichess.org/*"
+    "*://*.chesscomfiles.com/*"
   ],
   "background": {
     "scripts": [
@@ -30,8 +29,7 @@
   "content_scripts": [
     {
       "matches": [
-        "*://*.chess.com/*",
-        "*://*.lichess.org/*"
+        "*://*.chess.com/*"
       ],
       "js": [
         "settings.js",
