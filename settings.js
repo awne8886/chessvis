@@ -539,6 +539,11 @@
   // 2.0.4 (D1): in a hidden tab (timers clamped to ~1 s by Firefox) the cursor path's events are sent without a wait per
   // step. false = 2.0.3 (a timer per step, also when hidden).
   CV.HIDDEN_NO_STEP_WAIT = true;
+  // 2.0.4 (D3): the clock and name elements found on the page are cached and read again directly while they are in the
+  // page and still valid (a fresh scan at least every DOM_CACHE_RESCAN_MS); both clocks come from one scan. false = 2.0.3
+  // (every read scans the document; my clock and the opponent's are two scans).
+  CV.DOM_CACHE = true;
+  CV.DOM_CACHE_RESCAN_MS = 30000;
   // 2.0.2 (A7): AggroChess workers that report `interruptible` (JSPI in the browser and a 2.0.2 engine) are stopped
   // instead of terminated: a cancelled job's busy worker is stopped and recycled like a Stockfish one, and a `late`
   // reply search far from done is stopped and its move used from this depth on. false = 2.0.0 (terminate).

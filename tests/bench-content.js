@@ -54,9 +54,19 @@ async function openPage({ settings, moves, hidden }) {
     window.setTimeout = (fn, ms, ...a) => { c.now.timers = (c.now.timers || 0) + 1; return st(fn, Math.max(1000, Number(ms) || 0), ...a); };
     window.requestAnimationFrame = () => 0;                    // rAF does not run in a hidden tab
   }
+  // the players' bars around the board, as the panel's candidate selectors expect them (names, clocks)
+  const bar = (top, name, clockCls) => {
+    const d = document.createElement('div'); d.className = 'player-component';
+    d.innerHTML = '<span class="user-username-component">' + name + '</span><div class="clock-component ' + clockCls + '">5:00</div>';
+    d.getBoundingClientRect = () => ({ top, left: 0, right: 800, bottom: top + 40, width: 800, height: 40, x: 0, y: top });
+    d.firstChild.getBoundingClientRect = d.getBoundingClientRect;
+    return d;
+  };
+  document.body.appendChild(bar(-50, 'Bot', 'clock-top clock-black'));
   const board = document.createElement('wc-chess-board');
   board.className = 'board';
   document.body.appendChild(board);
+  document.body.appendChild(bar(810, 'You', 'clock-bottom clock-white'));
   const rect = { left: 0, top: 0, right: 800, bottom: 800, width: 800, height: 800, x: 0, y: 0 };
   board.getBoundingClientRect = () => rect;
   // instrumentation

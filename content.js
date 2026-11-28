@@ -346,52 +346,79 @@
   const NAME_SELECTORS = ['.player-component .user-username-component', '[data-test-element="user-tagline-username"]', '.user-tagline-username', '[class*="user-username"]'];
   const clsOf = (el) => String((el.className && el.className.baseVal !== undefined ? el.className.baseVal : el.className) || '').toLowerCase();
 
-  // A clock in ms (+ increment if the page shows one), or null. which = 'me' (my colour's clock, else the bottom one) or
-  // 'opp' (2.0.0: the other colour's clock, else the top one). CANDIDATE selectors, unverified on the real site.
-  function readClock(myColor, which) {
-    try {
-      const seen = new Set(), cands = [];
-      for (const sel of CLOCK_SELECTORS) {
-        for (const el of document.querySelectorAll(sel)) {
-          if (seen.has(el)) continue;
-          seen.add(el);
-          const ms = CV.clock.parseClock(el.textContent);
-          if (ms !== null) cands.push({ ms, cls: clsOf(el) });
-        }
-      }
-      const mineC = myColor === 'w' ? 'white' : 'black', otherC = myColor === 'w' ? 'black' : 'white';
-      const [want, avoid, side] = which === 'opp' ? [otherC, mineC, 'top'] : [mineC, otherC, 'bottom'];
-      // that colour's clock first (works with a flipped board), else the clock at the bottom (mine) / top (the opponent's)
-      const pick = cands.find((c) => c.cls.includes('clock-' + want)) ||
-                   cands.find((c) => c.cls.includes(want) && !c.cls.includes(avoid)) ||
-                   cands.find((c) => new RegExp('(^|[\\s-])' + side + '($|[\\s-])').test(c.cls));
-      if (!pick) return null;
-      let inc = 0;
-      for (const sel of INCREMENT_SELECTORS) {
-        for (const el of document.querySelectorAll(sel)) { inc = CV.clock.parseIncrement(el.textContent); if (inc) break; }
-        if (inc) break;
-      }
-      return { ms: pick.ms, inc };
-    } catch (e) { return null; }
+  // 2.0.4 (D3): both clocks and the increment from ONE pass over the page: { me, opp } (each { ms, inc } or null), the
+  // same values readClock(myColor, 'me' | 'opp') returned in 2.0.3 (selection rules: CV.clock.pickClock). me = my
+  // colour's clock, else the bottom one; opp = the other colour's, else the top one. The matched elements are cached and
+  // read again directly while they are in the page, still parse and keep their class; a fresh scan otherwise, and at
+  // least every CV.DOM_CACHE_RESCAN_MS (a new element would win only then). CANDIDATE selectors, unverified on the real site.
+  let clockCache = null;           // { myColor, me: { el, cls }, opp: { el, cls } | null, at }
+  let incCache = null;             // { el } of the increment element last read (only a non-zero increment is cached)
+  const cacheFresh = (c) => !!c && CV.DOM_CACHE && Date.now() - c.at < CV.DOM_CACHE_RESCAN_MS;
+  const clockOf = (x) => { if (!x || !x.el.isConnected || clsOf(x.el) !== x.cls) return undefined; const ms = CV.clock.parseClock(x.el.textContent); return ms === null ? undefined : ms; };
+  function readIncrement() {
+    if (CV.DOM_CACHE && incCache && incCache.el.isConnected) { const inc = CV.clock.parseIncrement(incCache.el.textContent); if (inc) return inc; }
+    incCache = null;
+    for (const sel of INCREMENT_SELECTORS) {
+      for (const el of document.querySelectorAll(sel)) { const inc = CV.clock.parseIncrement(el.textContent); if (inc) { incCache = { el }; return inc; } }
+    }
+    return 0;
   }
-  const readMyClock = (myColor) => readClock(myColor, 'me');
-  const readOppClock = (myColor) => readClock(myColor, 'opp');
+  function readClocks(myColor) {
+    try {
+      let meMs, oppMs;
+      const c = clockCache;
+      if (cacheFresh(c) && c.myColor === myColor && (meMs = clockOf(c.me)) !== undefined && (!c.opp || (oppMs = clockOf(c.opp)) !== undefined)) {
+        if (!c.opp) oppMs = null;
+      } else {
+        clockCache = null;
+        const seen = new Set(), cands = [];
+        for (const sel of CLOCK_SELECTORS) {
+          for (const el of document.querySelectorAll(sel)) {
+            if (seen.has(el)) continue;
+            seen.add(el);
+            const ms = CV.clock.parseClock(el.textContent);
+            if (ms !== null) cands.push({ ms, cls: clsOf(el), el });
+          }
+        }
+        const p = CV.clock.pickClocks(cands, myColor);
+        meMs = p.me ? p.me.ms : null; oppMs = p.opp ? p.opp.ms : null;
+        if (p.me) clockCache = { myColor, me: { el: p.me.el, cls: p.me.cls }, opp: p.opp ? { el: p.opp.el, cls: p.opp.cls } : null, at: Date.now() };
+      }
+      if (meMs === null && oppMs === null) return { me: null, opp: null };
+      const inc = readIncrement();
+      return { me: meMs === null ? null : { ms: meMs, inc }, opp: oppMs === null ? null : { ms: oppMs, inc } };
+    } catch (e) { return { me: null, opp: null }; }
+  }
+  const readMyClock = (myColor) => readClocks(myColor).me;
 
-  // { me, opp } player names (top name = opponent, bottom = me), or null.
+  // { me, opp } player names (top name = opponent, bottom = me), or null. 2.0.4 (D3): the two elements that gave them are
+  // cached and re-read (text, position) while they are in the page and still valid; a fresh scan otherwise / every
+  // CV.DOM_CACHE_RESCAN_MS.
+  let nameCache = null;            // { a, b, at }: the elements of the topmost and the lowest name
+  const nameText = (el) => { const t = (el.textContent || '').trim(); return t && t.length <= 40 ? t : null; };
   function readNames() {
     try {
+      const c = nameCache;
+      if (cacheFresh(c) && c.a.isConnected && c.b.isConnected) {
+        const ta = nameText(c.a), tb = nameText(c.b);
+        if (ta && tb && ta !== tb) return CV.clock.pickNames([{ t: ta, top: c.a.getBoundingClientRect().top }, { t: tb, top: c.b.getBoundingClientRect().top }]);
+      }
+      nameCache = null;
       const found = [], seen = new Set();
       for (const sel of NAME_SELECTORS) {
         for (const el of document.querySelectorAll(sel)) {
           const t = (el.textContent || '').trim();
           if (!t || t.length > 40 || seen.has(t)) continue;
           seen.add(t);
-          found.push({ t, top: el.getBoundingClientRect().top });
+          found.push({ t, top: el.getBoundingClientRect().top, el });
         }
       }
-      if (found.length < 2) return null;
-      found.sort((x, y) => x.top - y.top);
-      return { opp: found[0].t, me: found[found.length - 1].t };
+      const r = CV.clock.pickNames(found);
+      if (r) {
+        const s = found.slice().sort((x, y) => x.top - y.top);
+        nameCache = { a: s[0].el, b: s[s.length - 1].el, at: Date.now() };
+      }
+      return r;
     } catch (e) { return null; }
   }
 
@@ -413,11 +440,11 @@
       // 2.0.0 'clock' mode: Stockfish's own time manager gets both clocks (go wtime/btime/winc/binc); a JS timer stops it at
       // the clock.js hard limit (<= a quarter of what is left, and <= sfMaxMs when set). No readable clock of mine = 'delay'
       // for this move. The opponent's clock unreadable = mine for both. Clock selectors: unverified on the real site.
-      const clk = readMyClock(pos.myColor);
+      const both = readClocks(pos.myColor), clk = both.me;             // 2.0.4 (D3): one pass for both clocks
       const budget = clk && CV.clock.clockBudget({ remainingMs: clk.ms, incrementMs: clk.inc, thinkMs: cfg.sfMaxMs > 0 ? cfg.sfMaxMs : 5000 });
       if (!budget) { plan.searchMode = 'delay'; log('clock mode: my clock not readable, delay mode for this move'); }
       else {
-        const opp = readOppClock(pos.myColor), oppMs = opp ? opp.ms : clk.ms, inc = clk.inc || 0;
+        const opp = both.opp, oppMs = opp ? opp.ms : clk.ms, inc = clk.inc || 0;
         plan.uciClock = pos.myColor === 'w' ? { wtime: clk.ms, btime: oppMs, winc: inc, binc: inc } : { wtime: oppMs, btime: clk.ms, winc: inc, binc: inc };
         plan.sfCap = CV.sfSearchCap(cfg.sfMaxMs, budget.hard);
         lastClock = { ms: clk.ms, mode: budget.mode, soft: budget.soft, hard: budget.hard, opp: opp ? opp.ms : null };
