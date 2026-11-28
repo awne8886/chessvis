@@ -250,12 +250,17 @@ function sfStart(job) {
 function sfCheckStop(job, by) {
   if (by === 'soft timer' || by === 'hard timer') {
     const late = Date.now() - job.startedAt - (by === 'soft timer' ? job.softMs : job.hardMs);
-    job[by === 'soft timer' ? 'softLateMs' : 'hardLateMs'] = late;
+    job[by === 'soft timer' ? 'softLateMs' : 'hardLateMs'] = Math.max(0, late);   // 2.0.4: >= 0 (a timer may fire 1 ms "early")
   }
   if (sfCurrent !== job || job.stopSent) return;
-  if (job.mode === 'clock') { if (Date.now() - job.startedAt >= job.hardMs) sfSendStop(job, by); return; }
+  // 2.0.4: a timer can fire a millisecond before Date.now() says its time is up (clock rounding); a timer that fired has
+  // reached its time (seen as a flaky test: the hard timer did not stop the search, the next info line did)
+  let elapsedMs = Date.now() - job.startedAt;
+  if (by === 'hard timer') elapsedMs = Math.max(elapsedMs, job.hardMs);
+  else if (by === 'soft timer') elapsedMs = Math.max(elapsedMs, job.softMs);
+  if (job.mode === 'clock') { if (elapsedMs >= job.hardMs) sfSendStop(job, by); return; }
   if (job.mode !== 'delay') return;
-  if (CV.sfShouldStop({ elapsedMs: Date.now() - job.startedAt, softMs: job.softMs, depthDone: job.depthDone, minDepth: job.depth, hardMs: job.hardMs })) sfSendStop(job, by);
+  if (CV.sfShouldStop({ elapsedMs, softMs: job.softMs, depthDone: job.depthDone, minDepth: job.depth, hardMs: job.hardMs })) sfSendStop(job, by);
 }
 // 2.0.3: `stop` to the main worker, noting why and when (ms after the search started) for the debug info.
 function sfSendStop(job, by) {
