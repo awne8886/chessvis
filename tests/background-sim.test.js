@@ -452,4 +452,73 @@ test('B1 gate: first-move latency after `warm` matches 2.0.3 (engines started at
   assert.ok(med(cold) >= med(old), 'without warm the first request pays the start: ' + med(cold));
 });
 
+// ---- 2.0.4 A4 + B2: the ponder status is pushed on the tab's port; the last tab gone releases the ponder workers ----
+test('A4: the status is pushed to the tab that started the job, only on change, at most 4 a second; no polling needed', async () => {
+  const bg = makeBackground({ stepMs: 5 });
+  const mine = bg.connect('chessvision', { tab: { id: 7 } }), other = bg.connect('chessvision', { tab: { id: 8 } });
+  const got = [], otherGot = [];
+  mine.onMessage.addListener((m) => got.push({ ...m, at: Date.now() }));
+  other.onMessage.addListener((m) => otherGot.push(m));
+  const moves = ['e2e4', 'e7e5', 'g1f3'];
+  await bg.send(sfIdle(moves, { ponderWorkers: 1, ponderMs: 600, ponderUntilMove: false }), { tab: { id: 7 } });
+  await sleep(1400);
+  assert.ok(got.length >= 2, 'pushes: ' + got.length);
+  assert.ok(got.every((m) => m.type === 'idleStatus' && m.key === CV.ponderKey(START, moves)));
+  for (let i = 1; i < got.length; i++) {
+    const a = got[i - 1], b = got[i];
+    assert.ok(a.pondering !== b.pondering || a.found !== b.found || a.evalLine !== b.evalLine, 'only changes');
+    assert.ok(b.at - a.at >= 200, 'at most 4 a second: ' + (b.at - a.at));
+  }
+  assert.strictEqual(got[got.length - 1].pondering, false, 'the end of the job is pushed');
+  assert.ok(got[got.length - 1].found > 0);
+  assert.strictEqual(otherGot.length, 0, 'only to the tab that started it');
+  assert.strictEqual(bg.get('idleStatus.timer'), null, 'the check stops with the job');
+  const n = got.length;
+  await sleep(600);
+  assert.strictEqual(got.length, n, 'nothing more once it ended');
+  bg.get('CV.IDLE_STATUS_PUSH = false');
+  await bg.send(sfIdle(['e2e4', 'e7e5', 'g1f3', 'b8c6', 'f1b5'], { ponderWorkers: 1, ponderMs: 300, ponderUntilMove: false }), { tab: { id: 7 } });
+  await sleep(400);
+  assert.strictEqual(got.length, n, '2.0.3: no push');
+  const st = await bg.send({ type: 'aggroIdleStatus' });
+  assert.ok(st && typeof st.found === 'number', 'the poll still answers');
+  await bg.send({ type: 'aggroInvalidate' });
+});
+
+test('B2: the last tab disconnects -> the job is cancelled and the spares are released; a tab closing during its own job cancels it', async () => {
+  const bg = makeBackground({ stepMs: 5, aggroStartMs: 5 });
+  const port = bg.connect('chessvision', { tab: { id: 3 } });
+  await bg.send(sfIdle(['e2e4'], { ponderWorkers: 2, ponderMs: 300, ponderUntilMove: false }), { tab: { id: 3 } });
+  await sleep(700);
+  assert.ok(!bg.get('idleInfo.pondering'));
+  assert.ok(bg.get('ponderSpares.length') >= 1, 'warm spares after the job');
+  port.disconnect();
+  await sleep(50);
+  assert.strictEqual(bg.get('ponderWanted'), false);
+  assert.strictEqual(bg.get('ponderSpares.length'), 0);
+  assert.strictEqual(bg.workers.filter((w) => w.kind === 'sf' && !w.dead).length, 0, 'no Stockfish worker left (no main was started)');
+  // a new idle job makes them again
+  const p2 = bg.connect('chessvision', { tab: { id: 4 } }), p3 = bg.connect('chessvision', { tab: { id: 5 } });
+  await bg.send(sfIdle(['e2e4', 'e7e5'], { ponderWorkers: 1, ponderMs: 3000, ponderUntilMove: true }), { tab: { id: 4 } });
+  await sleep(200);
+  assert.ok(bg.get('idleInfo.pondering'));
+  p2.disconnect();                                     // the tab of the running job closes; another tab stays
+  await sleep(50);
+  assert.ok(!bg.get('idleInfo.pondering'), 'its job was cancelled');
+  assert.strictEqual(bg.get('ponderWanted'), true, 'the other tab may still ponder');
+  p3.disconnect();
+  await sleep(50);
+  assert.strictEqual(bg.get('ponderWanted'), false);
+  // 2.0.3: nothing happens on a disconnect
+  const old = makeBackground({ stepMs: 5 });
+  old.get('CV.PONDER_RELEASE_ON_DISCONNECT = false');
+  const q = old.connect('chessvision', { tab: { id: 1 } });
+  await old.send(sfIdle(['e2e4'], { ponderWorkers: 1, ponderMs: 300, ponderUntilMove: false }), { tab: { id: 1 } });
+  await sleep(600);
+  q.disconnect();
+  await sleep(50);
+  assert.ok(old.get('ponderSpares.length') >= 1);
+  await old.send({ type: 'aggroInvalidate' });
+});
+
 run();

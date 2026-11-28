@@ -52,12 +52,14 @@
   let overCache = null;            // { fen, value } game-over result per position
   let fast = false;                // true while executing a quick reply: faster hand, shorter pauses
   let ui = null;
+  let wfoShown = false;            // 2.0.4: the status line shows the waiting state (a pushed ponder status may update it)
 
   const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
   const rand = (a, b) => a + Math.random() * (b - a);
 
   // ---------- Status ----------
   function setStatus(text, tone) {
+    wfoShown = false;
     if (ui) ui.setStatus(text, tone);
   }
   const hum = () => cfg.humanize;
@@ -659,7 +661,8 @@
     if (pos.turn !== pos.myColor) {
       attempts = 0;
       idleWork(pos);
-      setStatus('WFO' + (idlePondering ? ' \u00b7 pondering' : idleFound ? ' \u00b7 pondered' : '') + (idleFound ? ' ' + idleFound : ''), 'on');   // short: fits the collapsed header   // short, so the ponder state fits in the collapsed header
+      setStatus(wfoText(), 'on');
+      wfoShown = true;
       return;
     }
     if (pos.fen === lastHandledKey) return;
@@ -678,6 +681,7 @@
     try { p = api.runtime.connect({ name: 'chessvision' }); } catch (e) { return; }   // no connect (old browser) or the extension is gone
     if (!p) return;
     port = p;
+    p.onMessage.addListener(onPortMessage);
     const since = Date.now();
     p.onDisconnect.addListener(() => {
       if (port === p) port = null;
@@ -685,6 +689,13 @@
       if (Date.now() - since > 10000) portRetries = 0;
       if (++portRetries <= 5) setTimeout(connectPort, 1000 * portRetries);
     });
+  }
+  // 2.0.4 (A4): the ponder status of this tab's idle job, pushed by the background when it changes (see idleWork)
+  function onPortMessage(m) {
+    if (!m || m.type !== 'idleStatus' || !idleKey || m.key !== idleKey) return;
+    idlePondering = !!m.pondering; idleFound = m.found || 0;
+    if (ui) ui.setEval(m.evalLine || '');
+    if (wfoShown) { setStatus(wfoText(), 'on'); wfoShown = true; }
   }
   function maybeWarm() {
     if (!CV.LAZY_ENGINES || !cfg.enabled || !isAllowedPage() || warmedFor === cfg.engine) return;
@@ -694,6 +705,8 @@
   }
 
   // ---------- Idle work (opponent's turn): pondering / evaluation line ----------
+  // The waiting status, short so the ponder state fits in the collapsed header.
+  const wfoText = () => 'WFO' + (idlePondering ? ' \u00b7 pondering' : idleFound ? ' \u00b7 pondered' : '') + (idleFound ? ' ' + idleFound : '');
   // Is idle work wanted for the current engine and settings? (idleWork and the early ponder in play() use the same rule)
   function idleWanted() { return sfPonderOn() || (cfg.engine === 'aggro' && (cfg.aggroPonder || cfg.aggroShowEval)); }
 
@@ -716,7 +729,7 @@
     const key = CV.ponderKey(h.startFen, h.moves);
     if (idleKey !== key) {                                       // start once per position (unless the early ponder already did)
       startIdle(h.startFen, h.moves, pos.myColor);
-    } else {                                                     // then poll (the watchdog ticks drive this)
+    } else if (!(CV.IDLE_STATUS_PUSH && port)) {                 // then poll (the watchdog ticks drive this); 2.0.4: pushed on the port instead
       api.runtime.sendMessage({ type: 'aggroIdleStatus' }).then((r) => {
         if (idleKey !== key || !r) return;
         idlePondering = !!r.pondering; idleFound = r.found || 0;

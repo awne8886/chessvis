@@ -740,7 +740,49 @@ if (api.runtime.onConnect) {
     port.onDisconnect.addListener(() => { enginePorts.delete(port); onPortGone(port); });
   });
 }
-function onPortGone() { armEngineIdle(); }
+// 2.0.4 (B2): the last tab is gone: nobody needs a ponder job or warm spares any more (kept indefinitely before, while
+// ponderWanted). A tab that started the running idle job and closed: the job is cancelled (other tabs keep the spares).
+// CV.PONDER_RELEASE_ON_DISCONNECT = false: 2.0.3 (nothing happens). The engines themselves stop after CV.ENGINE_IDLE_MS (B1).
+function onPortGone(port) {
+  const tab = portTab(port);
+  if (CV.PONDER_RELEASE_ON_DISCONNECT) {
+    if (!enginePorts.size) { ponderWanted = false; ponderCancel(); }
+    else if (idleStatus.tab !== null && idleStatus.tab === tab && !portForTab(tab)) ponderCancel();
+  }
+  if (idleStatus.tab === tab && !portForTab(tab)) stopIdleStatus();
+  armEngineIdle();
+}
+const portTab = (port) => (port && port.sender && port.sender.tab && port.sender.tab.id !== undefined ? port.sender.tab.id : null);
+const portForTab = (tab) => { for (const p of enginePorts) if (portTab(p) === tab) return p; return null; };
+
+// ======================= Ponder status pushed to the tab (2.0.4, A4) =======================
+// 2.0.3: the page asked for { pondering, evalLine, found } on every watchdog tick (aggroIdleStatus, one message a second
+// for the whole opponent's turn). Now the background pushes it on the port of the tab that started the idle job, only
+// when a value changed and at most every IDLE_STATUS_MIN_MS; the 250 ms check runs only while a job is reported.
+// aggroIdleStatus still answers (debug use, and pages without a port). CV.IDLE_STATUS_PUSH = false: 2.0.3.
+const IDLE_STATUS_MIN_MS = 250;
+const idleStatus = { tab: null, key: null, timer: null, last: null, pushes: 0 };
+const idleSnapshot = () => ({ pondering: !!idleInfo.pondering, evalLine: idleInfo.evalLine || null, found: ponder.found() });
+function startIdleStatus(msg, sender) {
+  if (!CV.IDLE_STATUS_PUSH) return;
+  const tab = sender && sender.tab && sender.tab.id !== undefined ? sender.tab.id : null;
+  idleStatus.tab = tab; idleStatus.key = CV.ponderKey(msg.startFen, msg.moves); idleStatus.last = null;
+  if (!idleStatus.timer) idleStatus.timer = setInterval(pushIdleStatus, IDLE_STATUS_MIN_MS);
+  pushIdleStatus();
+}
+function stopIdleStatus() { clearInterval(idleStatus.timer); idleStatus.timer = null; idleStatus.tab = null; idleStatus.key = null; }
+function pushIdleStatus() {
+  const port = idleStatus.tab === null ? null : portForTab(idleStatus.tab);
+  if (!port) { stopIdleStatus(); return; }
+  const snap = idleSnapshot();
+  const same = idleStatus.last && idleStatus.last.pondering === snap.pondering && idleStatus.last.evalLine === snap.evalLine && idleStatus.last.found === snap.found;
+  if (!same) {
+    idleStatus.last = snap;
+    idleStatus.pushes++;
+    try { port.postMessage({ type: 'idleStatus', key: idleStatus.key, ...snap }); } catch (e) { stopIdleStatus(); return; }
+  }
+  if (!snap.pondering && !idleJobs) { clearInterval(idleStatus.timer); idleStatus.timer = null; }   // the job ended and its last state is out
+}
 
 // What think wants: the fen/moves of the request (history when reliable, else the bare FEN as a set-up position).
 function aggroPosition(msg) {
@@ -1014,9 +1056,11 @@ function ourScore(a, myColor) {
 }
 
 // The idle job: after our move, while the opponent thinks. Runs detached; every step re-checks its token.
+let idleJobs = 0;                // 2.0.4: idle jobs whose code is still running (the status push runs while one does)
 async function runIdle(msg, token) {
   if (msg.ponder) idleInfo.pondering = true;                   // the job has started (the workers may still be loading)
-  try { await runIdleJob(msg, token); } finally { if (token === idleToken) idleInfo.pondering = false; }
+  idleJobs++;
+  try { await runIdleJob(msg, token); } finally { idleJobs--; if (token === idleToken) idleInfo.pondering = false; }
 }
 async function runIdleJob(msg, token) {
   const t0 = Date.now();
@@ -1385,7 +1429,8 @@ async function sfRelease(w) {
 // The idle job for Stockfish: after our move, while the opponent thinks. Detached; every step re-checks its token.
 async function runIdleSf(msg, token) {
   idleInfo.pondering = true;
-  try { await runIdleSfJob(msg, token); } finally { if (token === idleToken) idleInfo.pondering = false; }
+  idleJobs++;
+  try { await runIdleSfJob(msg, token); } finally { idleJobs--; if (token === idleToken) idleInfo.pondering = false; }
 }
 async function runIdleSfJob(msg, token) {
   const t0 = Date.now();
@@ -1645,13 +1690,13 @@ function migrateAtStart() {
 }
 
 // ======================= Messaging =======================
-api.runtime.onMessage.addListener((msg) => {
+api.runtime.onMessage.addListener((msg, sender) => {
   if (msg && msg.type === 'allowlist') return loadAllowlist();
   if (msg && msg.type === 'fetchImage') return fetchImage(msg.url);
   if (msg && msg.type === 'aggroClear') { aggroClear(); return Promise.resolve({ ok: true }); }
   if (msg && msg.type === 'clearEngines') { clearEngines(); return Promise.resolve({ ok: true }); }
   if (msg && msg.type === 'aggroInvalidate') { ponderWanted = false; ponderCancel(); return Promise.resolve({ ok: true }); }   // also frees the spares
-  if (msg && msg.type === 'aggroIdle') return withEngine(async () => aggroIdle(msg));
+  if (msg && msg.type === 'aggroIdle') return withEngine(async () => { const r = aggroIdle(msg); if (r && r.state === 'started') startIdleStatus(msg, sender); return r; });
   if (msg && msg.type === 'hitTopUp') return withEngine(() => hitFinal(msg.id));
   if (msg && msg.type === 'warm') return withEngine(() => warmEngine(msg.engine));
   if (msg && msg.type === 'saveGame') return saveGame(msg.record, msg.max);
@@ -1673,6 +1718,7 @@ api.runtime.onMessage.addListener((msg) => {
         searchMode: sfLast ? sfLast.mode : null, depthDone: sfLast ? sfLast.depthDone : null, softMs: sfLast ? sfLast.softMs : null, elapsedMs: sfLast ? sfLast.elapsedMs : null,
         lastSearch: sfLast, pvSeeds: sfDbg.pvSeeds, mainWarmMs: sfDbg.mainWarmMs === undefined ? null : sfDbg.mainWarmMs },
       aggroLastBudget: aggroDbg.lastBudget || null,
+      idleStatus: { push: !!CV.IDLE_STATUS_PUSH, pushes: idleStatus.pushes, tab: idleStatus.tab },
       savedGames: { saves: gameDbg.saves, migrated: gameDbg.migrated, migrateError: gameDbg.migrateError },
       engines: { lazy: !!CV.LAZY_ENGINES, idleMs: CV.ENGINE_IDLE_MS, starts: { ...engineDbg.starts }, stops: engineDbg.stops, lastStopAt: engineDbg.lastStopAt, ports: enginePorts.size,
         running: { stockfish: !!sfReady, aggro: !!(aggroMain && !aggroMain.dead) } } });
