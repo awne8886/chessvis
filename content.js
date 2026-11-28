@@ -182,7 +182,8 @@
       p = BS.buildPosition(st.grid, st.highlights, BS.updateRights(rights, st.grid));
     }
     const prefix = p.placement + ' ' + p.turn;
-    const info = obs && tracker.matches(prefix) ? tracker.info() : null;
+    // 2.0.4 (E3): only the counters (info() copied the move list and scanned every entry for the repetition count)
+    const info = obs && tracker.matches(prefix) ? (CV.TRACKER_COUNTERS ? tracker.counters() : tracker.info()) : null;
     const myColor = board.classList.contains('flipped') ? 'b' : 'w';
     const fen = BS.assembleFen({ placement: p.placement, turn: p.turn, castle: p.castle, ep: p.ep, halfmove: info ? info.halfmove : 0, fullmove: info ? info.fullmove : 1 });
     return { fen, turn: p.turn, myColor, count: st.count, lastTo: p.lastTo };
@@ -195,9 +196,10 @@
   }
 
   // startFen + moves for an engine, only when the tracked history ends exactly at this position; else null.
+  // 2.0.4 (E3): `moves` is the tracker's live list (tracker.history()): every caller sends it or copies it at once.
   function histFor(pos) {
     if (!tracker.matches(pos.fen)) return null;
-    const i = tracker.info();
+    const i = CV.TRACKER_COUNTERS ? tracker.history() : tracker.info();
     return { startFen: i.startFen, moves: i.moves };
   }
 

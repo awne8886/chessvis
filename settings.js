@@ -550,6 +550,9 @@
   // 2.0.4 (D2): the target of a synthetic event is document.elementFromPoint unless that is the panel (or nothing), and
   // the board's rect is read once per move. false = 2.0.3 (elementsFromPoint for every event, the rect for every point).
   CV.CHEAP_HIT_TEST = true;
+  // 2.0.4 (E3): a check reads the tracker's halfmove / fullmove counters and its history directly (tracker.counters(),
+  // tracker.history()) instead of info(), which copies the moves and counts repetitions. false = 2.0.3 (info()).
+  CV.TRACKER_COUNTERS = true;
   // 2.0.2 (A7): AggroChess workers that report `interruptible` (JSPI in the browser and a 2.0.2 engine) are stopped
   // instead of terminated: a cancelled job's busy worker is stopped and recycled like a Stockfish one, and a `late`
   // reply search far from done is stopped and its move used from this depth on. false = 2.0.0 (terminate).

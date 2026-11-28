@@ -320,6 +320,14 @@
           repetitionCount: entries.filter((x) => x.rep === e.rep).length, plies: moves.length, resets, turn: e.pos.turn,
         };
       },
+      // 2.0.4 (E3): the two counters the FEN needs, without info()'s copy of the move list and its repetition scan.
+      counters() {
+        const e = lastEntry();
+        return e ? { halfmove: e.halfmove, fullmove: e.fullmove } : { halfmove: 0, fullmove: 1 };
+      },
+      // 2.0.4 (E3): { startFen, moves } for an engine message. `moves` is the tracker's own list (no copy): use it at once
+      // (a message copies it when it is sent); copy it to keep it.
+      history() { return { startFen, moves }; },
       // True when the tracked history ends exactly at the given FEN's placement and side to move,
       // i.e. startFen + moves can be handed to an engine instead of the bare FEN.
       matches(fen) {

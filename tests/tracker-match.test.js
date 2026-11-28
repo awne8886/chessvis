@@ -79,4 +79,20 @@ test('the tracker gives the same events with either matcher', () => {
   CV.TRACKER_FAST_MATCH = true;
 });
 
+test('E3: counters() and history() give info()\'s halfmove / fullmove / startFen / moves at every step', () => {
+  for (let g = 0; g < 20; g++) {
+    const line = playout(FENS[g % FENS.length], 40);
+    const t = BS.createTracker();
+    for (const p of line) {
+      t.observe({ placement: BS.boardToPlacement(p.b), turn: p.turn, turnKnown: true, castle: BS.castleString(p.castle), ep: p.ep >= 0 ? C.sqName(p.ep) : '-', count: BS.countPieces(BS.boardToPlacement(p.b)), highlighted: true });
+      const i = t.info(), c = t.counters(), h = t.history();
+      assert.deepStrictEqual(c, { halfmove: i.halfmove, fullmove: i.fullmove });
+      assert.strictEqual(h.startFen, i.startFen);
+      assert.deepStrictEqual(h.moves.slice(), i.moves);
+    }
+  }
+  const empty = BS.createTracker();
+  assert.deepStrictEqual(empty.counters(), { halfmove: empty.info().halfmove, fullmove: empty.info().fullmove });
+});
+
 run();
