@@ -35,6 +35,7 @@
   let lastCheckSig = null, lastCheckAt = 0;      // 2.0.4 (A1): signature of the board the last check() used, and when it ran
   let retryWaiting = false;                      // 2.0.4 (A1): play()'s move-confirmation timer is pending
   let attachSkips = 0;                           // 2.0.4 (A1): re-attach ticks skipped while the board is still in the page
+  let filteredMutations = 0;                     // 2.0.4 (A3): mutation batches that could not change a board read
   let rights = BS.freshRights();
   const tracker = BS.createTracker();            // the one game-tracking mechanism (history, new game, takeback)
   const rec = CV.createRecorder();               // records every ply the tracker reports
@@ -870,10 +871,17 @@
     board = b;
     observer = null;
     if (!b) return;
-    observer = new MutationObserver(() => scheduleStable(cfg.boardDebounceMs, 'mutation'));
+    // 2.0.4 (A3): only mutations that can change a board read schedule one (BS.mutationRelevant: pieces, highlights, the
+    // board's own class); hover squares, arrows, drag ghosts and the reaction to our cursor glide do not. The watchdog
+    // stays the safety net for anything the filter misses. CV.MUTATION_FILTER = false: every mutation (2.0.3).
+    const filter = !!CV.MUTATION_FILTER;
+    observer = new MutationObserver((records) => {
+      if (filter && !BS.mutationRelevant(records, b)) { filteredMutations++; return; }
+      scheduleStable(cfg.boardDebounceMs, 'mutation');
+    });
     observer.observe(b, {
       childList: true, subtree: true,
-      attributes: true, attributeFilter: ['class'],
+      attributes: true, attributeFilter: ['class'], attributeOldValue: filter,
     });
     log('board attached');
     setStatus(cfg.enabled ? 'board found' : 'off');
@@ -919,7 +927,7 @@
       page: location.hostname + location.pathname,
       allowedPage: isAllowedPage(), allowedEntries: allowed ? allowed.length : null,
       settings: cfg,
-      state: { busy, busyForMs: busy ? Date.now() - busySince : 0, attempts, dragDisabled, lastMode, atStart, ownMove, watchdogTimerRunning: !!watchdogTimer, unstableReads },
+      state: { busy, busyForMs: busy ? Date.now() - busySince : 0, attempts, dragDisabled, lastMode, atStart, ownMove, watchdogTimerRunning: !!watchdogTimer, unstableReads, filteredMutations },
       history: (() => { const i = tracker.info(); return { length: i.plies, halfmove: i.halfmove, fullmove: i.fullmove, repetitionCount: i.repetitionCount, historyResets: i.resets, startFen: i.startFen }; })(),
       recording: { positionsSeen: rec.plyCount() },
       clock: { lastClock, myClockNow: board ? readMyClock(board.classList.contains('flipped') ? 'b' : 'w') : null },

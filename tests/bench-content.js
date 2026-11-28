@@ -188,13 +188,35 @@ async function slider() {
   return { ...r, stored: p.storage.data.minDelay, cfgMinDelay: dbg.settings.minDelay, cfgMaxDelay: dbg.settings.maxDelay };
 }
 
+// 2.0.4 (A3): SECONDS / 6 of hover churn: a hover square follows a cursor across the board every 50 ms and an arrow is drawn
+// and removed every 500 ms (nothing that changes a board read).
+async function hover() {
+  const p = await openPage({ settings: { engine: 'stockfish', sfPonder: false }, moves: OPENING });
+  await sleep(3000);
+  p.reset();
+  const doc = p.window.document;
+  let hs = null, i = 0;
+  const t = setInterval(() => {
+    if (hs) hs.remove();
+    hs = doc.createElement('div'); hs.className = 'hover-square square-' + ((i % 8) + 1) + (((i >> 3) % 8) + 1); i++;
+    p.board.appendChild(hs);
+    if (i % 10 === 0) { const a = doc.createElement('div'); a.className = 'arrows'; p.board.appendChild(a); setTimeout(() => a.remove(), 250); }
+  }, 50);
+  await sleep(SECONDS * 1000 / 6);
+  clearInterval(t);
+  const r = p.reset();
+  await p.close();
+  return r;
+}
+
 async function main() {
-  const only = opt('--only', 'idle,ponder,cycle,slider').split(',');
+  const only = opt('--only', 'idle,ponder,cycle,slider,hover').split(',');
   const out = {};
   if (only.includes('idle')) out.idle = await idle(false);
   if (only.includes('ponder')) out.ponder = await idle(true);
   if (only.includes('cycle')) out.cycle = await cycle();
   if (only.includes('slider')) out.slider = await slider();
+  if (only.includes('hover')) out.hover = await hover();
   if (args.includes('--json')) { console.log(JSON.stringify(out, null, 2)); process.exit(0); }
   console.log('root ' + ROOT + ', idle ' + SECONDS + ' s');
   const rows = {};

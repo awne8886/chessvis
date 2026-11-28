@@ -90,6 +90,33 @@
     return gridToPlacement(grid) + '|' + hl;
   }
 
+  // ---------- board mutations worth a read (2.0.4, A3) ----------
+  // A MutationObserver on the board reports hover squares, drag ghosts, arrows, coordinates and the board's reaction to
+  // our own synthetic pointer moves as well as real moves. Only these can change what readPosition() sees: a `class`
+  // change on an element that has (or, by attributeOldValue, had) the class `piece` or `highlight`; a `class` change on
+  // the board element itself (`flipped`); a child list change that adds or removes an element that is, or contains, a
+  // `.piece` or `.highlight`. Works on real MutationRecords and on plain objects of the same shape (tests).
+  const WATCH = ['piece', 'highlight'];
+  const hasCls = (el, c) => !!el && (el.classList && typeof el.classList.contains === 'function' ? el.classList.contains(c)
+    : (' ' + (typeof el.className === 'string' ? el.className : (el.className && el.className.baseVal) || '') + ' ').includes(' ' + c + ' '));
+  const tokens = (v) => String(v || '').split(/\s+/);
+  const watched = (el) => !!el && el.nodeType === 1 && (WATCH.some((c) => hasCls(el, c)) ||
+    (typeof el.querySelector === 'function' && !!el.querySelector('.piece, .highlight')));
+  function mutationRelevant(records, board) {
+    for (const r of records || []) {
+      if (r.type === 'attributes') {
+        if (r.attributeName && r.attributeName !== 'class') continue;
+        if (r.target === board) return true;
+        if (WATCH.some((c) => hasCls(r.target, c))) return true;
+        if (r.oldValue !== undefined && r.oldValue !== null && tokens(r.oldValue).some((t) => WATCH.includes(t))) return true;
+      } else if (r.type === 'childList') {
+        for (const n of r.addedNodes || []) if (watched(n)) return true;
+        for (const n of r.removedNodes || []) if (watched(n)) return true;
+      }
+    }
+    return false;
+  }
+
   // ---------- castling rights (inferred from the page) ----------
   const freshRights = () => ({ K: true, Q: true, k: true, q: true });
   const castleString = (r) => ['K', 'Q', 'k', 'q'].filter((k) => r[k]).join('') || '-';
@@ -267,7 +294,7 @@
 
   CV.boardstate = {
     START_PLACEMENT, START_FEN, gridToPlacement, placementToGrid, boardToPlacement, countPieces, assembleFen,
-    analyzeHighlights, signature, freshRights, castleString, rightsFromString, updateRights, buildPosition, createTracker, obsFromFen,
+    analyzeHighlights, signature, mutationRelevant, freshRights, castleString, rightsFromString, updateRights, buildPosition, createTracker, obsFromFen,
   };
   if (typeof module !== 'undefined' && module.exports) module.exports = CV.boardstate;
 })(typeof window !== 'undefined' ? window : globalThis);

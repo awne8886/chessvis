@@ -527,6 +527,9 @@
   // ignores the storage echo of a write whose values it already has; the panel is re-placed (a forced layout) only when
   // its position or open state changed. false = 2.0.3 (a write per slider step, every tab re-renders and re-places).
   CV.SETTINGS_FEWER_WRITES = true;
+  // 2.0.4 (A3): a board mutation schedules a stable read only when it can change what a read sees (CV.boardstate.
+  // mutationRelevant: pieces, highlights, the board's own class). false = 2.0.3 (every mutation under the board).
+  CV.MUTATION_FILTER = true;
   // 2.0.2 (A7): AggroChess workers that report `interruptible` (JSPI in the browser and a 2.0.2 engine) are stopped
   // instead of terminated: a cancelled job's busy worker is stopped and recycled like a Stockfish one, and a `late`
   // reply search far from done is stopped and its move used from this depth on. false = 2.0.0 (terminate).
