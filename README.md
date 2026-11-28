@@ -1,6 +1,6 @@
 # ChessVision
 
-ChessVision is a Firefox extension (Manifest V2, version 2.0.4) that plays chess against the **computer bots** on chess.com by itself. It reads the board from the page, asks a chess engine that runs locally inside the extension for a move, and plays that move with synthetic pointer events. No server is involved: both engines are WebAssembly binaries that ship in `engine/`.
+ChessVision is a Firefox extension (Manifest V2, version 2.0.5) that plays chess against the **computer bots** on chess.com by itself. It reads the board from the page, asks a chess engine that runs locally inside the extension for a move, and plays that move with synthetic pointer events. No server is involved: both engines are WebAssembly binaries that ship in `engine/`.
 
 > **Scope.** ChessVision only acts on pages listed in [`allowed-pages.txt`](allowed-pages.txt) and is meant for bot games. Do not use it against people, in rated play, or anywhere engine help is not allowed.
 
