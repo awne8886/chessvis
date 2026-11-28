@@ -50,12 +50,29 @@ engine/stockfish-19-lite-single-rsimd.wasm    built with WebAssembly relaxed SIM
                               engine/stockfish-19-lite-single-rsimd.wasm sha256 744ae23293592254667b4b4fe2d5eae17319945ee06c51e364792b524880e6e7
 engine/stockfish-19-lite.js    - 2.0.0: the multi-threaded lite build of the same package (Stockfish.js 19.0.1, lite net,
 engine/stockfish-19-lite.wasm    GPL-3.0), used only for the main worker when the setting sfThreads is above 1 AND the runtime
-                              test of SharedArrayBuffer / Atomics / shared memory passes (it fails in Firefox's extension
-                              background page: no cross-origin isolation; then the single-thread files above are used).
+                              test of SharedArrayBuffer / Atomics / shared memory passes (it fails in release Firefox's
+                              extension background page: no cross-origin isolation; then the single-thread files above are
+                              used; 2.0.6: it passes on Firefox Nightly with the pref named below).
                               Both files were taken unmodified from the same npm package "stockfish" 19.0.1 (tarball sha256
                               above), directory bin/; checked byte for byte against that tarball in 2.0.3:
                               engine/stockfish-19-lite.js   sha256 dac939ff529668e0168b2f615145ec18b029b753deb6963fd7319d788f964333
                               engine/stockfish-19-lite.wasm sha256 ddf06cdaf0b8e35c11b40530e44db96c2a99c9029c8d621dd9fca97e4872770c
+                              2.0.6: both files are reproduced byte for byte from source by tools/build-stockfish.sh
+                              (stockfish.js v19.0.1, emsdk 6.0.9, `node build.js --lite --no-split`). 2.0.6: they run in
+                              Firefox Nightly with dom.postMessage.sharedArrayBuffer.bypassCOOP_COEP.insecure.enabled
+                              (seen on Android by the owner with 2.0.5); release Firefox still has no SharedArrayBuffer there.
+engine/stockfish-19-lite-rsimd.js    - 2.0.6: the same threaded engine (Stockfish.js 19.0.1, lite net, pthreads, GPL-3.0)
+engine/stockfish-19-lite-rsimd.wasm    built with WebAssembly relaxed SIMD; for the main worker with sfThreads above 1, tried
+                              before the npm threaded files above when the browser validates the relaxed SIMD probe (any
+                              failure falls back to them). Built by tools/build-stockfish.sh from the same source and
+                              toolchain as the single-thread relaxed build (stockfish.js tag v19.0.1, commit
+                              0d5dd7944f88c817c07a26bc4fb1905d5f9c46d6, emsdk 6.0.9, terser 5.51.2, the same 6-line
+                              RELAXED_SIMD switch), flags `node build.js --lite --no-split` with RELAXED_SIMD=yes; the plain
+                              threaded build of the same run reproduces engine/stockfish-19-lite.{js,wasm} byte for byte. The
+                              loader differs from engine/stockfish-19-lite.js only in the .wasm size it reports for progress.
+                              48 relaxed dot instructions (byte scan). No lichess / AGPL code is used.
+                              engine/stockfish-19-lite-rsimd.js   sha256 4c2428cf08cd11fecec981193e5eb27cf0b449a3bab7ce9ea07a69af96e99ab9
+                              engine/stockfish-19-lite-rsimd.wasm sha256 58d38e98bf4b41f51e3c7f495a7faeb73a8608d216903f0e3abbd2223fdef4fd
 engine/sf-worker.js           - 2.0.2: ChessVision's own worker wrapper for the Stockfish builds (GPL-3.0, see LICENSE).
 
 Maia-3 (added in 1.3.0; REMOVED in 1.7.8 - none of the files below is shipped any more, the entries are kept for the record)
