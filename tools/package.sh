@@ -5,15 +5,17 @@
 #
 # Default package: manifest.json, every script the manifest lists (background + content scripts), the popup
 # (popup.html and the scripts it loads), engine/ (all of it, NOTICE.txt included), LICENSE and allowed-pages.txt.
-# --lean also leaves out engine/stockfish-19-asm.js (the asm.js fallback: Firefox always has WebAssembly) and the threaded
-# build engine/stockfish-19-lite.js/.wasm (Firefox extension pages have no SharedArrayBuffer, see the 2.0.2 notes, so it
-# never runs; background.js keeps the single-thread engine when it cannot start). The files stay in the repository, so
-# the default package keeps the 2.0.2 fallback rules.
+# --lean also leaves out engine/stockfish-19-asm.js (the asm.js fallback: Firefox always has WebAssembly). The file stays in
+# the repository, so the default package keeps the 2.0.2 fallback rules. 2.0.6: --lean KEEPS both threaded builds
+# (engine/stockfish-19-lite.js/.wasm and engine/stockfish-19-lite-rsimd.js/.wasm): release Firefox has no SharedArrayBuffer
+# in extension pages, but Firefox Nightly with dom.postMessage.sharedArrayBuffer.bypassCOOP_COEP.insecure.enabled runs them
+# (owner-verified on Android with 2.0.5). The script list comes from the manifest, so ponderstats.js (2.0.6, the temporary
+# ponder-stats recorder) is packaged while the manifest lists it.
 #
 # allowed-pages.txt is put in the zip by its path; this script never reads or prints it. After zipping, the zip is
 # unpacked into a temporary directory and checked: every path the manifest lists, the popup's scripts and every engine
 # file background.js names (SF_*, AGGRO_* and the worker files, with each loader's .wasm) must be there (in lean mode
-# except the two left out). Prints the zip size. Needs zip, unzip and node.
+# except the one left out). Prints the zip size. Needs zip, unzip and node.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 LEAN=0
@@ -33,7 +35,7 @@ VERSION=$(node -p "require('./manifest.json').version")
 SUFFIX=""
 if [ "$LEAN" = 1 ]; then SUFFIX="-lean"; fi
 NAME="chessvision-$VERSION$SUFFIX.zip"
-LEAN_SKIP=(engine/stockfish-19-asm.js engine/stockfish-19-lite.js engine/stockfish-19-lite.wasm)
+LEAN_SKIP=(engine/stockfish-19-asm.js)
 
 # the files: from the manifest and popup.html (paths only), engine/, LICENSE, allowed-pages.txt
 mapfile -t FILES < <(node -e '

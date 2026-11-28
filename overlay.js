@@ -185,6 +185,45 @@ details[open] summary .arrow { transform: rotate(90deg); }
         el('button', { class: 'btn', type: 'button', onclick: () => { opts.onReset(); flash('Settings reset'); } }, 'Reset settings')),
       importBox, msg,
       el('p', { class: 'note' }, 'Export/Import skip Auto-play, the panel position and saved games. Clear engine memory empties AggroChess\u2019s hash and starts a new game in Stockfish. Debug info contains settings and board state, no account data.'));
+    // PONDER_STATS (temporary) begin
+    // 2.0.6 (D): "Ponder stats (temporary)" next to Copy debug info: one text file with every run, divided by the ponder
+    // worker count (ponderstats.js); only when CV.PONDER_STATS is on (content.js passes onPonderStats).
+    if (opts.onPonderStats) {
+      const psLine = el('p', { class: 'note' }, 'Ponder stats: \u2026');
+      const psDay = () => { const d = new Date(); return d.getFullYear() + '-' + String(d.getMonth() + 1).padStart(2, '0') + '-' + String(d.getDate()).padStart(2, '0'); };
+      const psStatus = async () => {
+        try {
+          const r = await opts.onPonderStats('status');
+          psLine.textContent = r && r.ok ? 'Ponder stats: ' + r.records + ' records, ' + r.games + ' games' + (r.dropped ? ' (' + r.dropped + ' oldest dropped)' : '') + ' \u00b7 workers now ' + r.workers : 'Ponder stats: ' + ((r && r.error) || 'no answer');
+        } catch (e) { psLine.textContent = 'Ponder stats: ' + ((e && e.message) || e); }
+      };
+      let psArmed = false, psArmTimer = null;
+      const psResetBtn = el('button', { class: 'btn', type: 'button' }, 'Reset stats');
+      const psDisarm = () => { psArmed = false; psResetBtn.textContent = 'Reset stats'; clearTimeout(psArmTimer); };
+      psResetBtn.addEventListener('click', async () => {
+        if (!psArmed) { psArmed = true; psResetBtn.textContent = 'Click again to confirm'; psArmTimer = setTimeout(psDisarm, 4000); return; }
+        psDisarm();
+        await opts.onPonderStats('reset');
+        flash('Ponder stats cleared'); psStatus();
+      });
+      const psDet = el('details', {}, el('summary', {}, el('span', {}, el('span', { class: 'arrow' }, '\u25b8'), 'Ponder stats (temporary)')),
+        el('div', { class: 'btns' },
+          el('button', { class: 'btn', type: 'button', onclick: async () => {
+            const r = await opts.onPonderStats('export');
+            if (!r || !r.ok) { flash('Ponder stats: ' + ((r && r.error) || 'no answer')); return; }
+            await downloadOrCopy('chessvision-ponder-stats-' + psDay() + '.txt', r.text, { type: 'text/plain', flash, ok: 'Download started (' + r.records + ' records; if nothing was saved, use Copy summary)', failed: 'Download failed \u2013 stats copied instead' });
+            psStatus();
+          } }, 'Download stats'),
+          el('button', { class: 'btn', type: 'button', onclick: async () => {
+            const r = await opts.onPonderStats('summary');
+            if (r && r.ok) await copyOrShow(r.text, 'Summary copied'); else flash('Ponder stats: ' + ((r && r.error) || 'no answer'));
+          } }, 'Copy summary'),
+          psResetBtn),
+        psLine);
+      psDet.addEventListener('toggle', () => { if (psDet.open) psStatus(); });
+      toolsBox.append(psDet);
+    }
+    // PONDER_STATS (temporary) end
 
 
     // ---- AggroChess options (visible only for AggroChess) ----
@@ -222,7 +261,8 @@ details[open] summary .arrow { transform: rotate(90deg); }
         slider('sfPonderWorkers', 'Ponder workers', fmtInt),
         slider('sfPonderHashMb', 'Ponder hash', (v) => v + ' MB'),
         slider('sfThreads', 'Search threads', fmtInt),
-        el('p', { class: 'note' }, 'Search: Depth = stop at Search depth (old behaviour). Delay = keep searching through the human-like pause and stop when it is used up (Search depth is then the minimum), so moves come at the same speed but are deeper. Clock = Stockfish\u2019s own time manager from both chess.com clocks (falls back to Delay when your clock cannot be read; untested on the real site). Clock: caps the search time from your chess.com clock (never more than a quarter of what is left). Ponder: extra Stockfish workers rank the opponent\u2019s moves and prepare replies while they think; a prepared reply is used only if the opponent plays that move. Each ponder worker costs about 40 MB plus its hash and is capped by your CPU count. Pondering is off while Imperfection is above 0. Threads above 1 need the threaded engine and a browser that allows SharedArrayBuffer; otherwise it stays at 1 (see Copy debug info).')));
+        slider('sfHashMb', 'Search hash', (v) => v + ' MB'),
+        el('p', { class: 'note' }, 'Search: Depth = stop at Search depth (old behaviour). Delay = keep searching through the human-like pause and stop when it is used up (Search depth is then the minimum), so moves come at the same speed but are deeper. Clock = Stockfish\u2019s own time manager from both chess.com clocks (falls back to Delay when your clock cannot be read; untested on the real site). Clock: caps the search time from your chess.com clock (never more than a quarter of what is left). Ponder: extra Stockfish workers rank the opponent\u2019s moves and prepare replies while they think; a prepared reply is used only if the opponent plays that move. Each ponder worker costs about 40 MB plus its hash and is capped by your CPU count. Pondering is off while Imperfection is above 0. Search threads (1\u20137, at most your CPU count \u2212 1) above 1 need the threaded engine and SharedArrayBuffer: release Firefox has none in extension pages, Firefox Nightly with dom.postMessage.sharedArrayBuffer.bypassCOOP_COEP.insecure.enabled does; otherwise it stays at 1 (see Copy debug info). The threads search on your turn, when the ponder workers are idle. Search hash: the main search\u2019s table (32 MB = before 2.0.6); a change clears it before the next search and costs that much memory.')));
 
     // ---- Game saving ----
     const gmsg = el('p', { class: 'msg', 'aria-live': 'polite' });
@@ -231,9 +271,10 @@ details[open] summary .arrow { transform: rotate(90deg); }
     const gamesBox = el('div', {});
     let games = [];
     const pad2 = (n) => String(n).padStart(2, '0');
-    function downloadText(name, text) {
+    // 2.0.6: type = the file's MIME type (default: PGN)
+    function downloadText(name, text, type) {
       try {
-        const url = URL.createObjectURL(new Blob([text], { type: 'application/x-chess-pgn' }));
+        const url = URL.createObjectURL(new Blob([text], { type: type || 'application/x-chess-pgn' }));
         const a = document.createElement('a');
         a.href = url; a.download = name; a.style.display = 'none';
         document.documentElement.appendChild(a); a.click(); a.remove();
@@ -241,9 +282,12 @@ details[open] summary .arrow { transform: rotate(90deg); }
         return true;
       } catch (e) { return false; }
     }
-    async function downloadOrCopy(name, text) {
-      if (downloadText(name, text)) { flashG('Download started (if nothing was saved, use Copy PGN)'); return; }
-      await copyOrShow(text, 'Download failed \u2013 PGN copied instead');
+    // 2.0.6: o (optional) = { type, flash, ok, failed }: MIME type, message function and texts (defaults: the PGN ones)
+    async function downloadOrCopy(name, text, o) {
+      o = o || {};
+      const say = o.flash || flashG;
+      if (downloadText(name, text, o.type)) { say(o.ok || 'Download started (if nothing was saved, use Copy PGN)'); return; }
+      await copyOrShow(text, o.failed || 'Download failed \u2013 PGN copied instead');
     }
     const small = (t, fn) => el('button', { class: 'btn sm', type: 'button', onclick: fn }, t);
     function renderGames() {

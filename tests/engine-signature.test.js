@@ -57,4 +57,46 @@ test('small budgets: analyze_floor / think_floor honour floors below 20 / 30 ms,
   assert.strictEqual(e.analyzeFloor(30, 3).split(' ').length, 5, 'same answer format');
 });
 
+// 2.0.6 (C): the threaded Stockfish builds run under Node too (worker_threads). At Threads 1 both must search exactly like
+// the single-thread builds: depth-14 signature over the 10 bench positions (Hash 32, ucinewgame before each), 748 260
+// nodes (docs/REFERENCE.md, 2.0.2). The relaxed-SIMD threaded build is a pure speed-up of the npm threaded one.
+const SF_SIG14 = { nodes: 748260, moves: 'd5e6 d2d3 e1g1 c4d5 c3b5 e4e5 f5d3 b4b2 f4f5 d4d8' };
+function sfSignature(file, depth) {
+  const { spawn } = require('child_process');
+  const { BENCH_FENS } = require('./_aggro-wasm');
+  return new Promise((resolve, reject) => {
+    const p = spawn(process.execPath, [path.join(ROOT, file)], { stdio: ['pipe', 'pipe', 'ignore'] });
+    let buf = '', waiters = [], last = null;
+    const timer = setTimeout(() => { p.kill(); reject(new Error(file + ': timeout')); }, 120000);
+    p.stdout.on('data', (d) => {
+      buf += d;
+      let i;
+      while ((i = buf.indexOf('\n')) >= 0) {
+        const l = buf.slice(0, i).trim(); buf = buf.slice(i + 1);
+        if (l.startsWith('info depth') && / pv /.test(l) && !/bound/.test(l)) last = l;
+        waiters = waiters.filter((w) => { if (w.re.test(l)) { w.r(l); return false; } return true; });
+      }
+    });
+    const send = (x) => p.stdin.write(x + '\n'), until = (re) => new Promise((r) => waiters.push({ re, r }));
+    (async () => {
+      send('uci'); await until(/^uciok/);
+      send('setoption name Threads value 1'); send('setoption name Hash value 32'); send('isready'); await until(/^readyok/);
+      let nodes = 0; const moves = [];
+      for (const f of BENCH_FENS) {
+        send('ucinewgame'); send('isready'); await until(/^readyok/);
+        last = null; send('position fen ' + f); send('go depth ' + depth);
+        const l = await until(/^bestmove/);
+        nodes += +(/ nodes (\d+)/.exec(last)[1]); moves.push(l.split(' ')[1]);
+      }
+      clearTimeout(timer); send('quit'); setTimeout(() => p.kill(), 300);
+      resolve({ nodes, moves: moves.join(' ') });
+    })().catch(reject);
+  });
+}
+for (const file of ['engine/stockfish-19-lite.js', 'engine/stockfish-19-lite-rsimd.js']) {
+  test(file + ' (threaded) at Threads 1: the depth-14 signature of the single-thread builds', async () => {
+    assert.deepStrictEqual(await sfSignature(file, 14), SF_SIG14);
+  });
+}
+
 run();

@@ -6,8 +6,9 @@ const api = typeof browser !== 'undefined' ? browser : chrome;
 // same name (SF_WASM) are both in engine/. If it fails to start, SF_FALLBACK_FILE (asm.js, much slower) is used.
 // Start order of every Stockfish worker: (1) engine/sf-worker.js, which loads the UNMODIFIED loader and hands it a wasm
 // Module compiled once here (sfModuleFor), (2) the loader directly (it fetches and compiles the .wasm itself), (3) asm.js
-// (main worker only). The threaded build SF_THREADED_FILE is used for the MAIN worker only, only when setting sfThreads > 1
-// AND the runtime feature test (CV.sabSupport) passes; any failure there keeps the single-thread engine.
+// (main worker only). The threaded builds (2.0.6: SF_THREADED_FILE_RSIMD, then SF_THREADED_FILE) are used for the MAIN
+// worker only, only when setting sfThreads > 1 AND the runtime feature test (CV.sabSupport) passes; any failure there falls
+// back one step (relaxed-SIMD threaded -> npm threaded -> the single-thread engine) and is remembered.
 const SF_FILE = 'engine/stockfish-19-lite-single.js';
 const SF_WASM = SF_FILE.replace(/\.js$/, '.wasm');
 // 2.0.2 (B1): the same engine built with WebAssembly relaxed SIMD (its NNUE uses i32x4.relaxed_dot_i8x16_i7x16_add; same
@@ -19,9 +20,13 @@ const sfWasmOf = (file) => file.replace(/\.js$/, '.wasm');
 const isSfSingle = (file) => file === SF_FILE || file === SF_FILE_RSIMD;
 const SF_WRAPPER = 'engine/sf-worker.js';
 const SF_THREADED_FILE = 'engine/stockfish-19-lite.js';
-const SF_THREADED_WASM = SF_THREADED_FILE.replace(/\.js$/, '.wasm');
+// 2.0.6 (C): the threaded build with WebAssembly relaxed SIMD (tools/build-stockfish.sh; the same search, Threads 1 gives the
+// depth-14 bench signature of the single builds). Its loader gets its own .wasm in "#<url>,worker" (sfWasmOf), and its
+// pthread workers load the same URL, so they never see the plain .wasm (tests/bench-threads.js --only load).
+const SF_THREADED_FILE_RSIMD = 'engine/stockfish-19-lite-rsimd.js';
+const isSfThreaded = (file) => file === SF_THREADED_FILE || file === SF_THREADED_FILE_RSIMD;
 const SF_FALLBACK_FILE = 'engine/stockfish-19-asm.js';
-const SF_THREADS = 1, SF_HASH_MB = 32;      // sent once after start-up
+const SF_THREADS = 1, SF_HASH_MB = 32;      // sent once after start-up (2.0.6: the main worker's Hash is the setting sfHashMb, see sfHashWant)
 const SF_START_TIMEOUT_MS = 30000;          // no readyok within this long = the engine did not start
 const SF_WRAPPER_TIMEOUT_MS = 15000;        // ... for the wrapper / shared-module start (then the direct loader is tried)
 // "Imperfection" only considers alternatives within this many centipawns of the best line.
@@ -36,7 +41,14 @@ const SF_DELAY_GO = 'go depth 64';   // delay-matched search: effectively unboun
 let sfActive = null;    // engine file in use
 let sfPrevCount = null; // pieces in the previous request; null = nothing searched yet (see CV.sfIsNewGame)
 let sfMultiPvSent = null, sfThreadsSent = SF_THREADS;   // setoption is only sent when the value changes
+// 2.0.6 (B): the main worker's hash (MB): the latest setting value from the page (sfHashWant, used at the next start) and
+// what the running main worker has (sfHashSent; null = the engine's default); sfSpin = the spin options the main engine
+// listed ({ name: { min, max } }), so a runtime setoption stays inside them.
+let sfHashWant = CV.DEFAULTS.sfHashMb, sfHashSent = null, sfSpin = {};
 const sfDbg = { moduleSendFailures: 0, workerStarts: 0, lastStart: null, harvested: 0, harvestFailed: 0, threadedFailed: null, threadedStarts: 0, pvSeeds: 0, rsimdFailed: null,
+  // 2.0.6: the relaxed-SIMD threaded build failed to start (why; then the npm threaded build is used); Hash changes sent to
+  // the main worker; main searches that waited for stopping ponder workers (CV.SF_MAIN_WAIT_STOP_MS) and the last waits (ms)
+  rsimdThreadedFailed: null, hashChanges: 0, mainWaits: 0, mainWaitMs: [],
   // 2.0.3 (seen on a phone: a main search ran 4 752 ms with a 3 000 ms cap, and 27 Stockfish workers were started for 31
   // ponder jobs): main searches that ended more than SF_OVERRUN_MS after their cap (count, the last 5 in full); Stockfish
   // workers terminated, by reason; the last 20 ponder cancels (stop + readyok, ms)
@@ -78,6 +90,7 @@ function sfModuleFor(file) {
 // Starts one engine file and resolves { worker, notes } once it has answered `readyok` after the options were sent.
 // Rejects on a worker error, a start timeout or a failure to create the worker.
 // opts (all optional): wrapper + module = start SF_FILE through SF_WRAPPER with that compiled Module; hashMb; threads; timeoutMs.
+// 2.0.6: also resolves `spin` (the spin options the engine listed) and `sent` ({ Threads, Hash }: the values sent, or null).
 function sfSpawn(file, opts) {
   opts = opts || {};
   const hashMb = opts.hashMb || SF_HASH_MB, threads = opts.threads || SF_THREADS;
@@ -86,6 +99,7 @@ function sfSpawn(file, opts) {
     let w = null, done = false, stage = 'uci';
     const spin = {};      // option name -> { min, max } for the spin options the engine lists
     const notes = [];     // what happened with the options, for the log
+    const sent = { Threads: null, Hash: null };
     const fail = (why) => {
       if (done) return;
       done = true; clearTimeout(timer);
@@ -95,8 +109,8 @@ function sfSpawn(file, opts) {
     const timer = setTimeout(() => fail('no readyok within ' + (opts.timeoutMs || SF_START_TIMEOUT_MS) + ' ms (waiting for ' + stage + ')'), opts.timeoutMs || SF_START_TIMEOUT_MS);
     try {
       // The wasm loader finds its .wasm from "#<url>,worker"; passing it explicitly avoids relying on location.origin.
-      const wasmFile = file === SF_THREADED_FILE ? SF_THREADED_WASM : sfWasmOf(file);
-      w = new Worker(api.runtime.getURL(viaWrapper ? SF_WRAPPER : file) + (isSfSingle(file) || file === SF_THREADED_FILE ? '#' + encodeURIComponent(api.runtime.getURL(wasmFile)) + ',worker' : ''));
+      // 2.0.6: every wasm loader (single and threaded, plain and relaxed SIMD) gets the .wasm of its own name.
+      w = new Worker(api.runtime.getURL(viaWrapper ? SF_WRAPPER : file) + (isSfSingle(file) || isSfThreaded(file) ? '#' + encodeURIComponent(api.runtime.getURL(sfWasmOf(file))) + ',worker' : ''));
     } catch (e) { return fail('could not create worker: ' + ((e && e.message) || e)); }
     w.onerror = (e) => fail('worker error: ' + ((e && e.message) || 'unknown'));
     w.onmessage = (e) => {
@@ -111,7 +125,7 @@ function sfSpawn(file, opts) {
             const o = spin[name];
             if (!o) notes.push(name + ': option not offered');
             else if (value < o.min || value > o.max) notes.push(name + ': ' + value + ' outside ' + o.min + '-' + o.max + ', not sent');
-            else { w.postMessage('setoption name ' + name + ' value ' + value); notes.push(name + ' = ' + value + ' sent'); }
+            else { w.postMessage('setoption name ' + name + ' value ' + value); notes.push(name + ' = ' + value + ' sent'); sent[name] = value; }
           }
           w.postMessage('isready');
         }
@@ -119,7 +133,7 @@ function sfSpawn(file, opts) {
         notes.push('engine refused an option: ' + line);
       } else if (line === 'readyok') {
         done = true; clearTimeout(timer);
-        resolve({ worker: w, notes });
+        resolve({ worker: w, notes, spin, sent });
       }
     };
     if (viaWrapper) {       // first message: the compiled module (null = the wrapper fetches the file itself)
@@ -165,12 +179,12 @@ function initStockfish() {
   sfReady = (async () => {
     let r, file;
     try {
-      r = await sfSpawnWasm();
+      r = await sfSpawnWasm({ hashMb: sfHashWant });            // 2.0.6 (B): the main worker's hash is the setting sfHashMb
       file = r.file || SF_FILE;
     } catch (e) {
       if (gen !== engineGen) throw e;
       console.error('[ChessVision] Stockfish: ' + SF_FILE + ' did not start (' + ((e && e.message) || e) + '); falling back to ' + SF_FALLBACK_FILE);
-      r = await sfSpawn(SF_FALLBACK_FILE);
+      r = await sfSpawn(SF_FALLBACK_FILE, { hashMb: sfHashWant });
       file = SF_FALLBACK_FILE;
     }
     // 2.0.0 (T10): warm the main worker like the ponder workers before sfReady resolves: the first search of a fresh engine
@@ -183,6 +197,7 @@ function initStockfish() {
     sfDbg.mainWarmMs = warmMs;
     sfAttach(r.worker);
     sfThreadsSent = SF_THREADS;
+    sfHashSent = r.sent ? r.sent.Hash : null; sfSpin = r.spin || {};
     sfDbg.workerStarts++; sfDbg.lastStart = { label: 'main', file: sfActive, how: r.how || 'direct' };
     // Threads missing on the asm fallback is expected (it is single-threaded); anything else is worth a look.
     const notes = sfActive === SF_FALLBACK_FILE ? r.notes.filter((n) => n !== 'Threads: option not offered') : r.notes;
@@ -210,28 +225,50 @@ function sfWarmMain(w) {
 const SF_MAIN_WARM_TIMEOUT_MS = 2000;
 
 // Optional: the threaded build for the main worker (setting sfThreads > 1). Needs SharedArrayBuffer (runtime test, sfSab).
-// Any failure keeps the single-thread engine and is remembered (no retry loop). Returns the thread count in use.
+// 2.0.6 (C): the builds of CV.sfThreadedCandidates in turn (relaxed-SIMD threaded, then the npm threaded build); a build
+// that fails is remembered (sfDbg.rsimdThreadedFailed / threadedFailed) and the next one is tried; when none starts, the
+// single-thread engine stays (no retry loop). Returns the thread count in use.
+const sfThreadedFiles = () => CV.sfThreadedCandidates({ relaxedOk: sfRelaxedOk, failed: { rsimd: !!sfDbg.rsimdThreadedFailed, npm: !!sfDbg.threadedFailed } })
+  .map((k) => (k === 'rsimd' ? SF_THREADED_FILE_RSIMD : SF_THREADED_FILE));
 async function sfApplyThreads(setting) {
   const want = CV.sfThreadCount(setting, typeof navigator !== 'undefined' ? navigator.hardwareConcurrency : undefined, sfSab.ok);
-  if (sfActive === SF_THREADED_FILE) {
+  if (isSfThreaded(sfActive)) {
     if (want !== sfThreadsSent && !sfCurrent) { sf.postMessage('setoption name Threads value ' + want); sfThreadsSent = want; }
     return sfThreadsSent;
   }
-  if (want <= 1 || sfDbg.threadedFailed || sfCurrent || sfNext) return 1;
-  try {
-    const r = await sfSpawn(SF_THREADED_FILE, { threads: want });
-    if (sfCurrent) { try { r.worker.terminate(); } catch (e) { /* ignore */ } return 1; }     // a search started meanwhile: keep the old engine
-    const old = sf; sfAttach(r.worker); sfActive = SF_THREADED_FILE; sfThreadsSent = want; sfPrevCount = null;
-    try { if (old) old.terminate(); } catch (e) { /* ignore */ }
-    sfDbg.threadedStarts++; sfDbg.lastStart = { label: 'main', file: sfActive, how: 'threaded, Threads ' + want };
-    console.log('[ChessVision] Stockfish threaded build active:', SF_THREADED_FILE, 'Threads', want, r.notes.join('; '));
-    return want;
-  } catch (e) {
-    sfDbg.threadedFailed = String((e && e.message) || e);
-    console.error('[ChessVision] Stockfish threaded build did not start (' + sfDbg.threadedFailed + '); keeping ' + sfActive);
-    return 1;
+  if (want <= 1 || sfCurrent || sfNext) return 1;
+  for (const file of sfThreadedFiles()) {
+    try {
+      const r = await sfSpawn(file, { threads: want, hashMb: sfHashWant });
+      if (sfCurrent) { try { r.worker.terminate(); } catch (e) { /* ignore */ } return 1; }     // a search started meanwhile: keep the old engine
+      const old = sf; sfAttach(r.worker); sfActive = file; sfThreadsSent = want; sfPrevCount = null;
+      sfHashSent = r.sent ? r.sent.Hash : null; sfSpin = r.spin || {};
+      try { if (old) old.terminate(); } catch (e) { /* ignore */ }
+      sfDbg.threadedStarts++; sfDbg.lastStart = { label: 'main', file: sfActive, how: 'threaded, Threads ' + want };
+      console.log('[ChessVision] Stockfish threaded build active:', file, 'Threads', want, r.notes.join('; '));
+      return want;
+    } catch (e) {
+      const why = String((e && e.message) || e);
+      if (file === SF_THREADED_FILE_RSIMD) { sfDbg.rsimdThreadedFailed = why; console.error('[ChessVision] Stockfish relaxed-SIMD threaded build did not start (' + why + '); trying ' + SF_THREADED_FILE); continue; }
+      sfDbg.threadedFailed = why;
+      console.error('[ChessVision] Stockfish threaded build did not start (' + why + '); keeping ' + sfActive);
+      return 1;
+    }
   }
+  return 1;
 }
+
+// 2.0.6 (B): the main worker's hash follows the setting sfHashMb: `setoption name Hash` only when the value changed and only
+// while the main worker is idle (called right before a search starts; nothing is searching then). A new size clears the
+// table. A value outside the range the engine listed is not sent (the engine keeps its table).
+function sfApplyHash() {
+  if (!sf || sfCurrent || sfNext || sfHashWant === sfHashSent) return;
+  const o = sfSpin.Hash;
+  if (o && (sfHashWant < o.min || sfHashWant > o.max)) return;
+  sf.postMessage('setoption name Hash value ' + sfHashWant);
+  sfHashSent = sfHashWant; sfDbg.hashChanges++;
+}
+const sfHashFrom = (msg) => { if (msg && msg.sfHashMb !== undefined) { const v = CV.sanitize({ sfHashMb: msg.sfHashMb }).sfHashMb; if (v) sfHashWant = v; } };
 
 function sfStart(job) {
   sfCurrent = job;
@@ -339,6 +376,21 @@ function sfBestMove(line) {
   }
 }
 
+// 2.0.6 (A3): the ponder workers just stopped (ponderCancel) are answering `stop` + `isready`; with CV.SF_MAIN_WAIT_STOP_MS > 0
+// the main `go` waits until every one of them answered, at most that long (their search threads and the main search's
+// would otherwise compete for the cores for those few ms). 0 = 2.0.5 (no wait).
+async function sfWaitStopped() {
+  const cap = Math.max(0, Number(CV.SF_MAIN_WAIT_STOP_MS) || 0);
+  if (!cap) return;
+  const ps = ponderCancelling.filter((w) => w.kind === 'sf' && !w.dead && w.cancelP).map((w) => w.cancelP.catch(() => false));
+  if (!ps.length) return;
+  const t0 = Date.now();
+  let timer = null;
+  await Promise.race([Promise.all(ps), new Promise((r) => { timer = setTimeout(r, cap); })]);
+  clearTimeout(timer);
+  sfDbg.mainWaits++; sfDbg.mainWaitMs.push(Date.now() - t0); if (sfDbg.mainWaitMs.length > 20) sfDbg.mainWaitMs.shift();
+}
+
 // The real Stockfish request. `msg` (optional, 7th argument) carries the pondering fields (ponder, sfThreads).
 async function analyzeStockfish(fen, depth, imperfection, maxMs, startFen, moves, msg) {
   aggroThinking++;                     // while a real search runs, no spare ponder worker is made (see ponderTopUp)
@@ -346,12 +398,14 @@ async function analyzeStockfish(fen, depth, imperfection, maxMs, startFen, moves
 }
 async function analyzeStockfishNow(fen, depth, imperfection, maxMs, startFen, moves, msg) {
   const t0 = Date.now();
+  sfHashFrom(msg);
   try { await sfEnsureCurrent(); } catch (e) { return { error: 'Stockfish: could not start (' + ((e && e.message) || e) + ')' }; }
   // 1) a reply already found while pondering wins; anything else stops the ponder workers at once (stop + isready, never waited for)
   if (!msg.ponder) { if (ponderKind === 'sf') ponderCancel(); }
   else {
     const hist = typeof startFen === 'string' && Array.isArray(moves);
     const d = ponder.decide(hist ? startFen : null, hist ? moves : null);
+    psDecide('sf', msg, d, hist ? startFen : null, hist ? moves : null);      // PONDER_STATS (temporary)
     if (d.decision === 'hit') {
       // 2.0.0 harvest upgrade: a deepening pass may be searching exactly this move right now and already be deeper than the
       // stored reply. Stop it and use its bestmove if it answers within SF_HARVEST_MS; otherwise the stored reply.
@@ -388,9 +442,11 @@ async function analyzeStockfishNow(fen, depth, imperfection, maxMs, startFen, mo
       }
     }
     ponderCancel();                                                           // miss, late or no entry yet: the ponder workers never delay a real search
+    await sfWaitStopped();                                                    // 2.0.6 (A3): CV.SF_MAIN_WAIT_STOP_MS (0 = 2.0.5: no wait)
   }
   if (msg.sfThreads !== undefined) { try { await sfApplyThreads(msg.sfThreads); } catch (e) { /* keep the engine we have */ } }
   if (!sf) { try { await sfEnsureCurrent(); } catch (e) { return { error: 'Stockfish: could not start (' + ((e && e.message) || e) + ')' }; } }   // 2.0.4: from here to sfStart nothing waits
+  sfApplyHash();                                                              // 2.0.6 (B): only when sfHashMb changed
   const res = await new Promise((resolve) => {
     const imp = Math.max(0, Math.min(100, imperfection || 0));
     const softMs = Math.max(0, Math.min(AGGRO_HARD_MAX_MS, Math.round(Number(msg.softMs)) || 0));
@@ -720,6 +776,7 @@ function stopEngines() {
   ponderSpares = []; ponderActive = []; ponderCancelling = [];
   if (sf) { try { sf.terminate(); } catch (e) { /* ignore */ } }
   sf = null; sfReady = null; sfActive = null; sfCurrent = null; sfNext = null; sfPrevCount = null; sfMultiPvSent = null; sfThreadsSent = SF_THREADS; lastMainPv = null;
+  sfHashSent = null; sfSpin = {};
   if (aggroMain) { aggroMain.kill(); aggroMain = null; }
   sfModuleP.clear(); aggroModuleP = null;                       // compiled again on the next start
   Object.assign(sfModuleInfo, { shared: false, ms: null, how: null, error: null, file: null });
@@ -1104,6 +1161,7 @@ async function runIdleJob(msg, token) {
     if (rankedList || !rank.ended || rank.pending > 0) return;
     rankedList = legal.map((m) => m.uci).filter((u) => scoreOf.get(u) !== null)
       .sort((x, y) => (scoreOf.has(x) ? scoreOf.get(x) : Infinity) - (scoreOf.has(y) ? scoreOf.get(y) : Infinity));
+    psRanked(token, rankedList);                               // PONDER_STATS (temporary)
     resolveRanked();
   };
   const rankClaim = () => {
@@ -1203,6 +1261,7 @@ function aggroIdle(msg) {
   ponderCancel();
   const token = idleToken;
   if (!(msg.ponder || msg.showEval) || typeof msg.startFen !== 'string' || !Array.isArray(msg.moves)) return { state: 'off' };
+  if (msg.ponder) psJobStart(msg, token);                      // PONDER_STATS (temporary)
   runIdle(msg, token).catch((e) => { if (token === idleToken) console.error('[ChessVision] AggroChess idle job failed', e); });
   return { state: 'started' };
 }
@@ -1238,6 +1297,7 @@ async function analyzeAggroNow(msg) {
     if (!msg.ponder) ponderCancel();
     else {
       const d = ponder.decide(hist ? msg.startFen : null, hist ? msg.moves : null);
+      psDecide('aggro', msg, d, hist ? msg.startFen : null, hist ? msg.moves : null);   // PONDER_STATS (temporary)
       if (d.decision === 'hit') {
         ponderStop(); const e = d.result; noteHitDepth(e.depth);
         const res = { uci: e.uci, best: e.uci, san: e.san, sacrifice: e.sacrifice, depth: e.depth, ponderHit: true };
@@ -1467,7 +1527,12 @@ async function runIdleSfJob(msg, token) {
   const rank = { owner: null, next: 0, pending: 0, ended: false };
   let rankedList = null, resolveRanked = null;
   const ranked = new Promise((r) => { resolveRanked = r; });
-  const setRanked = (list) => { if (!rankedList) { rankedList = CV.moveFirst(list, predicted); resolveRanked(); } };
+  const setRanked = (list) => {
+    if (rankedList) return;
+    rankedList = CV.moveFirst(list, predicted);
+    psRanked(token, rankedList);                               // PONDER_STATS (temporary)
+    resolveRanked();
+  };
   if (mode === 'single') setRanked(legal.slice());
   let passes = null;
   const getPasses = () => passes || (passes = createReplyPasses({ token, ranked: rankedList, firstSlice: slice, left, until: !!msg.ponderUntilMove,
@@ -1551,6 +1616,7 @@ function sfIdle(msg) {
   ponderCancel();
   const token = idleToken;
   if (!msg.ponder || typeof msg.startFen !== 'string' || !Array.isArray(msg.moves)) return { state: 'off' };
+  psJobStart(msg, token);                                      // PONDER_STATS (temporary)
   runIdleSf(msg, token).catch((e) => { if (token === idleToken) console.error('[ChessVision] Stockfish idle job failed', e); });
   return { state: 'started' };
 }
@@ -1694,16 +1760,226 @@ function migrateAtStart() {
   gameSerial(migrateSavedGames).catch((e) => { gameDbg.migrateError = String((e && e.message) || e); console.error('[ChessVision] saved games migration failed (will retry)', e); });
 }
 
+// PONDER_STATS (temporary) begin
+// ======================= Ponder stats recorder (2.0.6, D; temporary) =======================
+// One record per ponder decision (hit / late / miss / none from ponder.decide(), skipped = our move needed no engine),
+// with the run's settings, the depths, the lead time, the rank of the opponent's move in the job's ranked list and the
+// kills since the previous record; the page adds what only it knows (the opponent's think time, our move latency, the
+// clock, the ponder settings) in a `ps` field of its next message. Nothing here changes a search: it reads state only.
+// Storage (2.0.4 discipline): an index under CV.PONDER_STATS_KEY ({ v, nextGame, dropped, droppedGames, runs, games:
+// [{ g, c, at, n, bytes }] }) and one key per game (CV.PONDER_STATS_KEY + ':g' + n: { g, c, at, recs }), written at a game
+// end and at most every PS_WRITE_MS (never per move); a write carries the index and the games that changed only (one key
+// for everything would rewrite up to 5 MB, and send it to every chess.com tab in storage.onChanged, every 10 s). Finished
+// games leave memory once written. Read once on the first use and merged with what was recorded meanwhile
+// (CV.ponderStatsMerge). Capped at CV.PONDER_STATS_MAX_RECORDS / _MAX_BYTES (oldest whole games dropped and counted).
+const PS_WRITE_MS = 10000;
+const psOn = () => !!CV.PONDER_STATS && typeof CV.ponderStatsNew === 'function' && !!(api.storage && api.storage.local);
+const psGameKey = (g) => CV.PONDER_STATS_KEY + ':g' + g;
+let psStore = null, psLoadP = null, psLoaded = false, psCur = null, psTimer = null, psChain = Promise.resolve();
+const psDirty = new Set();                 // game numbers to write
+const psByKey = new Map();                 // history key -> record, current game only (a quick look + full search = one record)
+let psJob = null;                          // the latest ponder job: { key, token, startedAt, ranked }
+let psKillsPrev = null;
+const psStoreNow = () => psStore || (psStore = CV.ponderStatsNew());
+const psSerial = (fn) => { const p = psChain.then(fn); psChain = p.catch(() => {}); return p; };
+function psLoad() {
+  if (!psLoadP) {
+    psLoadP = (async () => {
+      let stored = null;
+      try { stored = (await api.storage.local.get(CV.PONDER_STATS_KEY))[CV.PONDER_STATS_KEY] || null; } catch (e) { stored = null; }
+      const live = psStoreNow();
+      const { store, map } = CV.ponderStatsMerge(stored, live);
+      for (const g of store.games) if (!g.recs) g.recs = null;   // stored games stay in storage (index entries only)
+      psStore = store; psLoaded = true;
+      if (psCur !== null && map[psCur] !== undefined) psCur = map[psCur];
+      psDirty.clear(); for (const g of store.games) if (g.recs) psDirty.add(g.g);
+    })();
+  }
+  return psLoadP;
+}
+const psKey = (startFen, moves) => (typeof startFen === 'string' && Array.isArray(moves) ? CV.ponderKey(startFen, moves) : null);
+function psKillsDelta() {
+  const now = { ...sfDbg.kills };
+  if (ponderDbg.aggroKilled) now['aggro killed'] = ponderDbg.aggroKilled;
+  const prev = psKillsPrev || {};
+  const d = {};
+  for (const k of Object.keys(now)) if (now[k] > (prev[k] || 0)) d[k] = now[k] - (prev[k] || 0);
+  psKillsPrev = now;
+  return d;
+}
+// the page's fields: latency of our previous move, the clock of this game
+function psFromPage(ps) {
+  if (!ps || typeof ps !== 'object') return;
+  if (ps.prev && ps.prev.key && Number.isFinite(Number(ps.prev.latMs))) {
+    const r = psByKey.get(ps.prev.key);
+    if (r && r.lat === undefined) { r.lat = Math.max(0, Math.round(Number(ps.prev.latMs))); if (psCur !== null) psMark(psCur); }
+  }
+}
+function psGameNow(ps) {
+  const st = psStoreNow();
+  if (psCur === null) { psCur = CV.ponderStatsNewGame(st); psByKey.clear(); }
+  const c = ps && Number(ps.clockSec) > 0 ? Math.round(Number(ps.clockSec)) : null;
+  CV.ponderStatsGame(st, psCur, c, Date.now());
+  return psCur;
+}
+const psNum = (v) => (v === null || v === undefined || !Number.isFinite(Number(v)) ? null : Math.round(Number(v)));
+// A ponder job started (aggroIdle): its key and, later, its ranked list (psRanked).
+function psJobStart(msg, token) {
+  if (!psOn()) return;
+  psJob = { key: psKey(msg.startFen, msg.moves), token, startedAt: Date.now(), ranked: null };
+}
+function psRanked(token, list) { if (psJob && psJob.token === token && !psJob.ranked && Array.isArray(list)) psJob.ranked = list.slice(); }
+function psRankOf(startFen, moves) {
+  if (!psJob || !psJob.ranked || !Array.isArray(moves) || !moves.length || psJob.key !== psKey(startFen, moves.slice(0, -1))) return null;
+  const i = psJob.ranked.indexOf(moves[moves.length - 1]);
+  return i < 0 ? null : i;
+}
+// A decision was made (analyze*Now, right after ponder.decide). The record is completed by psFinish (msg._ps).
+function psDecide(engine, msg, d, startFen, moves) {
+  if (!psOn()) return;
+  try {
+    const ps = msg.ps || {};
+    psFromPage(ps);
+    const key = psKey(startFen, moves);
+    const old = key ? psByKey.get(key) : null;
+    if (old) { msg._ps = { rec: old, engine, again: true }; return; }     // the full search after a quick look: same record
+    const g = psGameNow(ps);
+    const rec = CV.ponderStatsAdd(psStoreNow(), { g, run: psRunFor(engine, ps), p: Array.isArray(moves) ? moves.length : null, d: d.decision,
+      ot: psNum(ps.oppMs), lm: psNum(d.leadMs), rk: psRankOf(startFen, moves), k: psKillsDelta(), at: Date.now() });
+    if (key) psByKey.set(key, rec);
+    msg._ps = { rec, engine, ps };
+    psMark(g);
+  } catch (e) { /* the recorder never breaks a move */ }
+}
+// The run key of a record: the page's settings and what is in effect here (ponderCap, main threads, build, main hash).
+function psRunFor(engine, ps) {
+  const sfMain = engine === 'sf';
+  const base = (f) => (f ? String(f).split('/').pop() : null);
+  // w: the effective worker count of the page's setting (= ponderCap of its jobs; before the first job ponderCap is still 1)
+  return { e: engine, w: psNum(ps.ws) !== null ? ponderEffectiveCount(ps.ws) : ponderCap, ws: psNum(ps.ws), t: sfMain ? (isSfThreaded(sfActive) ? sfThreadsSent : 1) : 1, pm: psNum(ps.pm), px: psNum(ps.px), ph: psNum(ps.ph),
+    mh: sfMain ? (sfHashSent !== null ? sfHashSent : psNum(ps.mh)) : psNum(ps.mh), sm: ps.sm ? String(ps.sm) : null, b: sfMain ? base(sfActive) : base(aggroModuleInfo.file) };
+}
+// The request ended with result r: depths, and the run key now that the main search's threads / build are known.
+function psFinish(msg, r) {
+  const x = msg && msg._ps;
+  if (!x || !psStore) return;
+  try {
+    const rec = x.rec;
+    if (!x.again) {
+      const key = CV.ponderStatsRunKey(psRunFor(x.engine, x.ps || {}));
+      let i = psStore.runs.indexOf(key);
+      if (i < 0) { psStore.runs.push(key); i = psStore.runs.length - 1; }
+      rec.r = i;
+    }
+    if (r && !r.error) {
+      if (r.ponderHit) { rec.hd = psNum(r.depth); if (rec.d === 'late') rec.lh = 1; }
+      else if (Number.isFinite(Number(r.depth))) rec.md = psNum(r.depth);
+    }
+    if (psCur !== null) psMark(psCur);
+  } catch (e) { /* ignore */ }
+}
+// Our move needed no engine (the only legal move): a 'skipped' record.
+function psSkipped(msg) {
+  if (!psOn()) return;
+  const ps = msg.ps || {};
+  psFromPage(ps);
+  const moves = Array.isArray(msg.moves) ? msg.moves : null, key = psKey(msg.startFen, moves);
+  if (key && psByKey.has(key)) return;
+  ponder.skip();
+  const g = psGameNow(ps);
+  const lead = psJob && moves && moves.length && psJob.key === psKey(msg.startFen, moves.slice(0, -1)) ? Date.now() - psJob.startedAt : null;
+  const rec = CV.ponderStatsAdd(psStoreNow(), { g, run: psRunFor(msg.engine === 'stockfish' ? 'sf' : 'aggro', ps), p: moves ? moves.length : null, d: 'skipped',
+    ot: psNum(ps.oppMs), lm: lead, rk: psRankOf(msg.startFen, moves), k: psKillsDelta(), at: Date.now() });
+  if (key) psByKey.set(key, rec);
+  psMark(g);
+}
+function psMark(g) {
+  psDirty.add(g);
+  if (!psTimer) psTimer = setTimeout(() => { psTimer = null; psFlush().catch(() => {}); }, PS_WRITE_MS);
+}
+// Writes the index and the changed games; trims first. Finished games then leave memory (index entry only).
+function psFlush() {
+  if (!psOn()) return Promise.resolve();
+  return psSerial(async () => {
+    await psLoad();
+    clearTimeout(psTimer); psTimer = null;
+    const st = psStore;
+    const dropped = CV.ponderStatsTrim(st);
+    const write = {};
+    for (const g of st.games) {
+      if (!psDirty.has(g.g) || !g.recs) continue;
+      const chunk = { g: g.g, c: g.c, at: g.at, recs: g.recs };
+      write[psGameKey(g.g)] = chunk;
+      g.bytes = JSON.stringify(chunk).length; g.n = g.recs.length;
+    }
+    write[CV.PONDER_STATS_KEY] = { v: st.v, nextGame: st.nextGame, dropped: st.dropped, droppedGames: st.droppedGames, runs: st.runs,
+      games: st.games.map((g) => ({ g: g.g, c: g.c, at: g.at, n: g.recs ? g.recs.length : g.n, bytes: g.bytes })) };
+    psDirty.clear();
+    await api.storage.local.set(write);
+    if (dropped.length) await api.storage.local.remove(dropped.map(psGameKey));
+    for (const g of st.games) if (g.g !== psCur && g.recs) { g.n = g.recs.length; g.recs = null; }   // written: out of memory
+  });
+}
+// New game (the page's tracker): the old game is written now; the next record opens a new one.
+function psNewGame() {
+  if (!psOn() || psCur === null) return;
+  psCur = null; psByKey.clear();
+  psFlush().catch(() => {});
+}
+// Everything, read back from storage (export).
+function psFull() {
+  return psFlush().then(() => psSerial(async () => {
+    const st = psStore;
+    const missing = st.games.filter((g) => !g.recs).map((g) => psGameKey(g.g));
+    const got = missing.length ? await api.storage.local.get(missing) : {};
+    const games = st.games.map((g) => (g.recs ? { g: g.g, c: g.c, at: g.at, recs: g.recs } : { g: g.g, c: g.c, at: g.at, recs: (got[psGameKey(g.g)] && got[psGameKey(g.g)].recs) || [] }));
+    return { ...st, games };
+  }));
+}
+const psMeta = () => ({ version: (() => { try { return api.runtime.getManifest().version; } catch (e) { return null; } })(), exportedAt: new Date().toISOString(),
+  userAgent: typeof navigator !== 'undefined' ? navigator.userAgent : null, hardwareConcurrency: typeof navigator !== 'undefined' ? navigator.hardwareConcurrency : null });
+function psStatus() {
+  return psLoad().then(() => ({ ok: true, records: CV.ponderStatsCount(psStore), games: psStore.games.length, dropped: psStore.dropped, workers: ponderCap, kind: ponderKind }));
+}
+function psReset() {
+  return psSerial(async () => {
+    await psLoad();
+    const keys = [CV.PONDER_STATS_KEY, ...psStore.games.map((g) => psGameKey(g.g))];
+    clearTimeout(psTimer); psTimer = null;
+    psStore = CV.ponderStatsNew(); psCur = null; psByKey.clear(); psDirty.clear(); psKillsPrev = null;
+    await api.storage.local.remove(keys);
+    return { ok: true };
+  });
+}
+function psMessage(msg) {
+  if (!psOn()) return Promise.resolve({ ok: false, error: 'ponder stats are off (CV.PONDER_STATS)' });
+  const op = msg.op;
+  if (op === 'skipped') { psSkipped(msg); return Promise.resolve({ ok: true }); }
+  if (op === 'note') { psFromPage(msg.ps); return Promise.resolve({ ok: true }); }
+  if (op === 'gameEnd') { psFromPage(msg.ps); return psFlush().then(() => ({ ok: true })); }
+  if (op === 'status') return psStatus();
+  if (op === 'export') return psFull().then((st) => ({ ok: true, text: CV.ponderStatsFormat(st, psMeta()), records: CV.ponderStatsCount(st) }));
+  if (op === 'summary') return psFull().then((st) => ({ ok: true, text: CV.ponderStatsSummaryText(st) }));
+  if (op === 'reset') return psReset();
+  return Promise.resolve({ ok: false, error: 'unknown op' });
+}
+if (psOn()) psLoad().catch(() => {});
+// PONDER_STATS (temporary) end
+
 // ======================= Messaging =======================
 api.runtime.onMessage.addListener((msg, sender) => {
   if (msg && msg.type === 'allowlist') return loadAllowlist();
   if (msg && msg.type === 'fetchImage') return fetchImage(msg.url);
+  // PONDER_STATS (temporary) begin
+  if (msg && msg.type === 'aggroClear') psNewGame();
+  if (msg && msg.type === 'ponderStats') return psMessage(msg);
+  // PONDER_STATS (temporary) end
   if (msg && msg.type === 'aggroClear') { aggroClear(); return Promise.resolve({ ok: true }); }
   if (msg && msg.type === 'clearEngines') { clearEngines(); return Promise.resolve({ ok: true }); }
   if (msg && msg.type === 'aggroInvalidate') { ponderWanted = false; ponderCancel(); return Promise.resolve({ ok: true }); }   // also frees the spares
   if (msg && msg.type === 'aggroIdle') return withEngine(async () => { const r = aggroIdle(msg); if (r && r.state === 'started') startIdleStatus(msg, sender); return r; });
   if (msg && msg.type === 'hitTopUp') return withEngine(() => hitFinal(msg.id));
-  if (msg && msg.type === 'warm') return withEngine(() => warmEngine(msg.engine));
+  if (msg && msg.type === 'warm') { sfHashFrom(msg); return withEngine(() => warmEngine(msg.engine)); }
   if (msg && msg.type === 'saveGame') return saveGame(msg.record, msg.max);
   if (msg && msg.type === 'listGames') return listGames();
   if (msg && msg.type === 'clearGames') return clearGames();
@@ -1718,7 +1994,8 @@ api.runtime.onMessage.addListener((msg, sender) => {
       aggroWorkerAlive: !!(aggroMain && !aggroMain.dead), aggroRestarts: aggroDbg.restarts, aggroFailure: aggroFailure ? aggroFailure.message : null,
       ponderPool: { cap: ponderCap, active: ponderActive.filter((w) => !w.dead).length, spares: ponderSpares.filter((w) => !w.dead).length, wanted: ponderWanted },
       module: { ...aggroModuleInfo, sendFailures: aggroDbg.moduleSendFailures }, ponderHashMb, ponderStepped: PONDER_STEPPED, workerStarts: aggroDbg.workerStarts, lastWorkerStart: aggroDbg.lastStart,
-      stockfish: { active: sfActive, relaxedSimd: { probe: sfRelaxedOk, failed: sfDbg.rsimdFailed }, threads: sfThreadsSent, threadedFailed: sfDbg.threadedFailed, threadedStarts: sfDbg.threadedStarts, sab: sfSab, module: { ...sfModuleInfo, sendFailures: sfDbg.moduleSendFailures },
+      stockfish: { active: sfActive, relaxedSimd: { probe: sfRelaxedOk, failed: sfDbg.rsimdFailed }, threads: sfThreadsSent, threadedFailed: sfDbg.threadedFailed, rsimdThreadedFailed: sfDbg.rsimdThreadedFailed, threadedRsimd: !!CV.SF_THREADED_RSIMD, threadedStarts: sfDbg.threadedStarts,
+        hashMb: sfHashSent, hashWanted: sfHashWant, hashChanges: sfDbg.hashChanges, mainWaitStop: { capMs: CV.SF_MAIN_WAIT_STOP_MS, waits: sfDbg.mainWaits, lastMs: sfDbg.mainWaitMs.slice() }, sab: sfSab, module: { ...sfModuleInfo, sendFailures: sfDbg.moduleSendFailures },
         poolKind: ponderKind, cancelling: ponderCancelling.length, harvested: sfDbg.harvested, harvestFailed: sfDbg.harvestFailed, kills: { ...sfDbg.kills }, cancelMs: sfDbg.cancelMs.slice(), claimedWhileStopping: sfDbg.claimedWhileStopping, claimReplaced: sfDbg.claimReplaced, overruns: sfDbg.overruns, lastOverruns: sfDbg.lastOverruns.slice(), workerStarts: sfDbg.workerStarts, lastWorkerStart: sfDbg.lastStart, rankMode: SF_RANK_MODE,
         searchMode: sfLast ? sfLast.mode : null, depthDone: sfLast ? sfLast.depthDone : null, softMs: sfLast ? sfLast.softMs : null, elapsedMs: sfLast ? sfLast.elapsedMs : null,
         lastSearch: sfLast, pvSeeds: sfDbg.pvSeeds, mainWarmMs: sfDbg.mainWarmMs === undefined ? null : sfDbg.mainWarmMs },
@@ -1729,9 +2006,13 @@ api.runtime.onMessage.addListener((msg, sender) => {
         running: { stockfish: !!sfReady, aggro: !!(aggroMain && !aggroMain.dead) } } });
   }
   if (!msg || msg.type !== 'analyze') return;
-  return withEngine(() => (msg.engine === 'stockfish'
+  const run = withEngine(() => (msg.engine === 'stockfish'
     ? analyzeStockfish(msg.fen, msg.depth, msg.imperfection, msg.sfMaxMs, msg.startFen, msg.moves, msg)
     : analyzeAggro(msg)));
+  // PONDER_STATS (temporary) begin
+  if (psOn()) run.then((r) => psFinish(msg, r), () => {});
+  // PONDER_STATS (temporary) end
+  return run;
 });
 
 migrateAtStart();
