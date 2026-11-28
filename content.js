@@ -121,10 +121,20 @@
     return count ? { grid, count, highlights } : null;
   }
 
+  // 2.0.4 (A2): one board read with its signature: { grid, count, highlights, sig }, or null without a board. The stable
+  // read's second read is handed to check() as it is, so a stable check costs two reads, not three.
+  function readBoard() {
+    if (!board) return null;
+    const r = readPosition();
+    r.sig = BS.signature(r.grid, r.highlights);
+    return r;
+  }
+
   // Reads the board and feeds the tracker. Only ever called on allowed pages, on every board read
   // (also while Auto-play is off), so moves made by hand or while paused are recorded too.
-  function observeBoard() {
-    const st = readBoardState();
+  // read (2.0.4, optional): a readBoard() result taken just before (synchronously), used instead of a fresh read.
+  function observeBoard(read) {
+    const st = read ? (read.count ? read : null) : readBoardState();
     if (!st) return null;
     lastGrid = st.grid;
     rights = BS.updateRights(rights, st.grid);
@@ -138,7 +148,7 @@
       const record = rec.build(abandoned, { cfg, result: '*' });
       if (CV.pgn.shouldSave(cfg, record)) storeGame(record);
     }
-    return { st, p, sig: BS.signature(st.grid, st.highlights) };
+    return { st, p, sig: st.sig || BS.signature(st.grid, st.highlights) };
   }
 
   function handleTrackerEvent(ev) {
@@ -177,9 +187,8 @@
 
   // Pieces + highlights as one string (BS.signature); '' without a board.
   function boardSignature() {
-    if (!board) return '';
-    const p = readPosition();
-    return BS.signature(p.grid, p.highlights);
+    const r = readBoard();
+    return r ? r.sig : '';
   }
 
   // startFen + moves for an engine, only when the tracked history ends exactly at this position; else null.
@@ -616,14 +625,16 @@
     }, RETRY_AFTER_MS);
   }
 
-  // opt (2.0.4): { forced } = the watchdog's forced check (CV.WATCHDOG_FORCE_MS).
+  // opt (2.0.4): { forced } = the watchdog's forced check (CV.WATCHDOG_FORCE_MS); { read } = a readBoard() result taken
+  // just before (A2: the stable read's second read), used instead of reading the board again.
   function check(reason, opt) {
     const forced = !!(opt && opt.forced);
+    const read = opt && opt.read && CV.STABLE_READ_REUSE ? opt.read : undefined;
     let obs;
     if (board && allowed !== null && isAllowedPage()) {          // observe before anything can return early
-      try { obs = observeBoard() || undefined; } catch (e) { console.error('[ChessVision] observe failed', e); }
+      try { obs = observeBoard(read) || undefined; } catch (e) { console.error('[ChessVision] observe failed', e); }
     }
-    if (CV.WATCHDOG_SKIP_UNCHANGED) { lastCheckAt = Date.now(); lastCheckSig = obs ? obs.sig : boardSignature(); }   // A1: what the next watchdog ticks compare with
+    if (CV.WATCHDOG_SKIP_UNCHANGED) { lastCheckAt = Date.now(); lastCheckSig = obs ? obs.sig : read ? read.sig : boardSignature(); }   // A1: what the next watchdog ticks compare with
     if (!cfg.enabled) { setStatus('off'); return; }
     if (allowed === null) { setStatus('loading page list\u2026'); return; }
     if (!isAllowedPage()) { setStatus('paused \u2013 this page is not in allowed-pages.txt', 'warn'); return; }
@@ -784,8 +795,8 @@
       await nextFrame();
       await sleep(STABLE_GAP_MS);
       if (seq !== stableSeq) return;                             // a newer mutation (or schedule) took over
-      const b = boardSignature();
-      if (a === b || unstableRun >= UNSTABLE_MAX) { unstableRun = 0; stableArmed = false; check(reason, { forced }); return; }
+      const rb = readBoard(), b = rb ? rb.sig : '';
+      if (a === b || unstableRun >= UNSTABLE_MAX) { unstableRun = 0; stableArmed = false; check(reason, { forced, read: rb }); return; }
       unstableReads++; unstableRun++;
       scheduleStable(cfg.boardDebounceMs, 'unstable', forced);
     }, ms);
@@ -810,9 +821,9 @@
     if (stableArmed) return;
     if (!CV.WATCHDOG_SKIP_UNCHANGED) { scheduleStable(0, 'watchdog'); return; }
     const forced = Date.now() - lastCheckAt >= CV.WATCHDOG_FORCE_MS;
-    const same = boardSignature() === lastCheckSig;
+    const read = readBoard(), same = (read ? read.sig : '') === lastCheckSig;
     if (same && !forced && !busy && !recheckPending && !retryWaiting) return;
-    if (same && forced && !busy) { check('watchdog (forced)', { forced: true }); return; }
+    if (same && forced && !busy) { check('watchdog (forced)', { forced: true, read }); return; }
     scheduleStable(0, forced ? 'watchdog (forced)' : 'watchdog', forced);
   }
 

@@ -161,13 +161,14 @@ async function cycle() {
   const reactMs = ours ? at - t0 : null;
   if (ours) await sleep(2500);
   const r = p.reset();
+  const dbg = JSON.parse(await p.overlay().onDebug());
   const msg = await p.overlay().onSaveNow();
   await sleep(200);
   const saved = Object.entries(p.storage.data).filter(([k]) => k === 'savedGames' || k.startsWith('game:'));
   let pgn = null;
   for (const [k, v] of saved) { const g = Array.isArray(v) ? v[0] : v; if (g && g.pgn) pgn = g.pgn.replace(/\[Date "[^"]*"\]\n/, ''); }
   await p.close();
-  return { ...r, move: ours, reactMs, saveMsg: msg, pgn };
+  return { ...r, move: ours, reactMs, saveMsg: msg, pgn, history: dbg.history, unstableReads: dbg.state.unstableReads };
 }
 
 async function main() {
@@ -185,7 +186,7 @@ async function main() {
   }
   console.table(rows);
   for (const [k, r] of Object.entries(out)) console.log(k, 'messages by type:', JSON.stringify(r.byType));
-  if (out.cycle) console.log('cycle: move', out.cycle.move, 'react', out.cycle.reactMs, 'ms;', out.cycle.saveMsg, '\n' + out.cycle.pgn);
+  if (out.cycle) console.log('cycle: move', out.cycle.move, 'react', out.cycle.reactMs, 'ms;', out.cycle.saveMsg, '; history', JSON.stringify(out.cycle.history), '\n' + out.cycle.pgn);
   process.exit(0);
 }
 main().catch((e) => { console.error(e); process.exit(1); });

@@ -514,6 +514,10 @@
   // 2.0.3 (findBoard every second).
   CV.ATTACH_LAZY = true;
   CV.ATTACH_FULL_EVERY = 5;
+  // 2.0.4 (A2): the stable read's second read (and a forced watchdog check's read) is the one check() uses: one stable
+  // check costs two board reads instead of three. Direct checks (schedule(), the retry timer) still read fresh. false =
+  // 2.0.3 (check() reads the board again).
+  CV.STABLE_READ_REUSE = true;
   // 2.0.2 (A7): AggroChess workers that report `interruptible` (JSPI in the browser and a 2.0.2 engine) are stopped
   // instead of terminated: a cancelled job's busy worker is stopped and recycled like a Stockfish one, and a `late`
   // reply search far from done is stopped and its move used from this depth on. false = 2.0.0 (terminate).
