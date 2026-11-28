@@ -521,4 +521,18 @@ test('B2: the last tab disconnects -> the job is cancelled and the spares are re
   await old.send({ type: 'aggroInvalidate' });
 });
 
+// ---- 2.0.4 F1: the lean package (tools/package.sh --lean) has no threaded Stockfish build and no asm.js fallback ----
+test('F1: without engine/stockfish-19-lite.js the threaded start fails once and the single-thread engine keeps playing', async () => {
+  const bg = makeBackground({ stepMs: 2, sab: true, cores: 4, missing: ['engine/stockfish-19-lite.js', 'engine/stockfish-19-asm.js'] });
+  assert.strictEqual(bg.get('sfSab.ok'), true, 'the SharedArrayBuffer test passes, so the threaded build is tried');
+  const r = await analyzeSf(bg, [], { sfSearchMode: 'depth', sfThreads: 2 });
+  assert.ok(r && r.uci && !r.error, JSON.stringify(r));
+  assert.ok(/not found/.test(bg.get('sfDbg.threadedFailed')), 'remembered: ' + bg.get('sfDbg.threadedFailed'));
+  assert.strictEqual(bg.get('sfActive'), 'engine/stockfish-19-lite-single.js');
+  const tries = bg.workers.filter((w) => w.missing).length;
+  const r2 = await analyzeSf(bg, ['e2e4', 'e7e5'], { sfSearchMode: 'depth', sfThreads: 2 });
+  assert.ok(r2 && r2.uci);
+  assert.strictEqual(bg.workers.filter((w) => w.missing).length, tries, 'not tried again');
+});
+
 run();

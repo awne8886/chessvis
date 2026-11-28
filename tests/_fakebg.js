@@ -62,9 +62,12 @@ function makeBackground(opts = {}) {
       this.url = String(url); this.kind = /aggro/.test(this.url) ? 'aggro' : 'sf'; this.dead = false; this.id = workers.length;
       this.pos = null; this.search = null; this.multipv = 1; this.msgs = [];
       workers.push(this);
+      // 2.0.4: opts.missing = engine files that are not in the package (tools/package.sh --lean): the worker fails to load
+      const file = decodeURIComponent(this.url.split('#')[0]);
+      if ((opts.missing || []).includes(file)) { this.missing = true; setTimeout(() => { if (this.onerror) this.onerror({ message: 'NetworkError: ' + file + ' not found' }); }, 1); }
     }
     emit(data) { if (!this.dead && this.onmessage) this.onmessage({ data }); }
-    postMessage(m) { if (this.dead) return; setTimeout(() => { if (!this.dead) this.handle(m); }, 0); }
+    postMessage(m) { if (this.dead || this.missing) return; setTimeout(() => { if (!this.dead) this.handle(m); }, 0); }
     terminate() { this.dead = true; if (this.search) { clearTimeout(this.search.timer); clearTimeout(this.search.mt); } }
     handle(m) { if (this.kind === 'sf') this.sf(m); else this.aggro(m); }
     sf(m) {
@@ -153,7 +156,10 @@ function makeBackground(opts = {}) {
     WebAssembly: { validate: (b) => (b.length === 37 ? !!opts.wasm.relaxed : true), compileStreaming: async () => ({ fake: 'module' }), compile: async () => ({ fake: 'module' }), Module: function Module() {} },
     fetch: async () => ({ arrayBuffer: async () => new ArrayBuffer(8) }),
   } : {};
+  // opts.sab (2.0.4): SharedArrayBuffer, Atomics and a WebAssembly whose Memory can be shared, so CV.sabSupport passes
+  const sab = opts.sab ? { SharedArrayBuffer, Atomics, WebAssembly: { Memory: WebAssembly.Memory } } : {};
   const ctx = vm.createContext({
+    ...sab,
     ...fakeWasm,
     console: opts.quiet === false ? console : { log() {}, warn() {}, error() {} },
     // 2.0.4: a long timer (the engines' idle shutdown, 10 min) must not keep a finished test process alive
