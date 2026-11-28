@@ -1055,6 +1055,11 @@ function ourScore(a, myColor) {
   return a.kind === 'mate' ? (v > 0 ? 100000 - Math.abs(a.value) : -100000 + Math.abs(a.value)) : v;
 }
 
+// 2.0.4 (E2): every ponder job replayed the whole game (CV.replayUci); the next job's moves extend the last job's by two
+// plies, so only those are applied (CV.createReplayCache, the same result). CV.REPLAY_CACHE = false: 2.0.3.
+const jobReplay = CV.createReplayCache();
+const replayForJob = (startFen, moves) => (CV.REPLAY_CACHE ? jobReplay.replay(startFen, moves) : CV.replayUci(startFen, moves));
+
 // The idle job: after our move, while the opponent thinks. Runs detached; every step re-checks its token.
 let idleJobs = 0;                // 2.0.4: idle jobs whose code is still running (the status push runs while one does)
 async function runIdle(msg, token) {
@@ -1076,7 +1081,7 @@ async function runIdleJob(msg, token) {
     predicted = r.uci && r.uci !== 'none' ? r.uci : null;      // a hint for ranking only
   } catch (e) { predicted = null; }
   if (token !== idleToken) return;
-  const after = CV.replayUci(msg.startFen, msg.moves);
+  const after = replayForJob(msg.startFen, msg.moves);
   if (!after.ok) return;
   const legal = CV.chess.legalMoves(after.pos);                // the opponent's possible moves
 
@@ -1437,7 +1442,7 @@ async function runIdleSfJob(msg, token) {
   const budget = Math.max(200, Math.min(AGGRO_HARD_MAX_MS, Number(msg.ponderMs) || 1500));
   const deadline = t0 + ponderCeiling(msg, budget), left = () => deadline - Date.now();   // 2.0.0: up to ponderMaxMs with ponderUntilMove
   ponderDbg.lastPasses = 0;
-  const after = CV.replayUci(msg.startFen, msg.moves);
+  const after = replayForJob(msg.startFen, msg.moves);
   if (!after.ok) return;
   const legal = CV.chess.legalMoves(after.pos).map((m) => m.uci);          // the opponent's possible moves
   if (!legal.length) return;

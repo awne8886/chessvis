@@ -215,6 +215,35 @@
     return { ok: true, pos };
   };
 
+  // 2.0.4 (E2): replayUci with a memory of the last successful replay { startFen, moves, pos }: a request whose moves
+  // extend it (the next ponder job: two more plies) applies only the new moves. Positions are never modified after they
+  // are made (chess.apply returns a new one), so the cached one can be shared. The result is the same as replayUci's
+  // (tests/perft.test.js), including { ok: false, pos, failedAt } with failedAt counted from the start.
+  CV.createReplayCache = function () {
+    let last = null;
+    return {
+      replay(startFen, moves) {
+        const list = moves || [];
+        let i = 0, pos;
+        if (last && last.startFen === startFen && last.moves.length <= list.length && last.moves.every((m, k) => list[k] === m)) { i = last.moves.length; pos = last.pos; }
+        else pos = CV.chess.parseFen(startFen);
+        for (; i < list.length; i++) {
+          const r = CV.applyUci(pos, list[i]);
+          if (!r) return { ok: false, pos, failedAt: i };
+          pos = r.pos;
+        }
+        last = { startFen, moves: list.slice(), pos };
+        return { ok: true, pos };
+      },
+      clear() { last = null; },
+    };
+  };
+  // 2.0.4 (E2): the background's ponder jobs replay the game through CV.createReplayCache (false = 2.0.3: CV.replayUci,
+  // the whole game every job). chessmini's gameState / isMate stop at the first legal move (CV.CHESS_EARLY_EXIT; false =
+  // they list every legal move).
+  CV.REPLAY_CACHE = true;
+  CV.CHESS_EARLY_EXIT = true;
+
   // The Stockfish `position` command. With a usable history: `position fen <startFen> moves m1 m2 ...`
   // (so the engine sees repetitions and the 50-move counter); without: the old `position fen <fen>`.
   CV.sfPositionCommand = function (fen, startFen, moves) {
